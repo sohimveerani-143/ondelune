@@ -96,6 +96,7 @@ export async function joinPairing(pairingId, { publicKey, displayName, timezone 
     partnerPublicKey: creatorInfo.creatorPublicKey,
     partnerName: creatorInfo.creatorName,
     partnerTimezone: creatorInfo.creatorTimezone,
+    creatorUid: creatorInfo.creatorUid,
     myUid: user.uid,
   };
 }
