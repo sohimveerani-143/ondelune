@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover" />
+  <title>Ondelune</title>
+  <meta name="description" content="A quiet, private, end-to-end encrypted space for two." />
+  <meta name="theme-color" content="#11161a" />
+  <link rel="manifest" href="manifest.webmanifest" />
+  <link rel="icon" href="icons/icon-192.png" />
+  <link rel="apple-touch-icon" href="icons/icon-192.png" />
+  <link rel="stylesheet" href="css/style.css" />
+</head>
+<body>
+  <div id="app">
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <p style="color:var(--text-dim); font-size:14px;">Loading Ondelune…</p>
+    </div>
+  </div>
+
+  <!-- If module scripts fail entirely (e.g. opened via file:// instead of a server),
+       this plain script still runs and replaces the loading state with a clear explanation
+       instead of leaving a blank screen. -->
+  <script>
+    window.__ondeluneModuleLoaded = false;
+    setTimeout(function () {
+      if (!window.__ondeluneModuleLoaded) {
+        document.getElementById('app').innerHTML =
+          '<div class="fatal-error">' +
+          '<div class="mark" style="margin:0 auto 16px;"></div>' +
+          '<h2 style="font-family:Georgia,serif;">This page needs a server</h2>' +
+          '<p style="color:#8b959b;font-size:14px;max-width:320px;margin:0 auto;">' +
+          'It looks like this file was opened directly. Browsers block the module scripts this app needs when opened as a local file. ' +
+          'Serve it from a local server (e.g. <code style="background:#1e262c;padding:2px 6px;border-radius:4px;">python3 -m http.server</code>) or open your deployed Firebase Hosting URL instead.' +
+          '</p></div>';
+      }
+    }, 2500);
+  </script>
+
+  <script type="module">
+    window.__ondeluneModuleLoaded = true;
+  </script>
+  <script type="module" src="js/app.js"></script>
+
+  <script>
+    if ('serviceWorker' in navigator) {
+      window.addEventListener('load', () => {
+        navigator.serviceWorker.register('sw.js').catch(() => {});
+      });
+    }
+  </script>
+</body>
+</html>
