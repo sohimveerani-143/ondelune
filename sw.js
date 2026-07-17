@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ondelune-v2';
+const CACHE_NAME = 'ondelune-v3';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -13,6 +13,7 @@ const SHELL_FILES = [
   './js/room-data.js',
   './js/image-utils.js',
 ];
+
 self.addEventListener('install', (event) => {
   event.waitUntil(
     caches.open(CACHE_NAME).then((cache) => cache.addAll(SHELL_FILES)).catch(() => {})

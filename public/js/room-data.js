@@ -1,5 +1,4 @@
 // room-data.js — every read/write here encrypts or decrypts using the shared key.
-// Firestore only ever stores ciphertext + nonce. No plaintext field ever leaves the device.
 import {
   db,
   ensureSignedIn,
@@ -19,7 +18,6 @@ function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
 }
 
-// ---------- Thread (shared messages) ----------
 export async function sendThreadMessage(roomId, sharedKey, text) {
   const user = await ensureSignedIn();
   const { ciphertext, nonce } = encryptJSON({ text }, sharedKey);
@@ -39,9 +37,7 @@ export function listenThread(roomId, sharedKey, onMessages) {
       let text = '⚠️ Could not decrypt';
       try {
         text = decryptJSON(data.ciphertext, data.nonce, sharedKey).text;
-      } catch (e) {
-        /* leave fallback text */
-      }
+      } catch (e) {}
       return {
         id: d.id,
         senderUid: data.senderUid,
@@ -53,7 +49,6 @@ export function listenThread(roomId, sharedKey, onMessages) {
   });
 }
 
-// ---------- Mood (one entry per person per day) ----------
 export async function setTodayMood(roomId, sharedKey, mood) {
   const user = await ensureSignedIn();
   const dateKey = new Date().toISOString().slice(0, 10);
@@ -76,20 +71,17 @@ export function listenMood(roomId, sharedKey, onEntries) {
       let mood = null;
       try {
         mood = decryptJSON(data.ciphertext, data.nonce, sharedKey).mood;
-      } catch (e) {
-        /* skip */
-      }
+      } catch (e) {}
       return { id: d.id, senderUid: data.senderUid, date: data.date, mood };
     });
     onEntries(entries);
   });
 }
 
-// ---------- Calendar ----------
 export async function addCalendarEvent(roomId, sharedKey, { title, dateTime }) {
   const { ciphertext, nonce } = encryptJSON({ title, dateTime }, sharedKey);
   await addDoc(col(roomId, 'calendar'), {
-    dateTime, // used for sort only; content itself is inside the ciphertext too
+    dateTime,
     ciphertext,
     nonce,
     createdAt: serverTimestamp(),
@@ -104,16 +96,13 @@ export function listenCalendar(roomId, sharedKey, onEvents) {
       let title = '⚠️ Could not decrypt';
       try {
         title = decryptJSON(data.ciphertext, data.nonce, sharedKey).title;
-      } catch (e) {
-        /* skip */
-      }
+      } catch (e) {}
       return { id: d.id, title, dateTime: data.dateTime };
     });
     onEvents(events);
   });
 }
 
-// ---------- Bucket list ----------
 export async function addBucketItem(roomId, sharedKey, text) {
   const { ciphertext, nonce } = encryptJSON({ text, done: false }, sharedKey);
   await addDoc(col(roomId, 'bucketlist'), {
@@ -139,16 +128,13 @@ export function listenBucketList(roomId, sharedKey, onItems) {
         const parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
         text = parsed.text;
         done = parsed.done;
-      } catch (e) {
-        /* skip */
-      }
+      } catch (e) {}
       return { id: d.id, text, done };
     });
     onItems(items);
   });
 }
 
-// ---------- Photo of the day ----------
 export async function setTodayPhoto(roomId, sharedKey, base64Jpeg) {
   const user = await ensureSignedIn();
   const dateKey = new Date().toISOString().slice(0, 10);
@@ -171,16 +157,13 @@ export function listenPhotos(roomId, sharedKey, onPhotos, limit = 14) {
       let image = null;
       try {
         image = decryptJSON(data.ciphertext, data.nonce, sharedKey).image;
-      } catch (e) {
-        /* skip */
-      }
+      } catch (e) {}
       return { id: d.id, senderUid: data.senderUid, date: data.date, image };
     });
     onPhotos(photos);
   });
 }
 
-// ---------- Room settings (together-since date) ----------
 export async function setTogetherSince(roomId, sharedKey, isoDate) {
   const { ciphertext, nonce } = encryptJSON({ togetherSince: isoDate }, sharedKey);
   await setDoc(

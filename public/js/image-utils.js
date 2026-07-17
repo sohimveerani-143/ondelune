@@ -1,5 +1,3 @@
-// image-utils.js — shrink photos before they're encrypted, so encrypted docs stay
-// comfortably under Firestore's 1MB document limit.
 export function fileToCompressedBase64(file, { maxDim = 900, quality = 0.7 } = {}) {
   return new Promise((resolve, reject) => {
     const img = new Image();

@@ -1,5 +1,4 @@
-// pairing.js — one-time link pairing. Once a pairing doc is marked 'paired',
-// it can never be reused, and there is no UI anywhere to add a second partner.
+// pairing.js — one-time link pairing.
 import {
   db,
   ensureSignedIn,
@@ -22,7 +21,6 @@ export function getPairingIdFromUrl() {
   return match ? match[1] : null;
 }
 
-// Called by the person generating the link.
 export async function createPairing({ publicKey, displayName, timezone }) {
   const user = await ensureSignedIn();
   const pairingId = randomToken(8);
@@ -37,7 +35,6 @@ export async function createPairing({ publicKey, displayName, timezone }) {
   return pairingId;
 }
 
-// Creator side: listen until the partner joins.
 export function listenForJoin(pairingId, onJoined) {
   return onSnapshot(doc(db, 'pairings', pairingId), (snap) => {
     const data = snap.data();
@@ -47,7 +44,6 @@ export function listenForJoin(pairingId, onJoined) {
   });
 }
 
-// Once the creator sees the join, finalize the shared room doc.
 export async function finalizeRoomAsCreator({ myPublicKey, partnerPublicKey, myUid, partnerUid }) {
   const roomId = await computeRoomId(myPublicKey, partnerPublicKey);
   await setDoc(
@@ -58,8 +54,6 @@ export async function finalizeRoomAsCreator({ myPublicKey, partnerPublicKey, myU
   return roomId;
 }
 
-// Called by the person who opened the link. Transaction guarantees a
-// pairing link can only ever be consumed once — a second attempt throws.
 export async function joinPairing(pairingId, { publicKey, displayName, timezone }) {
   const user = await ensureSignedIn();
   const pairingRef = doc(db, 'pairings', pairingId);
@@ -96,7 +90,6 @@ export async function joinPairing(pairingId, { publicKey, displayName, timezone 
     partnerPublicKey: creatorInfo.creatorPublicKey,
     partnerName: creatorInfo.creatorName,
     partnerTimezone: creatorInfo.creatorTimezone,
-    creatorUid: creatorInfo.creatorUid,
     myUid: user.uid,
   };
 }
