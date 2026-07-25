@@ -69,3 +69,59 @@ export async function computeRoomId(pubA, pubB) {
     .map((b) => b.toString(16).padStart(2, '0'))
     .join('');
 }
+
+// ---------------- Passphrase-based encryption ----------------
+// Used for (1) locking the private key at rest behind a PIN, and (2) encrypting
+// a cloud backup of the private key behind a recovery password.
+async function deriveAesKeyFromSecret(secretString, saltBytes, iterations = 150000) {
+  const enc = new TextEncoder();
+  const keyMaterial = await crypto.subtle.importKey(
+    'raw',
+    enc.encode(secretString),
+    'PBKDF2',
+    false,
+    ['deriveKey']
+  );
+  return crypto.subtle.deriveKey(
+    { name: 'PBKDF2', salt: saltBytes, iterations, hash: 'SHA-256' },
+    keyMaterial,
+    { name: 'AES-GCM', length: 256 },
+    false,
+    ['encrypt', 'decrypt']
+  );
+}
+
+export async function encryptWithPassphrase(plainObj, passphrase) {
+  const salt = crypto.getRandomValues(new Uint8Array(16));
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await deriveAesKeyFromSecret(passphrase, salt);
+  const data = new TextEncoder().encode(JSON.stringify(plainObj));
+  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
+  return {
+    ciphertext: encodeBase64(new Uint8Array(cipherBuf)),
+    salt: encodeBase64(salt),
+    iv: encodeBase64(iv),
+  };
+}
+
+export async function decryptWithPassphrase({ ciphertext, salt, iv }, passphrase) {
+  const key = await deriveAesKeyFromSecret(passphrase, decodeBase64(salt));
+  const cipherBuf = decodeBase64(ciphertext);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: decodeBase64(iv) },
+    key,
+    cipherBuf
+  );
+  return JSON.parse(new TextDecoder().decode(plainBuf));
+}
+
+// A short, human-comparable fingerprint of both public keys — read aloud once
+// to confirm the pairing wasn't intercepted.
+export async function safetyNumber(pubA, pubB) {
+  const sorted = [pubA, pubB].sort().join('|');
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sorted));
+  const hex = Array.from(new Uint8Array(digest))
+    .map((b) => b.toString(16).padStart(2, '0'))
+    .join('');
+  return hex.slice(0, 16).toUpperCase().match(/.{1,4}/g).join(' ');
+}

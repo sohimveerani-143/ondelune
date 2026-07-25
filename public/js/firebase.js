@@ -3,6 +3,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import {
   getAuth,
   signInAnonymously,
+  signOut as firebaseSignOut,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore,
@@ -10,12 +11,14 @@ import {
   getDoc,
   setDoc,
   updateDoc,
+  deleteDoc,
   onSnapshot,
   runTransaction,
   collection,
   addDoc,
   query,
   orderBy,
+  limit,
   serverTimestamp,
   enableIndexedDbPersistence,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js';
@@ -43,16 +46,22 @@ export async function ensureSignedIn() {
   return auth.currentUser;
 }
 
+export async function signOutOfAccount() {
+  await firebaseSignOut(auth);
+}
+
 export {
   doc,
   getDoc,
   setDoc,
   updateDoc,
+  deleteDoc,
   onSnapshot,
   runTransaction,
   collection,
   addDoc,
   query,
   orderBy,
+  limit,
   serverTimestamp,
 };

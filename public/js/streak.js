@@ -1,7 +1,7 @@
 // streak.js — a "talking streak": counts consecutive days where BOTH partners did
-// something real (sent a message, logged a mood, added a photo/event/list item, or
-// played a move). Merely opening the app never counts — recordActivity() is only
-// called from inside the actual write functions in room-data.js and game-tictactoe.js.
+// something real (sent a message, logged a mood, added a photo/event/list item).
+// Merely opening the app never counts — recordActivity() is only called from
+// inside the actual write functions in room-data.js.
 import { db, ensureSignedIn, doc, setDoc, onSnapshot, collection, query, orderBy, limit } from './firebase.js';
 
 function todayUTC(offsetDays = 0) {
@@ -21,7 +21,6 @@ export async function recordActivity(roomId) {
   });
 }
 
-// memberUids: the room's two uids (order doesn't matter here).
 export function listenStreak(roomId, memberUids, onStreak) {
   const q = query(collection(db, 'rooms', roomId, 'activity'), orderBy('date', 'desc'), limit(160));
   return onSnapshot(q, (snap) => {
@@ -37,7 +36,7 @@ export function listenStreak(roomId, memberUids, onStreak) {
     const bothActive = (dateStr) => datesA.has(dateStr) && datesB.has(dateStr);
 
     let streak = 0;
-    let offset = bothActive(todayUTC()) ? 0 : -1; // don't zero out the streak right at midnight
+    let offset = bothActive(todayUTC()) ? 0 : -1;
     while (bothActive(todayUTC(offset))) {
       streak += 1;
       offset -= 1;

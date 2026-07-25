@@ -1,4 +1,4 @@
-const CACHE_NAME = 'ondelune-v3';
+const CACHE_NAME = 'ondelune-v4';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -12,6 +12,9 @@ const SHELL_FILES = [
   './js/pairing.js',
   './js/room-data.js',
   './js/image-utils.js',
+  './js/applock.js',
+  './js/auth-recovery.js',
+  './js/streak.js',
 ];
 
 self.addEventListener('install', (event) => {

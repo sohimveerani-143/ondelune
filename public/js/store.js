@@ -1,7 +1,7 @@
 // store.js — persists this device's identity locally. Never synced anywhere.
 import * as idbKeyval from 'https://esm.sh/idb-keyval@6';
 
-const { get, set } = idbKeyval;
+const { get, set, del } = idbKeyval;
 const KEY = 'ondelune-identity-v1';
 
 export async function loadIdentity() {
@@ -18,6 +18,10 @@ export async function updateIdentity(patch) {
   const next = { ...current, ...patch };
   await saveIdentity(next);
   return next;
+}
+
+export async function clearIdentity() {
+  await del(KEY);
 }
 
 export function isPaired(identity) {

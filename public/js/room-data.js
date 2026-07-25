@@ -1,10 +1,12 @@
 // room-data.js — every read/write here encrypts or decrypts using the shared key.
+// Firestore only ever stores ciphertext + nonce. No plaintext field ever leaves the device.
 import {
   db,
   ensureSignedIn,
   doc,
   setDoc,
   updateDoc,
+  deleteDoc,
   onSnapshot,
   collection,
   addDoc,
@@ -13,6 +15,7 @@ import {
   serverTimestamp,
 } from './firebase.js';
 import { encryptJSON, decryptJSON } from './crypto.js';
+import { recordActivity } from './streak.js';
 
 function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
@@ -20,13 +23,32 @@ function col(roomId, name) {
 
 export async function sendThreadMessage(roomId, sharedKey, text) {
   const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ text }, sharedKey);
+  const { ciphertext, nonce } = encryptJSON({ type: 'text', text }, sharedKey);
   await addDoc(col(roomId, 'thread'), {
     senderUid: user.uid,
     ciphertext,
     nonce,
     createdAt: serverTimestamp(),
   });
+  await recordActivity(roomId);
+}
+
+// View-once photo: once the RECIPIENT opens it, the doc is deleted for both sides.
+// This limits exposure time — it cannot stop a screenshot, which no website can do.
+export async function sendThreadPhoto(roomId, sharedKey, base64Image, viewOnce) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ type: 'photo', image: base64Image, viewOnce: !!viewOnce }, sharedKey);
+  await addDoc(col(roomId, 'thread'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
+export async function deleteThreadMessage(roomId, messageId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'thread', messageId));
 }
 
 export function listenThread(roomId, sharedKey, onMessages) {
@@ -34,14 +56,17 @@ export function listenThread(roomId, sharedKey, onMessages) {
   return onSnapshot(q, (snap) => {
     const messages = snap.docs.map((d) => {
       const data = d.data();
-      let text = '⚠️ Could not decrypt';
+      let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
       try {
-        text = decryptJSON(data.ciphertext, data.nonce, sharedKey).text;
+        parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
       } catch (e) {}
       return {
         id: d.id,
         senderUid: data.senderUid,
-        text,
+        type: parsed.type || 'text',
+        text: parsed.text,
+        image: parsed.image,
+        viewOnce: parsed.viewOnce,
         createdAt: data.createdAt?.toDate?.() || new Date(),
       };
     });
@@ -61,6 +86,7 @@ export async function setTodayMood(roomId, sharedKey, mood) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await recordActivity(roomId);
 }
 
 export function listenMood(roomId, sharedKey, onEntries) {
@@ -86,6 +112,7 @@ export async function addCalendarEvent(roomId, sharedKey, { title, dateTime }) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await recordActivity(roomId);
 }
 
 export function listenCalendar(roomId, sharedKey, onEvents) {
@@ -110,6 +137,7 @@ export async function addBucketItem(roomId, sharedKey, text) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await recordActivity(roomId);
 }
 
 export async function toggleBucketItem(roomId, sharedKey, itemId, currentText, currentDone) {
@@ -147,6 +175,7 @@ export async function setTodayPhoto(roomId, sharedKey, base64Jpeg) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await recordActivity(roomId);
 }
 
 export function listenPhotos(roomId, sharedKey, onPhotos, limit = 14) {
