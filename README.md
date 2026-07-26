@@ -1,4 +1,10 @@
-# Ondelune — setup guide
+# Tidelight — setup guide
+
+**What's new in this rebuild:** renamed from Ondelune, new warm moonlit visual identity,
+Chat (formerly Thread) now supports deleting any message for both people permanently,
+the safety-number/fingerprint feature was removed, a Network Privacy section explains
+DNS-over-HTTPS honestly, and a new **More** tab holds Expense Tracker, Savings Tracker,
+and Journal — kept out of the main navigation as requested.
 
 A quiet, private, end-to-end encrypted space for two. Everything is encrypted
 on your device before it's ever sent anywhere — Firebase only ever stores unreadable ciphertext.
@@ -12,11 +18,11 @@ on your device before it's ever sent anywhere — Firebase only ever stores unre
 
 ## Step 1 — Create a Firebase project
 1. Go to https://console.firebase.google.com
-2. **Add project** → any name (e.g. "ondelune") → Analytics can be skipped → **Create project**
+2. **Add project** → any name (e.g. "tidelight") → Analytics can be skipped → **Create project**
 
 ## Step 2 — Register a Web App
 1. Click the **</> (Web)** icon on the project overview page
-2. Nickname it (e.g. "ondelune-web") → **Register app**
+2. Nickname it (e.g. "tidelight-web") → **Register app**
 3. Copy the `firebaseConfig` object shown
 4. Paste your values into `js/firebase-config.js`, replacing the placeholders:
    ```js
@@ -50,12 +56,12 @@ scripts this app needs when loaded as a local file (`file://`), and that's
 exactly what causes a blank page. Instead, serve it over a real local address:
 
 ```bash
-cd ondelune
+cd tidelight
 python3 -m http.server 8000
 ```
 
 Then open **http://localhost:8000** in your browser. If your Firebase config
-is filled in correctly, you should see the "Welcome to Ondelune" screen — not
+is filled in correctly, you should see the "Welcome to Tidelight" screen — not
 a blank one. If something's still wrong, the app will now show a visible error
 explaining what happened instead of a blank screen.
 
@@ -78,7 +84,7 @@ Then:
 firebase deploy --only hosting,firestore:rules
 ```
 
-You'll get a live URL like `https://ondelune-xxxx.web.app`.
+You'll get a live URL like `https://tidelight-xxxx.web.app`.
 
 ## Step 8 — Pair up
 1. Open the URL, enter your name, tap **Create pairing link**

@@ -35,7 +35,7 @@ self.addEventListener('activate', (event) => {
 
 self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
-  if (url.origin !== self.location.origin) return;
+  if (url.origin !== self.location.origin) return; // let CDN/Firebase requests pass through
 
   event.respondWith(
     caches.match(event.request).then((cached) => cached || fetch(event.request))
