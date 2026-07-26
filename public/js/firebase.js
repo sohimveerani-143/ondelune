@@ -28,6 +28,9 @@ export const app = initializeApp(firebaseConfig);
 export const auth = getAuth(app);
 export const db = getFirestore(app);
 
+// Offline persistence is nice-to-have, not required — never let it block startup,
+// and never use top-level await here (unsupported in some older mobile WebViews,
+// and a silent failure here previously caused a blank screen with no error shown).
 let persistenceAttempted = false;
 export async function tryEnableOfflinePersistence() {
   if (persistenceAttempted) return;

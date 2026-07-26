@@ -1,9 +1,11 @@
 // crypto.js — all encryption happens here, client-side only.
+// The server (Firestore) never sees plaintext and never sees keys.
 import nacl from 'https://esm.sh/tweetnacl@1.0.3';
 import naclutil from 'https://esm.sh/tweetnacl-util@0.15.1';
 
 const { encodeBase64, decodeBase64, encodeUTF8, decodeUTF8 } = naclutil;
 
+// Generate a fresh identity keypair. secretKey NEVER leaves this device.
 export function generateKeyPair() {
   const kp = nacl.box.keyPair();
   return {
@@ -12,6 +14,8 @@ export function generateKeyPair() {
   };
 }
 
+// Derive the shared symmetric key from my secret key + partner's public key.
+// (X25519 ECDH under the hood — nacl.box.before returns a key usable with secretbox.)
 export function deriveSharedKey(theirPublicKeyB64, mySecretKeyB64) {
   const theirPub = decodeBase64(theirPublicKeyB64);
   const mySecret = decodeBase64(mySecretKeyB64);
@@ -61,6 +65,7 @@ export function randomToken(numBytes = 8) {
     .join('');
 }
 
+// Deterministic room id both devices can compute independently once paired.
 export async function computeRoomId(pubA, pubB) {
   const sorted = [pubA, pubB].sort().join('|');
   const enc = new TextEncoder().encode(sorted);
@@ -71,8 +76,9 @@ export async function computeRoomId(pubA, pubB) {
 }
 
 // ---------------- Passphrase-based encryption ----------------
-// Used for (1) locking the private key at rest behind a PIN, and (2) encrypting
-// a cloud backup of the private key behind a recovery password.
+// Used for two separate purposes: (1) locking the private key at rest on-device
+// behind a PIN, and (2) encrypting a cloud backup of the private key behind a
+// recovery password. Both use PBKDF2 (SHA-256) + AES-GCM via WebCrypto.
 async function deriveAesKeyFromSecret(secretString, saltBytes, iterations = 150000) {
   const enc = new TextEncoder();
   const keyMaterial = await crypto.subtle.importKey(
@@ -113,15 +119,4 @@ export async function decryptWithPassphrase({ ciphertext, salt, iv }, passphrase
     cipherBuf
   );
   return JSON.parse(new TextDecoder().decode(plainBuf));
-}
-
-// A short, human-comparable fingerprint of both public keys — read aloud once
-// to confirm the pairing wasn't intercepted.
-export async function safetyNumber(pubA, pubB) {
-  const sorted = [pubA, pubB].sort().join('|');
-  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sorted));
-  const hex = Array.from(new Uint8Array(digest))
-    .map((b) => b.toString(16).padStart(2, '0'))
-    .join('');
-  return hex.slice(0, 16).toUpperCase().match(/.{1,4}/g).join(' ');
 }

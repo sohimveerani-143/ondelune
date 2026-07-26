@@ -1,11 +1,11 @@
 {
-  "name": "Ondelune",
-  "short_name": "Ondelune",
-  "description": "A quiet, private, end-to-end encrypted space for two.",
+  "name": "Tidelight",
+  "short_name": "Tidelight",
+  "description": "Our space. Our time. Always together.",
   "start_url": "./index.html",
   "display": "standalone",
-  "background_color": "#11161a",
-  "theme_color": "#11161a",
+  "background_color": "#1b1533",
+  "theme_color": "#1b1533",
   "orientation": "portrait",
   "icons": [
     { "src": "icons/icon-192.png", "sizes": "192x192", "type": "image/png" },

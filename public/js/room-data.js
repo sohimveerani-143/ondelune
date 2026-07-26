@@ -4,6 +4,7 @@ import {
   db,
   ensureSignedIn,
   doc,
+  getDoc,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -21,6 +22,7 @@ function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
 }
 
+// ---------- Thread (shared messages) ----------
 export async function sendThreadMessage(roomId, sharedKey, text) {
   const user = await ensureSignedIn();
   const { ciphertext, nonce } = encryptJSON({ type: 'text', text }, sharedKey);
@@ -59,7 +61,9 @@ export function listenThread(roomId, sharedKey, onMessages) {
       let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
       try {
         parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
-      } catch (e) {}
+      } catch (e) {
+        /* leave fallback text */
+      }
       return {
         id: d.id,
         senderUid: data.senderUid,
@@ -74,6 +78,7 @@ export function listenThread(roomId, sharedKey, onMessages) {
   });
 }
 
+// ---------- Mood (one entry per person per day) ----------
 export async function setTodayMood(roomId, sharedKey, mood) {
   const user = await ensureSignedIn();
   const dateKey = new Date().toISOString().slice(0, 10);
@@ -97,17 +102,20 @@ export function listenMood(roomId, sharedKey, onEntries) {
       let mood = null;
       try {
         mood = decryptJSON(data.ciphertext, data.nonce, sharedKey).mood;
-      } catch (e) {}
+      } catch (e) {
+        /* skip */
+      }
       return { id: d.id, senderUid: data.senderUid, date: data.date, mood };
     });
     onEntries(entries);
   });
 }
 
+// ---------- Calendar ----------
 export async function addCalendarEvent(roomId, sharedKey, { title, dateTime }) {
   const { ciphertext, nonce } = encryptJSON({ title, dateTime }, sharedKey);
   await addDoc(col(roomId, 'calendar'), {
-    dateTime,
+    dateTime, // used for sort only; content itself is inside the ciphertext too
     ciphertext,
     nonce,
     createdAt: serverTimestamp(),
@@ -123,13 +131,16 @@ export function listenCalendar(roomId, sharedKey, onEvents) {
       let title = '⚠️ Could not decrypt';
       try {
         title = decryptJSON(data.ciphertext, data.nonce, sharedKey).title;
-      } catch (e) {}
+      } catch (e) {
+        /* skip */
+      }
       return { id: d.id, title, dateTime: data.dateTime };
     });
     onEvents(events);
   });
 }
 
+// ---------- Bucket list ----------
 export async function addBucketItem(roomId, sharedKey, text) {
   const { ciphertext, nonce } = encryptJSON({ text, done: false }, sharedKey);
   await addDoc(col(roomId, 'bucketlist'), {
@@ -156,13 +167,16 @@ export function listenBucketList(roomId, sharedKey, onItems) {
         const parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
         text = parsed.text;
         done = parsed.done;
-      } catch (e) {}
+      } catch (e) {
+        /* skip */
+      }
       return { id: d.id, text, done };
     });
     onItems(items);
   });
 }
 
+// ---------- Photo of the day ----------
 export async function setTodayPhoto(roomId, sharedKey, base64Jpeg) {
   const user = await ensureSignedIn();
   const dateKey = new Date().toISOString().slice(0, 10);
@@ -186,20 +200,45 @@ export function listenPhotos(roomId, sharedKey, onPhotos, limit = 14) {
       let image = null;
       try {
         image = decryptJSON(data.ciphertext, data.nonce, sharedKey).image;
-      } catch (e) {}
+      } catch (e) {
+        /* skip */
+      }
       return { id: d.id, senderUid: data.senderUid, date: data.date, image };
     });
     onPhotos(photos);
   });
 }
 
+// ---------- Room settings (together-since date + savings goal) ----------
 export async function setTogetherSince(roomId, sharedKey, isoDate) {
-  const { ciphertext, nonce } = encryptJSON({ togetherSince: isoDate }, sharedKey);
+  const current = await getRoomSettingsOnce(roomId, sharedKey);
+  const { ciphertext, nonce } = encryptJSON({ ...current, togetherSince: isoDate }, sharedKey);
   await setDoc(
     doc(db, 'rooms', roomId, 'meta', 'settings'),
     { ciphertext, nonce },
     { merge: true }
   );
+}
+
+export async function setSavingsGoal(roomId, sharedKey, goalAmount, goalLabel) {
+  const current = await getRoomSettingsOnce(roomId, sharedKey);
+  const { ciphertext, nonce } = encryptJSON({ ...current, savingsGoal: goalAmount, savingsGoalLabel: goalLabel }, sharedKey);
+  await setDoc(
+    doc(db, 'rooms', roomId, 'meta', 'settings'),
+    { ciphertext, nonce },
+    { merge: true }
+  );
+}
+
+async function getRoomSettingsOnce(roomId, sharedKey) {
+  const snap = await getDoc(doc(db, 'rooms', roomId, 'meta', 'settings'));
+  const data = snap.data();
+  if (!data) return {};
+  try {
+    return decryptJSON(data.ciphertext, data.nonce, sharedKey);
+  } catch (e) {
+    return {};
+  }
 }
 
 export function listenRoomSettings(roomId, sharedKey, onSettings) {
@@ -211,5 +250,123 @@ export function listenRoomSettings(roomId, sharedKey, onSettings) {
     } catch (e) {
       onSettings({});
     }
+  });
+}
+
+// ---------- Expense tracker (shared, split expenses) ----------
+export async function addExpense(roomId, sharedKey, { description, amount, paidBy }) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON(
+    { description, amount, paidBy: paidBy || user.uid },
+    sharedKey
+  );
+  await addDoc(col(roomId, 'expenses'), {
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function deleteExpense(roomId, expenseId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'expenses', expenseId));
+}
+
+export function listenExpenses(roomId, sharedKey, onExpenses) {
+  const q = query(col(roomId, 'expenses'), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snap) => {
+    const expenses = snap.docs.map((d) => {
+      const data = d.data();
+      let parsed = { description: '⚠️ Could not decrypt', amount: 0, paidBy: null };
+      try {
+        parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+      } catch (e) {
+        /* skip */
+      }
+      return {
+        id: d.id,
+        description: parsed.description,
+        amount: parsed.amount,
+        paidBy: parsed.paidBy,
+        createdAt: data.createdAt?.toDate?.() || new Date(),
+      };
+    });
+    onExpenses(expenses);
+  });
+}
+
+// ---------- Savings tracker (shared goal, e.g. toward a visit) ----------
+export async function addSavingsEntry(roomId, sharedKey, { label, amount }) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ label, amount, contributedBy: user.uid }, sharedKey);
+  await addDoc(col(roomId, 'savings'), {
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function deleteSavingsEntry(roomId, entryId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'savings', entryId));
+}
+
+export function listenSavings(roomId, sharedKey, onEntries) {
+  const q = query(col(roomId, 'savings'), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snap) => {
+    const entries = snap.docs.map((d) => {
+      const data = d.data();
+      let parsed = { label: '⚠️ Could not decrypt', amount: 0, contributedBy: null };
+      try {
+        parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+      } catch (e) {
+        /* skip */
+      }
+      return {
+        id: d.id,
+        label: parsed.label,
+        amount: parsed.amount,
+        contributedBy: parsed.contributedBy,
+        createdAt: data.createdAt?.toDate?.() || new Date(),
+      };
+    });
+    onEntries(entries);
+  });
+}
+
+// ---------- Journal (shared, freeform reflective entries) ----------
+export async function addJournalEntry(roomId, sharedKey, text) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ text }, sharedKey);
+  await addDoc(col(roomId, 'journal'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
+export async function deleteJournalEntry(roomId, entryId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'journal', entryId));
+}
+
+export function listenJournal(roomId, sharedKey, onEntries) {
+  const q = query(col(roomId, 'journal'), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snap) => {
+    const entries = snap.docs.map((d) => {
+      const data = d.data();
+      let text = '⚠️ Could not decrypt';
+      try {
+        text = decryptJSON(data.ciphertext, data.nonce, sharedKey).text;
+      } catch (e) {
+        /* skip */
+      }
+      return {
+        id: d.id,
+        senderUid: data.senderUid,
+        text,
+        createdAt: data.createdAt?.toDate?.() || new Date(),
+      };
+    });
+    onEntries(entries);
   });
 }

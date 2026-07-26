@@ -2,7 +2,7 @@
 import * as idbKeyval from 'https://esm.sh/idb-keyval@6';
 
 const { get, set, del } = idbKeyval;
-const KEY = 'ondelune-identity-v1';
+const KEY = 'tidelight-identity-v1';
 
 export async function loadIdentity() {
   return (await get(KEY)) || null;

@@ -1,5 +1,5 @@
 import { loadIdentity, updateIdentity, saveIdentity, clearIdentity, isPaired } from './store.js';
-import { generateKeyPair, deriveSharedKey, safetyNumber } from './crypto.js';
+import { generateKeyPair, deriveSharedKey } from './crypto.js';
 import {
   pairingLinkFor,
   getPairingIdFromUrl,
@@ -95,7 +95,8 @@ function renderEntryChoice() {
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
-      <h1>Welcome to Ondelune</h1>
+      <h1 class="wordmark" style="margin-bottom: 4px;">Tidelight</h1>
+      <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">Our space. Our time. Always together.</p>
       <p style="color:var(--text-dim); font-size:14.5px; max-width:320px;">
         A quiet, private space for the two of you. Everything here is encrypted before it ever leaves your phone.
       </p>
@@ -316,7 +317,7 @@ function renderWaitingScreen(pairingId) {
   document.getElementById('share-btn').onclick = async () => {
     if (navigator.share) {
       try {
-        await navigator.share({ title: 'Join me on Ondelune', url: link });
+        await navigator.share({ title: 'Join me on Tidelight', url: link });
       } catch (e) {
         /* cancelled */
       }
@@ -391,10 +392,11 @@ function renderMain() {
 function navHTML() {
   const tabs = [
     { id: 'home', label: 'Home', icon: iconHome() },
-    { id: 'thread', label: 'Thread', icon: iconThread() },
+    { id: 'thread', label: 'Chat', icon: iconThread() },
     { id: 'today', label: 'Today', icon: iconToday() },
     { id: 'calendar', label: 'Calendar', icon: iconCalendar() },
     { id: 'list', label: 'List', icon: iconList() },
+    { id: 'more', label: 'More', icon: iconMore() },
   ];
   return `<div class="nav">${tabs
     .map(
@@ -423,49 +425,92 @@ function renderTab(tab) {
   if (tab === 'today') return renderToday(slot);
   if (tab === 'calendar') return renderCalendar(slot);
   if (tab === 'list') return renderBucketList(slot);
+  if (tab === 'more') return renderMore(slot);
 }
 
 // ---------------- Home ----------------
+function heroSceneSVG() {
+  // Original SVG recreation (not a copy of any reference image) of a moonlit
+  // ocean horizon — the app's one signature visual. `data-mood="calm"` is a
+  // hook for a later feature: swapping the two shore figures for closer poses
+  // when one or both partners are feeling low, without rebuilding the scene.
+  return `
+  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="calm">
+    <defs>
+      <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#1b1533"/>
+        <stop offset="55%" stop-color="#3a2a52"/>
+        <stop offset="100%" stop-color="#e8916f"/>
+      </linearGradient>
+      <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#4a3560"/>
+        <stop offset="100%" stop-color="#1b1533"/>
+      </linearGradient>
+      <radialGradient id="moonGlow" cx="50%" cy="50%" r="50%">
+        <stop offset="0%" stop-color="#fdf1d3"/>
+        <stop offset="100%" stop-color="#f3d9a8" stop-opacity="0"/>
+      </radialGradient>
+    </defs>
+    <rect x="0" y="0" width="400" height="150" fill="url(#sky)"/>
+    <rect x="0" y="150" width="400" height="70" fill="url(#sea)"/>
+    <circle cx="200" cy="58" r="46" fill="url(#moonGlow)" opacity="0.55"/>
+    <circle class="hero-moon" cx="200" cy="58" r="22" fill="#f3d9a8"/>
+    <polygon points="185,150 215,150 230,220 170,220" fill="#f3d9a8" opacity="0.14"/>
+    <path d="M0,150 Q40,145 80,150 T160,150 T240,150 T320,150 T400,150 V158 Q360,153 320,158 T240,158 T160,158 T80,158 T0,158 Z" fill="#241c40" opacity="0.5"/>
+    <g class="figures">
+      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="188" cy="178" r="6" fill="#161029"/>
+      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="208" cy="178" r="6" fill="#161029"/>
+    </g>
+  </svg>`;
+}
+
 function renderHome(slot) {
   slot.innerHTML = `
     <div class="screen">
       <div style="display:flex; justify-content:space-between; align-items:flex-start;">
         <div>
-          <div class="eyebrow">Ondelune</div>
+          <div class="eyebrow">Tidelight</div>
           <h1 style="margin-bottom:16px;">Evening, ${escapeHTML(identity.displayName)}</h1>
         </div>
         <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
       </div>
-      <div class="moon-pair">
-        <svg class="thread-svg" viewBox="0 0 300 172" preserveAspectRatio="none">
-          <path class="thread-path" d="M 90 86 Q 150 40 210 86" />
-        </svg>
-        <div class="moon mine">
-          <div class="moon-time" id="my-time">--:--</div>
-          <div class="moon-label">You</div>
-        </div>
-        <div class="moon theirs">
-          <div class="moon-time" id="partner-time">--:--</div>
-          <div class="moon-label">${escapeHTML(identity.partnerName || 'Them')}</div>
+
+      <div class="hero-scene">
+        ${heroSceneSVG()}
+        <div class="hero-caption">Two shores, one sky.</div>
+      </div>
+
+      <div class="card">
+        <div style="display:flex; justify-content:space-between;">
+          <div>
+            <div class="eyebrow">You</div>
+            <div class="stat-number" id="my-time" style="font-size:20px;">--:--</div>
+          </div>
+          <div style="text-align:right;">
+            <div class="eyebrow">${escapeHTML(identity.partnerName || 'Them')}</div>
+            <div class="stat-number" id="partner-time" style="font-size:20px;">--:--</div>
+          </div>
         </div>
       </div>
-      <div class="card streak-card">
-        <div class="streak-dot"></div>
-        <div>
-          <div class="stat-number" id="streak-value" style="font-size:22px;">–</div>
-          <div class="stat-caption">day streak — showing up for each other</div>
-        </div>
-      </div>
+
       <div class="stat-row">
         <div class="card">
           <div class="stat-number" id="days-together">–</div>
           <div class="stat-caption">days together</div>
         </div>
         <div class="card">
-          <div class="stat-number" id="countdown-value">–</div>
-          <div class="stat-caption" id="countdown-caption">next moment</div>
+          <div class="stat-number" id="streak-value">–</div>
+          <div class="stat-caption">day streak</div>
         </div>
       </div>
+
+      <div class="card">
+        <div class="eyebrow" id="countdown-caption">Next shared moment</div>
+        <div class="stat-number" id="countdown-value" style="font-size:22px;">–</div>
+      </div>
+
       <div class="card" id="together-since-card">
         <div class="eyebrow">Together since</div>
         <input type="date" id="together-since-input" />
@@ -518,11 +563,11 @@ function renderHome(slot) {
       const diffMs = new Date(upcoming.dateTime) - Date.now();
       const days = Math.floor(diffMs / 86400000);
       const hours = Math.floor((diffMs % 86400000) / 3600000);
-      valueEl.textContent = days > 0 ? `${days}d` : `${hours}h`;
-      captionEl.textContent = upcoming.title;
+      valueEl.textContent = `${upcoming.title} — ${days > 0 ? `${days}d` : `${hours}h`}`;
+      captionEl.textContent = 'Next shared moment';
     } else {
-      valueEl.textContent = '–';
-      captionEl.textContent = 'nothing planned yet';
+      valueEl.textContent = 'Nothing planned yet';
+      captionEl.textContent = 'Next shared moment';
     }
   });
   unsubscribers.push(unsubCal);
@@ -541,16 +586,25 @@ function renderSettings() {
   clearListeners();
   root.innerHTML = `
     <div class="screen">
-      <div class="eyebrow">Ondelune</div>
+      <div class="eyebrow">Tidelight</div>
       <h1 style="margin-bottom:16px;">Settings</h1>
 
       <div class="card">
-        <div class="eyebrow">Security</div>
-        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
-          Every message, photo, and entry is end-to-end encrypted with a key that never leaves your device.
-          Below is a short fingerprint of this pairing — read it aloud to each other once to confirm it wasn't intercepted.
+        <div class="eyebrow">Encryption</div>
+        <p style="font-size:13.5px; color:var(--text-dim);">
+          Every message, photo, and entry is end-to-end encrypted with a key that's generated on your device
+          and never leaves it. Tidelight's servers only ever store unreadable ciphertext.
         </p>
-        <div class="pairing-link-box" id="safety-number">Computing…</div>
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Network privacy</div>
+        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
+          Tidelight can't change your device's network settings — no website can. What genuinely helps is
+          turning on <strong>DNS-over-HTTPS</strong> in your phone or browser, which stops your internet
+          provider from seeing which sites you visit as plain text lookups.
+        </p>
+        <button class="btn-secondary" id="dns-help-btn">How to turn this on</button>
       </div>
 
       <div class="card">
@@ -570,10 +624,11 @@ function renderSettings() {
       </div>
 
       <div class="card">
-        <div class="eyebrow">Photo privacy</div>
+        <div class="eyebrow">Photo &amp; message privacy</div>
         <p style="font-size:13.5px; color:var(--text-dim);">
-          View-once photos in Thread delete themselves after your partner opens them once. The app also blurs
-          images the instant it's backgrounded, so they can't appear in your phone's recent-apps preview.
+          View-once photos in Chat delete themselves after your partner opens them once. Any message or
+          photo either of you deletes is removed from the database entirely — nothing lingers. The app also
+          blurs images the instant it's backgrounded, so they can't appear in your phone's recent-apps preview.
           No website can block an actual screenshot — that protection only exists in native apps.
         </p>
       </div>
@@ -587,7 +642,7 @@ function renderSettings() {
               : "You haven't set up recovery. Logging out now means permanently losing access to your account and paired room — there is no way back in."
           }
         </p>
-        <button class="btn-secondary" id="logout-btn" style="color:var(--ember); border-color: var(--ember);">Log out</button>
+        <button class="btn-secondary" id="logout-btn" style="color:var(--horizon); border-color: var(--horizon);">Log out</button>
       </div>
 
       <button class="btn-secondary" id="back-home-btn">Back to Home</button>
@@ -597,21 +652,49 @@ function renderSettings() {
   document.getElementById('back-home-btn').onclick = () => renderMain();
   document.getElementById('toggle-pin-btn').onclick = () => renderPinChoiceFromSettings();
   document.getElementById('logout-btn').onclick = () => handleLogout();
+  document.getElementById('dns-help-btn').onclick = () => renderDnsHelp();
 
   const recoveryBtn = document.getElementById('setup-recovery-later-btn');
   if (recoveryBtn) recoveryBtn.onclick = () => renderRecoverySetupFromSettings();
+}
 
-  if (identity.partnerPublicKey) {
-    safetyNumber(identity.publicKey, identity.partnerPublicKey).then((code) => {
-      const el = document.getElementById('safety-number');
-      if (el) el.textContent = code;
-    });
-  }
+function renderDnsHelp() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Network privacy</div>
+      <h1 style="margin-bottom:16px;">Turning on DNS-over-HTTPS</h1>
+      <div class="card">
+        <div class="eyebrow">Android</div>
+        <p style="font-size:13.5px; color:var(--text-dim);">
+          Settings → Network &amp; internet → Private DNS → choose "Private DNS provider hostname" →
+          enter <strong>dns.google</strong> or <strong>1dot1dot1dot1.cloudflare-dns.com</strong>.
+        </p>
+      </div>
+      <div class="card">
+        <div class="eyebrow">Chrome browser</div>
+        <p style="font-size:13.5px; color:var(--text-dim);">
+          Settings → Privacy and security → Security → "Use secure DNS" → pick a provider from the list.
+        </p>
+      </div>
+      <div class="card">
+        <div class="eyebrow">What this does — and doesn't do</div>
+        <p style="font-size:13.5px; color:var(--text-dim);">
+          It stops your local network or ISP from seeing plain-text records of which domains you look up.
+          It does not hide the destination IP address itself from a sufficiently resourced network operator,
+          and it doesn't change what Tidelight already protects with encryption. Think of it as one more
+          honest layer, not a cloak of invisibility.
+        </p>
+      </div>
+      <button class="btn-secondary" id="back-settings-btn">Back to Settings</button>
+    </div>
+  `;
+  document.getElementById('back-settings-btn').onclick = () => renderSettings();
 }
 
 async function handleLogout() {
   const confirmed = identity.recoveryEmail
-    ? confirm('Log out of Ondelune on this device? You can sign back in with your recovery email and password.')
+    ? confirm('Log out of Tidelight on this device? You can sign back in with your recovery email and password.')
     : confirm(
         "You haven't set up recovery. Logging out now will PERMANENTLY delete access to your account and paired room on this device — there is no way to undo this.\n\nAre you absolutely sure you want to log out?"
       );
@@ -694,7 +777,7 @@ function renderThread(slot) {
   slot.innerHTML = `
     <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
       <div class="eyebrow">Just the two of you</div>
-      <h2 style="margin-bottom:12px;">Thread</h2>
+      <h2 style="margin-bottom:12px;">Chat</h2>
       <div class="thread-list" id="thread-list" style="flex:1; overflow-y:auto;"></div>
       <div class="composer">
         <label class="btn-icon" style="cursor:pointer;">
@@ -716,13 +799,15 @@ function renderThread(slot) {
     listEl.innerHTML = messages
       .map((m, idx) => {
         const mine = m.senderUid === lastKnownUid;
+        const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
         if (m.type === 'photo') {
           return `<div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}">
+            ${deleteBtn}
             <img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
             ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}
           </div>`;
         }
-        return `<div class="bubble ${mine ? 'me' : 'them'}">${escapeHTML(m.text)}</div>`;
+        return `<div class="bubble ${mine ? 'me' : 'them'}">${deleteBtn}${escapeHTML(m.text)}</div>`;
       })
       .join('');
     listEl.scrollTop = listEl.scrollHeight;
@@ -736,6 +821,17 @@ function renderThread(slot) {
         setTimeout(() => {
           RoomData.deleteThreadMessage(identity.roomId, message.id);
         }, 6000);
+      };
+    });
+
+    listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.deleteIdx);
+        const message = messages[idx];
+        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
+          RoomData.deleteThreadMessage(identity.roomId, message.id);
+        }
       };
     });
   });
@@ -763,7 +859,7 @@ function renderThread(slot) {
   };
 }
 
-// ---------------- Today ----------------
+// ---------------- Today (Check-in + Play) ----------------
 const MOODS = ['😊', '😌', '😴', '😔', '😤', '🥰'];
 
 function renderToday(slot) {
@@ -921,6 +1017,274 @@ function renderBucketList(slot) {
   unsubscribers.push(unsub);
 }
 
+// ---------------- More (Shortcuts) ----------------
+function renderMore(slot) {
+  slot.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Tidelight</div>
+      <h2 style="margin-bottom:16px;">More</h2>
+      <div class="shortcut-grid">
+        <div class="shortcut-tile" id="tile-expense">
+          ${iconExpense()}
+          <div class="shortcut-tile-label">Expenses</div>
+          <div class="shortcut-tile-caption">Shared spending</div>
+        </div>
+        <div class="shortcut-tile" id="tile-savings">
+          ${iconSavings()}
+          <div class="shortcut-tile-label">Savings</div>
+          <div class="shortcut-tile-caption">Toward your next visit</div>
+        </div>
+        <div class="shortcut-tile" id="tile-journal">
+          ${iconJournal()}
+          <div class="shortcut-tile-label">Journal</div>
+          <div class="shortcut-tile-caption">Longer thoughts, shared</div>
+        </div>
+        <div class="shortcut-tile" id="tile-settings">
+          ${iconSettings()}
+          <div class="shortcut-tile-label">Settings</div>
+          <div class="shortcut-tile-caption">Security &amp; account</div>
+        </div>
+      </div>
+    </div>
+  `;
+  document.getElementById('tile-expense').onclick = () => renderExpenseTracker();
+  document.getElementById('tile-savings').onclick = () => renderSavingsTracker();
+  document.getElementById('tile-journal').onclick = () => renderJournal();
+  document.getElementById('tile-settings').onclick = () => renderSettings();
+}
+
+// ---------------- Expense tracker ----------------
+function renderExpenseTracker() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Shared spending</div>
+      <h2 style="margin-bottom:14px;">Expenses</h2>
+      <div class="card" id="expense-summary">
+        <div class="stat-caption">Loading…</div>
+      </div>
+      <div class="card">
+        <input type="text" id="expense-desc" placeholder="What was it for?" style="margin-bottom:8px;" />
+        <input type="number" id="expense-amount" placeholder="Amount" style="margin-bottom:8px;" />
+        <select id="expense-paidby" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:13px; color:var(--text); padding:12px 14px; margin-bottom:10px;">
+          <option value="${lastKnownUid}">I paid</option>
+          <option value="${identity.partnerUid || ''}">${escapeHTML(identity.partnerName || 'They')} paid</option>
+        </select>
+        <button class="btn-primary" id="add-expense-btn">Add expense</button>
+      </div>
+      <div class="card" id="expense-list"></div>
+      <button class="btn-secondary" id="back-more-btn">Back</button>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-expense-btn').onclick = async () => {
+    const description = document.getElementById('expense-desc').value.trim();
+    const amount = parseFloat(document.getElementById('expense-amount').value);
+    const paidBy = document.getElementById('expense-paidby').value;
+    if (!description || !amount) return;
+    await RoomData.addExpense(identity.roomId, sharedKey, { description, amount, paidBy });
+    document.getElementById('expense-desc').value = '';
+    document.getElementById('expense-amount').value = '';
+  };
+
+  const unsub = RoomData.listenExpenses(identity.roomId, sharedKey, (expenses) => {
+    const listEl = document.getElementById('expense-list');
+    const summaryEl = document.getElementById('expense-summary');
+
+    if (expenses.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">No expenses logged yet</div>`;
+      summaryEl.innerHTML = `<div class="stat-caption">Nothing tracked yet</div>`;
+      return;
+    }
+
+    const totalMine = expenses.filter((e) => e.paidBy === lastKnownUid).reduce((s, e) => s + e.amount, 0);
+    const totalTheirs = expenses.filter((e) => e.paidBy === identity.partnerUid).reduce((s, e) => s + e.amount, 0);
+    const diff = totalMine - totalTheirs;
+    let summaryText;
+    if (Math.abs(diff) < 0.01) summaryText = "You're even.";
+    else if (diff > 0) summaryText = `${escapeHTML(identity.partnerName || 'They')} owes you ${(diff / 2).toFixed(2)}`;
+    else summaryText = `You owe ${escapeHTML(identity.partnerName || 'them')} ${(Math.abs(diff) / 2).toFixed(2)}`;
+
+    summaryEl.innerHTML = `
+      <div class="eyebrow">Balance</div>
+      <div class="stat-number" style="font-size:20px;">${summaryText}</div>
+    `;
+
+    listEl.innerHTML = expenses
+      .map(
+        (e) => `
+      <div class="money-row" data-id="${e.id}">
+        <div>
+          <div>${escapeHTML(e.description)}</div>
+          <div class="journal-meta">${e.paidBy === lastKnownUid ? 'You paid' : `${escapeHTML(identity.partnerName || 'They')} paid`}</div>
+        </div>
+        <div class="money-amount">${e.amount.toFixed(2)}</div>
+      </div>`
+      )
+      .join('');
+
+    listEl.querySelectorAll('.money-row').forEach((row) => {
+      row.ondblclick = () => {
+        if (confirm('Delete this expense?')) RoomData.deleteExpense(identity.roomId, row.dataset.id);
+      };
+    });
+  });
+  unsubscribers.push(unsub);
+}
+
+// ---------------- Savings tracker ----------------
+function renderSavingsTracker() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Saving together</div>
+      <h2 style="margin-bottom:14px;">Savings</h2>
+      <div class="card" id="savings-progress">
+        <div class="stat-caption">Loading…</div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">Goal</div>
+        <input type="text" id="goal-label" placeholder="e.g. Flight to see her" style="margin-bottom:8px;" />
+        <input type="number" id="goal-amount" placeholder="Goal amount" style="margin-bottom:10px;" />
+        <button class="btn-secondary" id="save-goal-btn">Set goal</button>
+      </div>
+      <div class="card">
+        <input type="text" id="entry-label" placeholder="What's this contribution for?" style="margin-bottom:8px;" />
+        <input type="number" id="entry-amount" placeholder="Amount" style="margin-bottom:10px;" />
+        <button class="btn-primary" id="add-entry-btn">Add contribution</button>
+      </div>
+      <div class="card" id="savings-list"></div>
+      <button class="btn-secondary" id="back-more-btn">Back</button>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+
+  document.getElementById('save-goal-btn').onclick = async () => {
+    const label = document.getElementById('goal-label').value.trim();
+    const amount = parseFloat(document.getElementById('goal-amount').value);
+    if (!label || !amount) return;
+    await RoomData.setSavingsGoal(identity.roomId, sharedKey, amount, label);
+  };
+
+  document.getElementById('add-entry-btn').onclick = async () => {
+    const label = document.getElementById('entry-label').value.trim();
+    const amount = parseFloat(document.getElementById('entry-amount').value);
+    if (!label || !amount) return;
+    await RoomData.addSavingsEntry(identity.roomId, sharedKey, { label, amount });
+    document.getElementById('entry-label').value = '';
+    document.getElementById('entry-amount').value = '';
+  };
+
+  let goalAmount = 0;
+  let goalLabel = '';
+  const unsubSettings = RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
+    goalAmount = settings.savingsGoal || 0;
+    goalLabel = settings.savingsGoalLabel || '';
+    if (goalLabel) document.getElementById('goal-label').value = goalLabel;
+    if (goalAmount) document.getElementById('goal-amount').value = goalAmount;
+    renderSavingsProgress();
+  });
+  unsubscribers.push(unsubSettings);
+
+  let currentTotal = 0;
+  function renderSavingsProgress() {
+    const el = document.getElementById('savings-progress');
+    if (!el) return;
+    if (!goalAmount) {
+      el.innerHTML = `<div class="stat-caption">Set a goal to start tracking progress</div>`;
+      return;
+    }
+    const pct = Math.min(100, Math.round((currentTotal / goalAmount) * 100));
+    el.innerHTML = `
+      <div class="eyebrow">${escapeHTML(goalLabel || 'Goal')}</div>
+      <div class="stat-number" style="font-size:22px;">${currentTotal.toFixed(2)} / ${goalAmount.toFixed(2)}</div>
+      <div class="progress-track"><div class="progress-fill" style="width:${pct}%;"></div></div>
+      <div class="stat-caption">${pct}% there</div>
+    `;
+  }
+
+  const unsub = RoomData.listenSavings(identity.roomId, sharedKey, (entries) => {
+    currentTotal = entries.reduce((s, e) => s + e.amount, 0);
+    renderSavingsProgress();
+
+    const listEl = document.getElementById('savings-list');
+    if (entries.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">No contributions yet</div>`;
+      return;
+    }
+    listEl.innerHTML = entries
+      .map(
+        (e) => `
+      <div class="money-row" data-id="${e.id}">
+        <div>
+          <div>${escapeHTML(e.label)}</div>
+          <div class="journal-meta">${e.contributedBy === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')}</div>
+        </div>
+        <div class="money-amount">+${e.amount.toFixed(2)}</div>
+      </div>`
+      )
+      .join('');
+    listEl.querySelectorAll('.money-row').forEach((row) => {
+      row.ondblclick = () => {
+        if (confirm('Delete this contribution?')) RoomData.deleteSavingsEntry(identity.roomId, row.dataset.id);
+      };
+    });
+  });
+  unsubscribers.push(unsub);
+}
+
+// ---------------- Journal ----------------
+function renderJournal() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Longer thoughts, shared</div>
+      <h2 style="margin-bottom:14px;">Journal</h2>
+      <div class="card">
+        <textarea id="journal-input" rows="4" placeholder="Write something that doesn't fit in a quick message..." style="resize:vertical;"></textarea>
+        <button class="btn-primary" id="add-journal-btn" style="margin-top:10px;">Save entry</button>
+      </div>
+      <div id="journal-list"></div>
+      <button class="btn-secondary" id="back-more-btn">Back</button>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-journal-btn').onclick = async () => {
+    const text = document.getElementById('journal-input').value.trim();
+    if (!text) return;
+    document.getElementById('journal-input').value = '';
+    await RoomData.addJournalEntry(identity.roomId, sharedKey, text);
+  };
+
+  const unsub = RoomData.listenJournal(identity.roomId, sharedKey, (entries) => {
+    const listEl = document.getElementById('journal-list');
+    if (entries.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">No entries yet</div>`;
+      return;
+    }
+    listEl.innerHTML = `<div class="card">${entries
+      .map(
+        (e, idx) => `
+      <div class="journal-entry" data-idx="${idx}">
+        <div>${escapeHTML(e.text)}</div>
+        <div class="journal-meta">
+          ${e.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')} · ${e.createdAt.toLocaleDateString()}
+          ${e.senderUid === lastKnownUid ? ' · <span class="journal-delete" data-idx="' + idx + '" style="cursor:pointer; text-decoration:underline;">delete</span>' : ''}
+        </div>
+      </div>`
+      )
+      .join('')}</div>`;
+
+    listEl.querySelectorAll('.journal-delete').forEach((btn) => {
+      btn.onclick = () => {
+        const entry = entries[Number(btn.dataset.idx)];
+        if (confirm('Delete this journal entry?')) RoomData.deleteJournalEntry(identity.roomId, entry.id);
+      };
+    });
+  });
+  unsubscribers.push(unsub);
+}
+
 // ---------------- Utilities ----------------
 function escapeHTML(str) {
   const div = document.createElement('div');
@@ -949,6 +1313,18 @@ function iconSettings() {
 function iconPhoto() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><rect x="3" y="5" width="18" height="14" rx="2"/><circle cx="12" cy="12" r="3.5"/><path d="M8 5l1.5-2h5L16 5"/></svg>';
 }
+function iconMore() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="5" cy="12" r="1.4"/><circle cx="12" cy="12" r="1.4"/><circle cx="19" cy="12" r="1.4"/></svg>';
+}
+function iconExpense() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="12" cy="12" r="9"/><path d="M12 7v10M15 9.5c0-1.4-1.3-2.5-3-2.5s-3 1-3 2.2c0 3 6 1.4 6 4.3 0 1.3-1.3 2.5-3 2.5s-3-1.1-3-2.5"/></svg>';
+}
+function iconSavings() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M4 12a8 8 0 1116 0 8 8 0 01-16 0z"/><path d="M12 8v4l3 2"/></svg>';
+}
+function iconJournal() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 4h9a2 2 0 012 2v14l-4-2-4 2-4-2-2 2V6a2 2 0 012-2z"/><path d="M9 9h6M9 13h4"/></svg>';
+}
 
 // ---------------- Photo privacy: blur on background, auto-lock on return ----------------
 document.addEventListener('visibilitychange', () => {
@@ -964,6 +1340,7 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('blur', () => document.body.classList.add('privacy-blur'));
 window.addEventListener('focus', () => document.body.classList.remove('privacy-blur'));
 
+// Catch anything that slips through so the app never just goes blank.
 window.addEventListener('error', (e) => {
   if (root.innerHTML.trim() === '') {
     renderFatalError(e.error || new Error(e.message));

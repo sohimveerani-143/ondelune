@@ -21,6 +21,7 @@ export async function recordActivity(roomId) {
   });
 }
 
+// memberUids: the room's two uids (order doesn't matter here).
 export function listenStreak(roomId, memberUids, onStreak) {
   const q = query(collection(db, 'rooms', roomId, 'activity'), orderBy('date', 'desc'), limit(160));
   return onSnapshot(q, (snap) => {
@@ -36,7 +37,7 @@ export function listenStreak(roomId, memberUids, onStreak) {
     const bothActive = (dateStr) => datesA.has(dateStr) && datesB.has(dateStr);
 
     let streak = 0;
-    let offset = bothActive(todayUTC()) ? 0 : -1;
+    let offset = bothActive(todayUTC()) ? 0 : -1; // don't zero out the streak right at midnight
     while (bothActive(todayUTC(offset))) {
       streak += 1;
       offset -= 1;

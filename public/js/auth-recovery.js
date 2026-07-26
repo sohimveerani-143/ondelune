@@ -1,7 +1,10 @@
 // auth-recovery.js — OPTIONAL, but recommended. Upgrades the anonymous identity to
-// one recoverable by email + password, using Firebase's "link" flow so the UID
-// (and therefore your paired room) stays the same. The backup itself is encrypted
-// with a key derived from your password before it ever leaves the device.
+// one recoverable by email + password. Critically, this uses Firebase's "link"
+// flow rather than creating a new account — the UID stays the same, so the paired
+// room and all history remain accessible after recovery. Nothing here weakens the
+// end-to-end encryption: the backup itself is encrypted with a key derived from
+// your password before it ever leaves the device, so Firebase still only ever
+// stores ciphertext.
 import { auth, db, doc, setDoc, getDoc } from './firebase.js';
 import {
   EmailAuthProvider,
@@ -34,6 +37,7 @@ export async function setUpRecovery(email, password, identity) {
   });
 }
 
+// Called on a fresh device with no local identity at all.
 export async function recoverFromEmail(email, password) {
   const cred = await signInWithEmailAndPassword(auth, email, password);
   const snap = await getDoc(doc(db, 'users', cred.user.uid, 'backup', 'identity'));
