@@ -38,13 +38,22 @@ export async function createPairing({ publicKey, displayName, timezone }) {
 }
 
 // Creator side: listen until the partner joins.
-export function listenForJoin(pairingId, onJoined) {
-  return onSnapshot(doc(db, 'pairings', pairingId), (snap) => {
-    const data = snap.data();
-    if (data && data.status === 'paired' && data.joinerPublicKey) {
-      onJoined(data);
+// onError is invoked if the listener itself fails (e.g. a permission or network
+// error). Without it, a failed listener would die silently and the creator would
+// wait forever — the exact "stuck on Waiting for them" symptom.
+export function listenForJoin(pairingId, onJoined, onError) {
+  return onSnapshot(
+    doc(db, 'pairings', pairingId),
+    (snap) => {
+      const data = snap.data();
+      if (data && data.status === 'paired' && data.joinerPublicKey) {
+        onJoined(data);
+      }
+    },
+    (err) => {
+      if (onError) onError(err);
     }
-  });
+  );
 }
 
 // Once the creator sees the join, finalize the shared room doc.
@@ -72,6 +81,14 @@ export async function joinPairing(pairingId, { publicKey, displayName, timezone 
     const data = snap.data();
     if (data.status === 'paired') {
       throw new Error('This pairing link has already been used.');
+    }
+    // A pairing link is meant to connect two different people. If the same
+    // anonymous account opens its own link (e.g. two tabs in one browser
+    // profile share a UID), fail clearly instead of "pairing" with itself.
+    if (data.creatorUid === user.uid) {
+      throw new Error(
+        "This link was created on this same account. Open it on your partner's device (or a private/incognito window), not the one that made it."
+      );
     }
     tx.update(pairingRef, {
       joinerUid: user.uid,

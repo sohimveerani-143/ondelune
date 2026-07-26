@@ -13,6 +13,7 @@ import {
   addDoc,
   query,
   orderBy,
+  limit as fbLimit,
   serverTimestamp,
 } from './firebase.js';
 import { encryptJSON, decryptJSON } from './crypto.js';
@@ -263,10 +264,12 @@ export async function setTodayPhoto(roomId, sharedKey, base64Jpeg) {
   await recordActivity(roomId);
 }
 
-export function listenPhotos(roomId, sharedKey, onPhotos, limit = 14) {
-  const q = query(col(roomId, 'photos'), orderBy('createdAt', 'desc'));
+export function listenPhotos(roomId, sharedKey, onPhotos, max = 14) {
+  // Cap the query itself so a growing photo history never pulls every base64
+  // image down onto a low-RAM device — only the most recent `max` load.
+  const q = query(col(roomId, 'photos'), orderBy('createdAt', 'desc'), fbLimit(max));
   return onSnapshot(q, (snap) => {
-    const photos = snap.docs.slice(0, limit).map((d) => {
+    const photos = snap.docs.map((d) => {
       const data = d.data();
       let image = null;
       try {

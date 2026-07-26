@@ -305,14 +305,20 @@ function renderWaitingScreen(pairingId) {
       <div class="mark"></div>
       <h1>Waiting for them</h1>
       <p style="color:var(--text-dim); font-size:14.5px;">Send this link to your person. It only ever works once.</p>
-      <div class="pairing-link-box" id="link-box">${link}</div>
+      <div class="pairing-link-box" id="link-box">${escapeHTML(link)}</div>
       <button class="btn-secondary" id="copy-btn">Copy link</button>
       <button class="btn-primary" id="share-btn">Share</button>
+      <div id="pair-error" class="error-text" style="min-height:18px; width:100%;"></div>
+      <button class="btn-secondary" id="cancel-pair-btn" style="width:100%; opacity:0.8;">Cancel &amp; start over</button>
     </div>
   `;
   document.getElementById('copy-btn').onclick = async () => {
-    await navigator.clipboard.writeText(link);
-    document.getElementById('copy-btn').textContent = 'Copied ✓';
+    try {
+      await navigator.clipboard.writeText(link);
+      document.getElementById('copy-btn').textContent = 'Copied ✓';
+    } catch (e) {
+      showPairError('Copy failed — long-press the link above to copy it manually.');
+    }
   };
   document.getElementById('share-btn').onclick = async () => {
     if (navigator.share) {
@@ -321,27 +327,83 @@ function renderWaitingScreen(pairingId) {
       } catch (e) {
         /* cancelled */
       }
+    } else {
+      try {
+        await navigator.clipboard.writeText(link);
+        document.getElementById('share-btn').textContent = 'Link copied ✓';
+      } catch (e) {
+        showPairError('Sharing isn’t supported here — copy the link instead.');
+      }
     }
   };
 
-  const unsub = listenForJoin(pairingId, async (data) => {
-    const roomId = await finalizeRoomAsCreator({
-      myPublicKey: identity.publicKey,
-      partnerPublicKey: data.joinerPublicKey,
-      myUid: data.creatorUid,
-      partnerUid: data.joinerUid,
-    });
-    identity = await updateIdentity({
-      partnerPublicKey: data.joinerPublicKey,
-      partnerName: data.joinerName,
-      partnerTimezone: data.joinerTimezone,
-      partnerUid: data.joinerUid,
-      roomId,
-      pending: null,
-    });
-    sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
-    renderMain();
-  });
+  document.getElementById('cancel-pair-btn').onclick = async () => {
+    if (!confirm('Cancel this pairing link and start over? The link you already sent will stop working.')) return;
+    clearListeners();
+    identity = await updateIdentity({ pending: null });
+    renderPairingHub();
+  };
+
+  function showPairError(html) {
+    const el = document.getElementById('pair-error');
+    if (el) el.innerHTML = html;
+  }
+
+  // Guard so a re-fired snapshot (cache→server, or a reconnect) can't run the
+  // finalize twice or race with an in-flight attempt.
+  let finalizing = false;
+  let done = false;
+
+  async function finalize(data) {
+    if (done || finalizing) return;
+    finalizing = true;
+    showPairError('');
+    try {
+      // Never a valid real-world case — the same account can't be both people.
+      if (data.creatorUid === data.joinerUid) {
+        throw new Error('This link was opened on the same account that created it. Open it on their device instead.');
+      }
+      const roomId = await finalizeRoomAsCreator({
+        myPublicKey: identity.publicKey,
+        partnerPublicKey: data.joinerPublicKey,
+        myUid: data.creatorUid,
+        partnerUid: data.joinerUid,
+      });
+      identity = await updateIdentity({
+        partnerPublicKey: data.joinerPublicKey,
+        partnerName: data.joinerName,
+        partnerTimezone: data.joinerTimezone,
+        partnerUid: data.joinerUid,
+        roomId,
+        pending: null,
+      });
+      done = true;
+      clearListeners();
+      sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
+      renderMain();
+    } catch (err) {
+      console.error('Pairing finalize failed:', err);
+      finalizing = false;
+      showPairError(
+        `They joined, but finishing the connection failed: ${escapeHTML(err?.message || 'unknown error')} ` +
+          `<button id="pair-retry-btn" class="btn-secondary" style="width:100%; margin-top:8px;">Try again</button>`
+      );
+      const retry = document.getElementById('pair-retry-btn');
+      if (retry) retry.onclick = () => finalize(data);
+    }
+  }
+
+  const unsub = listenForJoin(
+    pairingId,
+    (data) => finalize(data),
+    (err) => {
+      console.error('Pairing listener error:', err);
+      showPairError(
+        `Lost the connection while waiting: ${escapeHTML(err?.message || 'network error')}. ` +
+          `It’ll keep retrying — or reopen the app if it stays stuck.`
+      );
+    }
+  );
   unsubscribers.push(unsub);
 }
 
@@ -357,7 +419,11 @@ function renderJoinScreen(pairingId) {
       <div id="join-error" class="error-text"></div>
     </div>
   `;
-  document.getElementById('join-btn').onclick = async () => {
+  const joinBtn = document.getElementById('join-btn');
+  joinBtn.onclick = async () => {
+    joinBtn.disabled = true;
+    joinBtn.textContent = 'Connecting…';
+    document.getElementById('join-error').textContent = '';
     try {
       const result = await joinPairing(pairingId, {
         publicKey: identity.publicKey,
@@ -377,6 +443,8 @@ function renderJoinScreen(pairingId) {
       renderMain();
     } catch (e) {
       document.getElementById('join-error').textContent = e.message;
+      joinBtn.disabled = false;
+      joinBtn.textContent = 'Connect';
     }
   };
 }
@@ -508,7 +576,7 @@ function renderHome(slot) {
         </div>
         <div style="flex:1;">
           <div class="eyebrow">Tidelight</div>
-          <h1 style="margin-bottom:16px;">Evening, ${escapeHTML(identity.displayName)}</h1>
+          <h1 style="margin-bottom:16px;">${greetingFor(identity.displayName)}</h1>
         </div>
         <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
       </div>
@@ -574,8 +642,9 @@ function renderHome(slot) {
       (uid, avatar) => {
         const targetId = uid === lastKnownUid ? 'avatar-mine' : 'avatar-theirs';
         const el = document.getElementById(targetId);
-        if (!el || !avatar) return;
-        el.style.backgroundImage = `url(${avatar})`;
+        const src = safeMediaSrc(avatar, 'image');
+        if (!el || !src) return;
+        el.style.backgroundImage = `url("${src}")`;
         el.textContent = '';
       }
     );
@@ -637,7 +706,7 @@ function renderHome(slot) {
   if (identity.partnerUid) {
     const unsubStreak = listenStreak(identity.roomId, memberUidsOf(identity), (streak) => {
       const el = document.getElementById('streak-value');
-      if (el) el.textContent = streak;
+      if (el) el.textContent = streak > 0 ? `${streak} 🔥` : '0';
     });
     unsubscribers.push(unsubStreak);
   }
@@ -884,6 +953,12 @@ function renderThread(slot) {
     listEl.innerHTML = messages
       .map((m, idx) => {
         const mine = m.senderUid === lastKnownUid;
+        const prev = messages[idx - 1];
+        const divider =
+          !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()
+            ? `<div class="day-divider">${escapeHTML(dayLabel(m.createdAt))}</div>`
+            : '';
+        const when = escapeHTML(timeLabel(m.createdAt));
         const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
         const pinBtn = `<span class="bubble-pin" data-pin-idx="${idx}" title="Save as a memory">${iconPinSmall()}</span>`;
         const sendingTag = mine && m.pending
@@ -891,25 +966,28 @@ function renderThread(slot) {
           : '';
 
         if (m.type === 'photo') {
-          return `<div>
-            <div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}">
+          const src = safeMediaSrc(m.image, 'image');
+          return `${divider}<div>
+            <div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}" title="${when}">
               ${deleteBtn}${pinBtn}
-              <img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
+              ${src
+                ? `<img src="${src}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />`
+                : `<div class="empty-state" style="padding:20px;">⚠️ Photo unavailable</div>`}
               ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}
             </div>${sendingTag}
           </div>`;
         }
         if (m.type === 'voice') {
-          return `<div>
-            <div class="bubble ${mine ? 'me' : 'them'} voice-bubble" data-idx="${idx}">
+          return `${divider}<div>
+            <div class="bubble ${mine ? 'me' : 'them'} voice-bubble" data-idx="${idx}" title="${when}">
               ${deleteBtn}${pinBtn}
               <button class="voice-play-btn" data-idx="${idx}">${iconPlay()}</button>
               <span>Voice note · ${m.audioDuration || 0}s</span>
             </div>${sendingTag}
           </div>`;
         }
-        return `<div>
-          <div class="bubble ${mine ? 'me' : 'them'}">${deleteBtn}${pinBtn}${escapeHTML(m.text)}</div>${sendingTag}
+        return `${divider}<div>
+          <div class="bubble ${mine ? 'me' : 'them'}" title="${when}">${deleteBtn}${pinBtn}${escapeHTML(m.text)}</div>${sendingTag}
         </div>`;
       })
       .join('');
@@ -931,9 +1009,10 @@ function renderThread(slot) {
       btn.onclick = () => {
         const idx = Number(btn.dataset.idx);
         const message = messages[idx];
-        if (!message.audio) return;
-        const audio = new Audio(message.audio);
-        audio.play();
+        const src = safeMediaSrc(message.audio, 'audio');
+        if (!src) return;
+        const audio = new Audio(src);
+        audio.play().catch(() => {});
       };
     });
 
@@ -1099,8 +1178,9 @@ function renderToday(slot) {
       return;
     }
     grid.innerHTML = photos
-      .filter((p) => p.image)
-      .map((p) => `<img src="${p.image}" alt="${p.date}" />`)
+      .map((p) => ({ ...p, src: safeMediaSrc(p.image, 'image') }))
+      .filter((p) => p.src)
+      .map((p) => `<img src="${p.src}" alt="${escapeHTML(p.date || '')}" />`)
       .join('');
   });
   unsubscribers.push(unsubPhotos);
@@ -1333,8 +1413,12 @@ function renderMemories() {
     listEl.innerHTML = memories
       .map((m, idx) => {
         let body = '';
-        if (m.type === 'photo') body = `<img src="${m.image}" style="width:100%; border-radius:13px;" />`;
-        else if (m.type === 'voice') body = `<div>Voice note · ${m.audioDuration || 0}s</div>`;
+        if (m.type === 'photo') {
+          const src = safeMediaSrc(m.image, 'image');
+          body = src
+            ? `<img src="${src}" style="width:100%; border-radius:13px;" />`
+            : `<div class="empty-state" style="padding:16px;">⚠️ Photo unavailable</div>`;
+        } else if (m.type === 'voice') body = `<div>Voice note · ${m.audioDuration || 0}s</div>`;
         else body = `<div>${escapeHTML(m.text)}</div>`;
         return `<div class="card" data-idx="${idx}">
           ${body}
@@ -1590,6 +1674,37 @@ function escapeHTML(str) {
   const div = document.createElement('div');
   div.textContent = str ?? '';
   return div.innerHTML;
+}
+
+// Defense-in-depth: content is E2E-encrypted between two trusted people, but we
+// still never trust a decrypted blob to be a well-formed data: URL. Only allow
+// genuine base64 data URLs of the expected kind — anything else (a crafted
+// payload trying to break out of an attribute or a url()) renders as nothing.
+function safeMediaSrc(value, kind = 'image') {
+  const s = String(value ?? '');
+  const re = kind === 'audio'
+    ? /^data:audio\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i
+    : /^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i;
+  return re.test(s) ? s : '';
+}
+
+function dayLabel(date) {
+  const d = new Date(date);
+  const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
+  const diff = Math.round((startOf(new Date()) - startOf(d)) / 86400000);
+  if (diff <= 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  return d.toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function timeLabel(date) {
+  return new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function greetingFor(name) {
+  const h = new Date().getHours();
+  const part = h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : h < 21 ? 'Good evening' : 'Good night';
+  return `${part}, ${escapeHTML(name)}`;
 }
 
 function iconHome() {
