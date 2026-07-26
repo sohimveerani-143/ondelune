@@ -122,31 +122,61 @@ export function listenMemories(roomId, sharedKey, onMemories) {
   });
 }
 
+// Reactions live in their own encrypted field on the message doc, so adding one
+// never re-encrypts (or risks clobbering) the message body itself.
+export async function setReaction(roomId, sharedKey, messageId, reactions) {
+  const { ciphertext, nonce } = encryptJSON(reactions || {}, sharedKey);
+  await updateDoc(doc(db, 'rooms', roomId, 'thread', messageId), {
+    rxCipher: ciphertext,
+    rxNonce: nonce,
+  });
+}
+
+function decodeMessageDoc(d, sharedKey) {
+  const data = d.data();
+  let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
+  try {
+    parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+  } catch (e) {
+    /* leave fallback text */
+  }
+  let reactions = {};
+  if (data.rxCipher && data.rxNonce) {
+    try {
+      reactions = decryptJSON(data.rxCipher, data.rxNonce, sharedKey) || {};
+    } catch (e) {
+      /* ignore an unreadable reaction — never break the message */
+    }
+  }
+  return {
+    id: d.id,
+    senderUid: data.senderUid,
+    type: parsed.type || 'text',
+    text: parsed.text,
+    image: parsed.image,
+    audio: parsed.audio,
+    audioDuration: parsed.audioDuration,
+    viewOnce: parsed.viewOnce,
+    reactions,
+    pending: d.metadata?.hasPendingWrites,
+    createdAt: data.createdAt?.toDate?.() || new Date(),
+  };
+}
+
 export function listenThread(roomId, sharedKey, onMessages) {
   const q = query(col(roomId, 'thread'), orderBy('createdAt', 'asc'));
   return onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
-    const messages = snap.docs.map((d) => {
-      const data = d.data();
-      let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
-      try {
-        parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
-      } catch (e) {
-        /* leave fallback text */
-      }
-      return {
-        id: d.id,
-        senderUid: data.senderUid,
-        type: parsed.type || 'text',
-        text: parsed.text,
-        image: parsed.image,
-        audio: parsed.audio,
-        audioDuration: parsed.audioDuration,
-        viewOnce: parsed.viewOnce,
-        pending: d.metadata.hasPendingWrites,
-        createdAt: data.createdAt?.toDate?.() || new Date(),
-      };
-    });
-    onMessages(messages);
+    onMessages(snap.docs.map((d) => decodeMessageDoc(d, sharedKey)));
+  });
+}
+
+// Cheap listener for notifications: only ever pulls the single newest message,
+// so it can stay subscribed app-wide without dragging the whole history around.
+export function listenLatestMessage(roomId, sharedKey, onMessage) {
+  const q = query(col(roomId, 'thread'), orderBy('createdAt', 'desc'), fbLimit(1));
+  return onSnapshot(q, (snap) => {
+    if (snap.empty) return onMessage(null);
+    onMessage(decodeMessageDoc(snap.docs[0], sharedKey));
   });
 }
 
@@ -328,10 +358,12 @@ export function listenRoomSettings(roomId, sharedKey, onSettings) {
 }
 
 // ---------- Expense tracker (shared, split expenses) ----------
-export async function addExpense(roomId, sharedKey, { description, amount, paidBy }) {
+export const EXPENSE_CATEGORIES = ['General', 'Travel', 'Gifts', 'Food', 'Calls', 'Bills', 'Other'];
+
+export async function addExpense(roomId, sharedKey, { description, amount, paidBy, category }) {
   const user = await ensureSignedIn();
   const { ciphertext, nonce } = encryptJSON(
-    { description, amount, paidBy: paidBy || user.uid },
+    { description, amount, paidBy: paidBy || user.uid, category: category || 'General' },
     sharedKey
   );
   await addDoc(col(roomId, 'expenses'), {
@@ -359,8 +391,10 @@ export function listenExpenses(roomId, sharedKey, onExpenses) {
       return {
         id: d.id,
         description: parsed.description,
-        amount: parsed.amount,
+        amount: Number(parsed.amount) || 0,
         paidBy: parsed.paidBy,
+        // Entries written before categories existed simply fall back to General.
+        category: parsed.category || 'General',
         createdAt: data.createdAt?.toDate?.() || new Date(),
       };
     });
@@ -368,10 +402,53 @@ export function listenExpenses(roomId, sharedKey, onExpenses) {
   });
 }
 
-// ---------- Savings tracker (shared goal, e.g. toward a visit) ----------
-export async function addSavingsEntry(roomId, sharedKey, { label, amount }) {
+// ---------- Savings tracker (several goals at once, e.g. a flight AND a ring) ----------
+// Each goal is its own encrypted doc; contributions carry the goal's id so they
+// can be totalled per goal. Contributions saved before multi-goal existed have
+// no goalId and are grouped under "Unassigned" rather than being lost.
+export async function addSavingsGoal(roomId, sharedKey, { label, target }) {
+  const { ciphertext, nonce } = encryptJSON({ label, target: Number(target) || 0 }, sharedKey);
+  const ref = await addDoc(col(roomId, 'savingsGoals'), {
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  return ref.id;
+}
+
+export async function updateSavingsGoal(roomId, sharedKey, goalId, { label, target }) {
+  const { ciphertext, nonce } = encryptJSON({ label, target: Number(target) || 0 }, sharedKey);
+  await updateDoc(doc(db, 'rooms', roomId, 'savingsGoals', goalId), { ciphertext, nonce });
+}
+
+export async function deleteSavingsGoal(roomId, goalId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'savingsGoals', goalId));
+}
+
+export function listenSavingsGoals(roomId, sharedKey, onGoals) {
+  const q = query(col(roomId, 'savingsGoals'), orderBy('createdAt', 'asc'));
+  return onSnapshot(q, (snap) => {
+    onGoals(
+      snap.docs.map((d) => {
+        const data = d.data();
+        let parsed = { label: '⚠️ Could not decrypt', target: 0 };
+        try {
+          parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+        } catch (e) {
+          /* skip */
+        }
+        return { id: d.id, label: parsed.label, target: Number(parsed.target) || 0 };
+      })
+    );
+  });
+}
+
+export async function addSavingsEntry(roomId, sharedKey, { label, amount, goalId }) {
   const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ label, amount, contributedBy: user.uid }, sharedKey);
+  const { ciphertext, nonce } = encryptJSON(
+    { label, amount, contributedBy: user.uid, goalId: goalId || null },
+    sharedKey
+  );
   await addDoc(col(roomId, 'savings'), {
     ciphertext,
     nonce,
@@ -397,8 +474,9 @@ export function listenSavings(roomId, sharedKey, onEntries) {
       return {
         id: d.id,
         label: parsed.label,
-        amount: parsed.amount,
+        amount: Number(parsed.amount) || 0,
         contributedBy: parsed.contributedBy,
+        goalId: parsed.goalId || null,
         createdAt: data.createdAt?.toDate?.() || new Date(),
       };
     });

@@ -14,22 +14,62 @@ import { ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from '.
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
 import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
+import { renderLoading, toast, countdownParts, pad2, relativeTime } from './ui.js';
+import {
+  startHeartbeat,
+  stopHeartbeat,
+  signalTyping,
+  clearTyping,
+  listenPartnerPresence,
+} from './presence.js';
+import {
+  notificationsSupported,
+  notificationPermission,
+  requestNotificationPermission,
+  showNotification,
+  previewFor,
+} from './notify.js';
 
 const root = document.getElementById('app');
 let identity = null;
 let sharedKey = null;
 let activeTab = 'home';
 let unsubscribers = [];
+let globalUnsubscribers = [];
 let lastKnownUid = null;
 let lastHiddenAt = null;
+let notifyPrimed = false;
+let lastNotifiedId = null;
 
 function clearListeners() {
-  unsubscribers.forEach((u) => u());
+  unsubscribers.forEach((u) => {
+    try {
+      u();
+    } catch (e) {
+      /* a listener that already tore itself down is fine */
+    }
+  });
   unsubscribers = [];
+}
+
+function clearGlobalListeners() {
+  globalUnsubscribers.forEach((u) => {
+    try {
+      u();
+    } catch (e) {
+      /* ignore */
+    }
+  });
+  globalUnsubscribers = [];
+  stopHeartbeat();
 }
 
 function memberUidsOf(identity) {
   return [lastKnownUid, identity.partnerUid].sort();
+}
+
+function presenceEnabled() {
+  return identity?.presenceEnabled !== false; // opt-out, defaults on
 }
 
 // ---------------- Boot ----------------
@@ -44,11 +84,9 @@ async function boot() {
     if (!identity || !identity.displayName) {
       return renderEntryChoice();
     }
-
     if (needsUnlock(identity)) {
       return renderLockScreen();
     }
-
     return continueAfterUnlock();
   } catch (err) {
     renderFatalError(err);
@@ -81,7 +119,7 @@ function renderFatalError(err) {
       <p>${
         isConfigIssue
           ? "This usually means the Firebase details in js/firebase-config.js haven't been filled in yet, or the app is being opened as a local file instead of through a server."
-          : "An unexpected error stopped the app from starting."
+          : 'An unexpected error stopped the app from starting.'
       }</p>
       <p>If testing locally, run <code style="display:inline;padding:2px 6px;">python3 -m http.server</code> rather than opening index.html directly.</p>
       <code>${escapeHTML(err?.message || String(err))}</code>
@@ -95,13 +133,13 @@ function renderEntryChoice() {
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
-      <h1 class="wordmark" style="margin-bottom: 4px;">Tidelight</h1>
-      <p style="color:var(--text-dim); font-size:13px; margin-top:-8px;">Our space. Our time. Always together.</p>
-      <p style="color:var(--text-dim); font-size:14.5px; max-width:320px;">
+      <h1 class="wordmark">Tidelight</h1>
+      <p class="tagline">Our space. Our time. Always together.</p>
+      <p class="lede">
         A quiet, private space for the two of you. Everything here is encrypted before it ever leaves your phone.
       </p>
-      <button class="btn-primary" id="new-here-btn" style="width:100%;">I'm new here</button>
-      <button class="btn-secondary" id="recover-btn" style="width:100%;">I already have an account</button>
+      <button class="btn-primary" id="new-here-btn">I'm new here</button>
+      <button class="btn-secondary" id="recover-btn">I already have an account</button>
     </div>
   `;
   document.getElementById('new-here-btn').onclick = () => renderNameStep();
@@ -114,51 +152,60 @@ function renderRecoverStep() {
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Recover your account</h1>
-      <p style="color:var(--text-dim); font-size:14.5px;">Enter the email and password you set up recovery with.</p>
-      <div class="card" style="width:100%;">
-        <input type="text" id="recover-email" placeholder="Email" style="margin-bottom:8px;" />
-        <input type="text" id="recover-password" placeholder="Password" />
+      <p class="lede">Enter the email and password you set up recovery with.</p>
+      <div class="card">
+        <input type="email" id="recover-email" placeholder="Email" autocomplete="email" />
+        <input type="password" id="recover-password" placeholder="Password" autocomplete="current-password" style="margin-top:8px;" />
       </div>
-      <button class="btn-primary" id="recover-submit" style="width:100%;">Recover</button>
+      <button class="btn-primary" id="recover-submit">Recover</button>
       <div id="recover-error" class="error-text"></div>
-      <button class="btn-secondary" id="back-btn" style="width:100%;">Back</button>
+      <button class="btn-secondary" id="back-btn">Back</button>
     </div>
   `;
   document.getElementById('back-btn').onclick = () => renderEntryChoice();
-  document.getElementById('recover-submit').onclick = async () => {
+  const btn = document.getElementById('recover-submit');
+  btn.onclick = async () => {
     const email = document.getElementById('recover-email').value.trim();
     const password = document.getElementById('recover-password').value;
     if (!email || !password) return;
+    btn.disabled = true;
+    btn.textContent = 'Recovering…';
     try {
       const recovered = await recoverFromEmail(email, password);
       identity = await saveIdentity({ ...recovered, recoveryEmail: email, pending: null });
       continueAfterUnlock();
     } catch (e) {
       document.getElementById('recover-error').textContent = e.message;
+      btn.disabled = false;
+      btn.textContent = 'Recover';
     }
   };
 }
 
-// ---------------- Onboarding: name → recovery choice → PIN choice ----------------
+// ---------------- Onboarding ----------------
 function renderNameStep() {
   clearListeners();
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>What should we call you?</h1>
-      <div class="card" style="width:100%;">
+      <div class="card">
         <input type="text" id="name-input" placeholder="Your name" maxlength="30" />
       </div>
-      <button class="btn-primary" id="continue-btn" style="width:100%;">Continue</button>
+      <button class="btn-primary" id="continue-btn">Continue</button>
     </div>
   `;
-  document.getElementById('continue-btn').onclick = async () => {
+  const go = () => {
     const name = document.getElementById('name-input').value.trim();
     if (!name) return;
     const kp = generateKeyPair();
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     identity = { displayName: name, timezone, publicKey: kp.publicKey, secretKey: kp.secretKey };
     renderRecoveryChoice();
+  };
+  document.getElementById('continue-btn').onclick = go;
+  document.getElementById('name-input').onkeydown = (e) => {
+    if (e.key === 'Enter') go();
   };
 }
 
@@ -168,32 +215,38 @@ function renderRecoveryChoice() {
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Don't lose your place</h1>
-      <p style="color:var(--text-dim); font-size:14.5px; max-width:320px;">
+      <p class="lede">
         By default your identity lives only on this device — if you lose the phone, it's gone for good.
         Setting up recovery lets you restore everything on a new device with just an email and password.
       </p>
-      <div class="card" style="width:100%;">
-        <input type="text" id="recovery-email" placeholder="Email" style="margin-bottom:8px;" />
-        <input type="text" id="recovery-password" placeholder="Choose a password" />
+      <div class="card">
+        <input type="email" id="recovery-email" placeholder="Email" autocomplete="email" />
+        <input type="password" id="recovery-password" placeholder="Choose a password" autocomplete="new-password" style="margin-top:8px;" />
       </div>
-      <button class="btn-primary" id="setup-recovery-btn" style="width:100%;">Set up recovery (recommended)</button>
-      <button class="btn-secondary" id="skip-recovery-btn" style="width:100%;">Skip — stay anonymous</button>
+      <button class="btn-primary" id="setup-recovery-btn">Set up recovery (recommended)</button>
+      <button class="btn-secondary" id="skip-recovery-btn">Skip — stay anonymous</button>
       <div id="recovery-error" class="error-text"></div>
     </div>
   `;
-  document.getElementById('setup-recovery-btn').onclick = async () => {
+  const btn = document.getElementById('setup-recovery-btn');
+  btn.onclick = async () => {
     const email = document.getElementById('recovery-email').value.trim();
     const password = document.getElementById('recovery-password').value;
     if (!email || password.length < 6) {
-      document.getElementById('recovery-error').textContent = 'Enter an email and a password of at least 6 characters.';
+      document.getElementById('recovery-error').textContent =
+        'Enter an email and a password of at least 6 characters.';
       return;
     }
+    btn.disabled = true;
+    btn.textContent = 'Setting up…';
     try {
       await setUpRecovery(email, password, identity);
       identity.recoveryEmail = email;
       renderPinChoice();
     } catch (e) {
       document.getElementById('recovery-error').textContent = e.message;
+      btn.disabled = false;
+      btn.textContent = 'Set up recovery (recommended)';
     }
   };
   document.getElementById('skip-recovery-btn').onclick = () => renderPinChoice();
@@ -205,14 +258,14 @@ function renderPinChoice() {
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Lock the app locally?</h1>
-      <p style="color:var(--text-dim); font-size:14.5px; max-width:320px;">
+      <p class="lede">
         A PIN encrypts your key right here on this device, so if someone else picks up your unlocked phone, they still can't get in.
       </p>
-      <div class="card" style="width:100%;">
-        <input type="text" inputmode="numeric" pattern="[0-9]*" id="pin-input" placeholder="Choose a 4–6 digit PIN" maxlength="6" />
+      <div class="card">
+        <input type="password" inputmode="numeric" pattern="[0-9]*" id="pin-input" placeholder="Choose a 4–6 digit PIN" maxlength="6" />
       </div>
-      <button class="btn-primary" id="set-pin-btn" style="width:100%;">Set PIN (recommended)</button>
-      <button class="btn-secondary" id="skip-pin-btn" style="width:100%;">Skip for now</button>
+      <button class="btn-primary" id="set-pin-btn">Set PIN (recommended)</button>
+      <button class="btn-secondary" id="skip-pin-btn">Skip for now</button>
       <div id="pin-error" class="error-text"></div>
     </div>
   `;
@@ -224,7 +277,7 @@ function renderPinChoice() {
     }
     const locked = await lockIdentityWithPin(identity, pin);
     await saveIdentity(locked);
-    identity = { ...locked, secretKey: identity.secretKey }; // keep plaintext key in memory for this session
+    identity = { ...locked, secretKey: identity.secretKey };
     finishOnboarding();
   };
   document.getElementById('skip-pin-btn').onclick = async () => {
@@ -235,25 +288,23 @@ function renderPinChoice() {
 
 function finishOnboarding() {
   const urlPairingId = getPairingIdFromUrl();
-  if (urlPairingId) {
-    renderJoinScreen(urlPairingId);
-  } else {
-    renderPairingHub();
-  }
+  if (urlPairingId) renderJoinScreen(urlPairingId);
+  else renderPairingHub();
 }
 
-// ---------------- Lock screen (PIN re-entry) ----------------
+// ---------------- Lock screen ----------------
 function renderLockScreen() {
   clearListeners();
+  clearGlobalListeners();
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Welcome back</h1>
-      <p style="color:var(--text-dim); font-size:14.5px;">Enter your PIN to continue.</p>
-      <div class="card" style="width:100%;">
-        <input type="text" inputmode="numeric" pattern="[0-9]*" id="unlock-pin" placeholder="PIN" maxlength="6" autofocus />
+      <p class="lede">Enter your PIN to continue.</p>
+      <div class="card">
+        <input type="password" inputmode="numeric" pattern="[0-9]*" id="unlock-pin" placeholder="PIN" maxlength="6" autofocus />
       </div>
-      <button class="btn-primary" id="unlock-btn" style="width:100%;">Unlock</button>
+      <button class="btn-primary" id="unlock-btn">Unlock</button>
       <div id="unlock-error" class="error-text"></div>
     </div>
   `;
@@ -264,7 +315,10 @@ function renderLockScreen() {
       identity.secretKey = unlocked.secretKey;
       continueAfterUnlock();
     } catch (e) {
-      document.getElementById('unlock-error').textContent = 'Wrong PIN — try again.';
+      const err = document.getElementById('unlock-error');
+      err.textContent = 'Wrong PIN — try again.';
+      document.querySelector('.card').classList.add('shake');
+      setTimeout(() => document.querySelector('.card')?.classList.remove('shake'), 450);
     }
   };
   document.getElementById('unlock-btn').onclick = tryUnlock;
@@ -273,27 +327,77 @@ function renderLockScreen() {
   };
 }
 
-// ---------------- Pairing: hub (create link) ----------------
+// ---------------- Pairing ----------------
 function renderPairingHub() {
   clearListeners();
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Pair with them</h1>
-      <p style="color:var(--text-dim); font-size:14.5px; max-width:320px;">
+      <p class="lede">
         Make a one-time link and send it however you like. Once they open it, you're quietly connected — for good.
       </p>
-      <button class="btn-primary" id="generate-btn" style="width:100%;">Create pairing link</button>
+      <button class="btn-primary" id="generate-btn">Create pairing link</button>
+      <div id="hub-error" class="error-text"></div>
+      <button class="btn-ghost" id="have-code-btn">I was given a code</button>
     </div>
   `;
-  document.getElementById('generate-btn').onclick = async () => {
-    const pairingId = await createPairing({
-      publicKey: identity.publicKey,
-      displayName: identity.displayName,
-      timezone: identity.timezone,
-    });
-    identity = await updateIdentity({ pending: { pairingId } });
-    renderWaitingScreen(pairingId);
+  const btn = document.getElementById('generate-btn');
+  btn.onclick = async () => {
+    btn.disabled = true;
+    btn.textContent = 'Creating…';
+    document.getElementById('hub-error').textContent = '';
+    try {
+      const pairingId = await createPairing({
+        publicKey: identity.publicKey,
+        displayName: identity.displayName,
+        timezone: identity.timezone,
+      });
+      identity = await updateIdentity({ pending: { pairingId } });
+      renderWaitingScreen(pairingId);
+    } catch (err) {
+      // Previously this was an unguarded async onclick — a failure here vanished silently.
+      console.error('createPairing failed:', err);
+      document.getElementById('hub-error').textContent = `Couldn't create a link: ${err?.message || err}`;
+      btn.disabled = false;
+      btn.textContent = 'Create pairing link';
+    }
+  };
+  document.getElementById('have-code-btn').onclick = () => renderCodeEntry();
+}
+
+// Group the id into readable blocks so it can be typed or read aloud over a call.
+function formatCode(id) {
+  return String(id).replace(/(.{4})/g, '$1 ').trim();
+}
+
+// Fallback path for when a messaging app mangles or strips the link's #fragment —
+// which is the most common way a perfectly valid pairing appears "invalid".
+function renderCodeEntry() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>Enter their code</h1>
+      <p class="lede">
+        If the link didn't work, ask them to read out the code shown under their link. Spaces don't matter.
+      </p>
+      <div class="card">
+        <input type="text" id="code-input" placeholder="e.g. a1b2 c3d4 e5f6 7890" autocapitalize="off" autocorrect="off" spellcheck="false" />
+      </div>
+      <button class="btn-primary" id="code-connect">Connect</button>
+      <div id="code-error" class="error-text"></div>
+      <button class="btn-secondary" id="code-back">Back</button>
+    </div>
+  `;
+  document.getElementById('code-back').onclick = () => renderPairingHub();
+  document.getElementById('code-connect').onclick = () => {
+    const raw = document.getElementById('code-input').value.replace(/[^a-f0-9]/gi, '').toLowerCase();
+    if (!raw) {
+      document.getElementById('code-error').textContent = 'Enter the code they gave you.';
+      return;
+    }
+    renderJoinScreen(raw);
   };
 }
 
@@ -302,14 +406,24 @@ function renderWaitingScreen(pairingId) {
   const link = pairingLinkFor(pairingId);
   root.innerHTML = `
     <div class="screen center-col">
-      <div class="mark"></div>
+      <div class="mark pulse"></div>
       <h1>Waiting for them</h1>
-      <p style="color:var(--text-dim); font-size:14.5px;">Send this link to your person. It only ever works once.</p>
-      <div class="pairing-link-box" id="link-box">${escapeHTML(link)}</div>
-      <button class="btn-secondary" id="copy-btn">Copy link</button>
-      <button class="btn-primary" id="share-btn">Share</button>
-      <div id="pair-error" class="error-text" style="min-height:18px; width:100%;"></div>
-      <button class="btn-secondary" id="cancel-pair-btn" style="width:100%; opacity:0.8;">Cancel &amp; start over</button>
+      <p class="lede">Send this link to your person. It only ever works once.</p>
+      <div class="pairing-link-box">${escapeHTML(link)}</div>
+      <div class="btn-row">
+        <button class="btn-secondary" id="copy-btn">Copy link</button>
+        <button class="btn-primary" id="share-btn">Share</button>
+      </div>
+      <div class="card code-card">
+        <div class="eyebrow">Or read them this code</div>
+        <div class="pair-code">${escapeHTML(formatCode(pairingId))}</div>
+        <p class="fine-print">
+          Some chat apps break long links. If theirs didn't work, they can tap
+          “I was given a code” on their own Pair screen and type this in.
+        </p>
+      </div>
+      <div id="pair-error" class="error-text"></div>
+      <button class="btn-ghost" id="cancel-pair-btn">Cancel &amp; start over</button>
     </div>
   `;
   document.getElementById('copy-btn').onclick = async () => {
@@ -336,7 +450,6 @@ function renderWaitingScreen(pairingId) {
       }
     }
   };
-
   document.getElementById('cancel-pair-btn').onclick = async () => {
     if (!confirm('Cancel this pairing link and start over? The link you already sent will stop working.')) return;
     clearListeners();
@@ -349,8 +462,6 @@ function renderWaitingScreen(pairingId) {
     if (el) el.innerHTML = html;
   }
 
-  // Guard so a re-fired snapshot (cache→server, or a reconnect) can't run the
-  // finalize twice or race with an in-flight attempt.
   let finalizing = false;
   let done = false;
 
@@ -359,7 +470,6 @@ function renderWaitingScreen(pairingId) {
     finalizing = true;
     showPairError('');
     try {
-      // Never a valid real-world case — the same account can't be both people.
       if (data.creatorUid === data.joinerUid) {
         throw new Error('This link was opened on the same account that created it. Open it on their device instead.');
       }
@@ -386,7 +496,7 @@ function renderWaitingScreen(pairingId) {
       finalizing = false;
       showPairError(
         `They joined, but finishing the connection failed: ${escapeHTML(err?.message || 'unknown error')} ` +
-          `<button id="pair-retry-btn" class="btn-secondary" style="width:100%; margin-top:8px;">Try again</button>`
+          `<button id="pair-retry-btn" class="btn-secondary" style="margin-top:8px;">Try again</button>`
       );
       const retry = document.getElementById('pair-retry-btn');
       if (retry) retry.onclick = () => finalize(data);
@@ -407,23 +517,24 @@ function renderWaitingScreen(pairingId) {
   unsubscribers.push(unsub);
 }
 
-// ---------------- Pairing: join via link ----------------
 function renderJoinScreen(pairingId) {
   clearListeners();
   root.innerHTML = `
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Join them</h1>
-      <p style="color:var(--text-dim); font-size:14.5px;">You're about to connect — quietly, and only the two of you will ever be able to read what's shared here.</p>
-      <button class="btn-primary" id="join-btn" style="width:100%;">Connect</button>
+      <p class="lede">You're about to connect — quietly, and only the two of you will ever be able to read what's shared here.</p>
+      <button class="btn-primary" id="join-btn">Connect</button>
       <div id="join-error" class="error-text"></div>
+      <button class="btn-ghost" id="join-code-btn">Type a code instead</button>
     </div>
   `;
+  document.getElementById('join-code-btn').onclick = () => renderCodeEntry();
   const joinBtn = document.getElementById('join-btn');
   joinBtn.onclick = async () => {
     joinBtn.disabled = true;
     joinBtn.textContent = 'Connecting…';
-    document.getElementById('join-error').textContent = '';
+    document.getElementById('join-error').innerHTML = '';
     try {
       const result = await joinPairing(pairingId, {
         publicKey: identity.publicKey,
@@ -442,19 +553,73 @@ function renderJoinScreen(pairingId) {
       history.replaceState(null, '', window.location.pathname);
       renderMain();
     } catch (e) {
-      document.getElementById('join-error').textContent = e.message;
+      // Show the exact code we looked up, so a mangled link is instantly obvious
+      // by comparing it against what the other person sees on their screen.
+      const isMissing = /invalid/i.test(e.message || '');
+      document.getElementById('join-error').innerHTML =
+        escapeHTML(e.message) +
+        (isMissing
+          ? `<div class="fine-print" style="margin-top:8px;">Looked for code <strong>${escapeHTML(
+              formatCode(pairingId)
+            )}</strong>. Check it matches the code on their screen exactly — some chat apps cut long links short.</div>`
+          : '');
       joinBtn.disabled = false;
       joinBtn.textContent = 'Connect';
     }
   };
 }
 
-// ---------------- Main app shell ----------------
+// ---------------- Main shell ----------------
 function renderMain() {
   clearListeners();
+  clearGlobalListeners();
   root.innerHTML = `<div id="screen-slot"></div>${navHTML()}`;
   bindNav();
+  setUpGlobalListeners();
   renderTab(activeTab);
+}
+
+function setUpGlobalListeners() {
+  if (!identity?.roomId || !sharedKey) return;
+
+  if (presenceEnabled()) startHeartbeat(identity.roomId);
+
+  // App-wide new-message watcher: powers notifications and the in-app toast no
+  // matter which tab you're on. Only ever holds the single newest message.
+  notifyPrimed = false;
+  const unsub = RoomData.listenLatestMessage(identity.roomId, sharedKey, (message) => {
+    if (!message) {
+      notifyPrimed = true;
+      return;
+    }
+    if (!notifyPrimed) {
+      // First snapshot is existing history, not an arrival — don't announce it.
+      notifyPrimed = true;
+      lastNotifiedId = message.id;
+      return;
+    }
+    if (message.id === lastNotifiedId) return;
+    lastNotifiedId = message.id;
+    if (message.senderUid === lastKnownUid) return;
+
+    const { title, body } = previewFor(message, identity.partnerName);
+    const lookingAtChat = activeTab === 'thread' && !document.hidden;
+    if (!lookingAtChat) {
+      showNotification(title, body);
+      if (!document.hidden) {
+        toast(`<strong>${escapeHTML(title)}</strong> · ${escapeHTML(body)}`, {
+          action: {
+            label: 'Open',
+            onClick: () => {
+              activeTab = 'thread';
+              renderMain();
+            },
+          },
+        });
+      }
+    }
+  });
+  globalUnsubscribers.push(unsub);
 }
 
 function navHTML() {
@@ -466,17 +631,20 @@ function navHTML() {
     { id: 'list', label: 'List', icon: iconList() },
     { id: 'more', label: 'More', icon: iconMore() },
   ];
-  return `<div class="nav">${tabs
+  return `<nav class="nav">${tabs
     .map(
       (t) =>
-        `<button data-tab="${t.id}" class="${t.id === activeTab ? 'active' : ''}">${t.icon}<span>${t.label}</span></button>`
+        `<button data-tab="${t.id}" class="${t.id === activeTab ? 'active' : ''}" aria-label="${t.label}">${
+          t.icon
+        }<span>${t.label}</span></button>`
     )
-    .join('')}</div>`;
+    .join('')}</nav>`;
 }
 
 function bindNav() {
   document.querySelectorAll('.nav button').forEach((btn) => {
     btn.onclick = () => {
+      if (activeTab === btn.dataset.tab) return;
       activeTab = btn.dataset.tab;
       document.querySelectorAll('.nav button').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
@@ -488,6 +656,7 @@ function bindNav() {
 function renderTab(tab) {
   clearListeners();
   const slot = document.getElementById('screen-slot');
+  if (!slot) return;
   if (tab === 'home') return renderHome(slot);
   if (tab === 'thread') return renderThread(slot);
   if (tab === 'today') return renderToday(slot);
@@ -496,35 +665,47 @@ function renderTab(tab) {
   if (tab === 'more') return renderMore(slot);
 }
 
-// ---------------- Home ----------------
+// ---------------- Cinematic hero scene ----------------
+// Time-of-day palettes keep the moonlit identity while still shifting through
+// the day — the two of you are in different timezones, so the sky moving matters.
+function skyPaletteFor(hour) {
+  if (hour >= 5 && hour < 8) return { name: 'dawn', top: '#221a3d', mid: '#5d3d63', bot: '#e6a17f', star: 0.35 };
+  if (hour >= 8 && hour < 17) return { name: 'day', top: '#2c3a5e', mid: '#4d6485', bot: '#c2ae9f', star: 0.06 };
+  if (hour >= 17 && hour < 20) return { name: 'dusk', top: '#1e1838', mid: '#4b2c56', bot: '#e8916f', star: 0.45 };
+  return { name: 'night', top: '#120e24', mid: '#281e43', bot: '#5f4258', star: 1 };
+}
+
+// Fixed star field — generated once, not per render, so the sky doesn't "jump"
+// every time a mood update re-renders the scene.
+const STARS = (() => {
+  let seed = 7;
+  const rand = () => ((seed = (seed * 9301 + 49297) % 233280) / 233280);
+  return Array.from({ length: 26 }, () => ({
+    x: Math.round(rand() * 400),
+    y: Math.round(rand() * 120),
+    r: (rand() * 1.1 + 0.5).toFixed(2),
+    d: (rand() * 4).toFixed(2),
+  }));
+})();
+
 function figuresGroupSVG(moodState) {
-  // left figure = you, right figure = partner, by convention.
+  // Left figure = you, right = partner, by convention.
+  const body = (cx, cy, rot) =>
+    `<ellipse cx="${cx}" cy="${cy}" rx="9" ry="15" fill="#0d0a1a" ${
+      rot ? `transform="rotate(${rot} ${cx} ${cy})"` : ''
+    }/>`;
+  const head = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.6" fill="#0d0a1a"/>`;
+
   if (moodState === 'meLow') {
-    return `
-      <ellipse cx="192" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(8 192 198)"/>
-      <circle cx="197" cy="182" r="6" fill="#161029"/>
-      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="208" cy="178" r="6" fill="#161029"/>`;
+    return body(191, 197, 10) + head(196, 181) + body(208, 196, 0) + head(208, 177);
   }
   if (moodState === 'themLow') {
-    return `
-      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="188" cy="178" r="6" fill="#161029"/>
-      <ellipse cx="204" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(-8 204 198)"/>
-      <circle cx="199" cy="182" r="6" fill="#161029"/>`;
+    return body(188, 196, 0) + head(188, 177) + body(205, 197, -10) + head(200, 181);
   }
   if (moodState === 'bothLow') {
-    return `
-      <ellipse cx="193" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(6 193 198)"/>
-      <circle cx="197" cy="183" r="6" fill="#161029"/>
-      <ellipse cx="203" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(-6 203 198)"/>
-      <circle cx="199" cy="183" r="6" fill="#161029"/>`;
+    return body(193, 197, 7) + head(197, 182) + body(203, 197, -7) + head(199, 182);
   }
-  return `
-      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="188" cy="178" r="6" fill="#161029"/>
-      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="208" cy="178" r="6" fill="#161029"/>`;
+  return body(186, 196, 0) + head(186, 177) + body(210, 196, 0) + head(210, 177);
 }
 
 function heroCaptionFor(moodState) {
@@ -535,246 +716,1670 @@ function heroCaptionFor(moodState) {
 }
 
 function heroSceneSVG(moodState = 'calm') {
-  // Original SVG recreation (not a copy of any reference image) of a moonlit
-  // ocean horizon — the app's one signature visual. The two shore figures
-  // reposition based on today's moods: closer and leaning when one or both
-  // of you are feeling low, upright and apart when things are calm.
+  const p = skyPaletteFor(new Date().getHours());
+  const stars = STARS.map(
+    (s) =>
+      `<circle class="hero-star" cx="${s.x}" cy="${s.y}" r="${s.r}" fill="#fdf3dd" style="animation-delay:${s.d}s"/>`
+  ).join('');
+
   return `
-  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="${moodState}">
+  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="${moodState}" data-sky="${p.name}">
     <defs>
       <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#1b1533"/>
-        <stop offset="55%" stop-color="#3a2a52"/>
-        <stop offset="100%" stop-color="#e8916f"/>
+        <stop offset="0%" stop-color="${p.top}"/>
+        <stop offset="58%" stop-color="${p.mid}"/>
+        <stop offset="100%" stop-color="${p.bot}"/>
       </linearGradient>
       <linearGradient id="sea" x1="0" y1="0" x2="0" y2="1">
-        <stop offset="0%" stop-color="#4a3560"/>
-        <stop offset="100%" stop-color="#1b1533"/>
+        <stop offset="0%" stop-color="${p.mid}"/>
+        <stop offset="100%" stop-color="${p.top}"/>
       </linearGradient>
       <radialGradient id="moonGlow" cx="50%" cy="50%" r="50%">
-        <stop offset="0%" stop-color="#fdf1d3"/>
+        <stop offset="0%" stop-color="#fdf1d3" stop-opacity="0.85"/>
         <stop offset="100%" stop-color="#f3d9a8" stop-opacity="0"/>
       </radialGradient>
+      <linearGradient id="glimmer" x1="0" y1="0" x2="0" y2="1">
+        <stop offset="0%" stop-color="#f3d9a8" stop-opacity="0.30"/>
+        <stop offset="100%" stop-color="#f3d9a8" stop-opacity="0"/>
+      </linearGradient>
+      <clipPath id="seaClip"><rect x="0" y="150" width="400" height="70"/></clipPath>
     </defs>
+
     <rect x="0" y="0" width="400" height="150" fill="url(#sky)"/>
+    <g style="opacity:${p.star}">${stars}</g>
+    <g class="hero-shooting"><circle cx="0" cy="0" r="1.5" fill="#fff6e2"/><rect x="-16" y="-0.4" width="16" height="0.8" fill="#fff6e2" opacity="0.5"/></g>
+
+    <g class="hero-cloud hero-cloud-a" opacity="0.16">
+      <ellipse cx="90" cy="52" rx="42" ry="9" fill="#f7ede0"/>
+      <ellipse cx="120" cy="49" rx="28" ry="7" fill="#f7ede0"/>
+    </g>
+    <g class="hero-cloud hero-cloud-b" opacity="0.11">
+      <ellipse cx="300" cy="86" rx="52" ry="8" fill="#f7ede0"/>
+    </g>
+
+    <circle cx="200" cy="58" r="52" fill="url(#moonGlow)" class="hero-halo"/>
+    <g class="hero-moon">
+      <circle cx="200" cy="58" r="22" fill="#f5e0b8"/>
+      <circle cx="192" cy="52" r="3.4" fill="#e6cda1" opacity="0.55"/>
+      <circle cx="206" cy="64" r="2.6" fill="#e6cda1" opacity="0.45"/>
+      <circle cx="203" cy="49" r="1.8" fill="#e6cda1" opacity="0.4"/>
+    </g>
+
     <rect x="0" y="150" width="400" height="70" fill="url(#sea)"/>
-    <circle cx="200" cy="58" r="46" fill="url(#moonGlow)" opacity="0.55"/>
-    <circle class="hero-moon" cx="200" cy="58" r="22" fill="#f3d9a8"/>
-    <polygon points="185,150 215,150 230,220 170,220" fill="#f3d9a8" opacity="0.14"/>
-    <path d="M0,150 Q40,145 80,150 T160,150 T240,150 T320,150 T400,150 V158 Q360,153 320,158 T240,158 T160,158 T80,158 T0,158 Z" fill="#241c40" opacity="0.5"/>
-    <g class="figures">${figuresGroupSVG(moodState)}</g>
+    <g clip-path="url(#seaClip)">
+      <polygon points="186,150 214,150 232,220 168,220" fill="url(#glimmer)" class="hero-reflection"/>
+      <path class="hero-wave hero-wave-1" d="M-40,164 Q10,160 60,164 T160,164 T260,164 T360,164 T460,164 V172 H-40 Z" fill="#0f0b20" opacity="0.28"/>
+      <path class="hero-wave hero-wave-2" d="M-40,180 Q20,175 80,180 T200,180 T320,180 T440,180 V190 H-40 Z" fill="#0d0918" opacity="0.34"/>
+      <path class="hero-wave hero-wave-3" d="M-40,198 Q30,193 100,198 T240,198 T380,198 T520,198 V214 H-40 Z" fill="#0b0715" opacity="0.4"/>
+    </g>
+
+    <path d="M0,150 Q40,146 80,150 T160,150 T240,150 T320,150 T400,150 V156 Q360,152 320,156 T240,156 T160,156 T80,156 T0,156 Z" fill="${p.top}" opacity="0.55"/>
+    <g class="hero-figures">${figuresGroupSVG(moodState)}</g>
   </svg>`;
 }
 
+// Gentle typewriter for the hero caption — the one place a little theatre suits.
+function typeCaption(el, text) {
+  if (!el) return null;
+  if (window.matchMedia('(prefers-reduced-motion: reduce)').matches) {
+    el.textContent = text;
+    return null;
+  }
+  el.textContent = '';
+  let i = 0;
+  const timer = setInterval(() => {
+    el.textContent = text.slice(0, ++i);
+    if (i >= text.length) clearInterval(timer);
+  }, 34);
+  return () => clearInterval(timer);
+}
+
+// ---------------- Home (bento) ----------------
 function renderHome(slot) {
   slot.innerHTML = `
     <div class="screen">
-      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
-        <div class="avatar-stack" id="avatar-stack">
-          <div class="avatar-circle mine" id="avatar-mine">${escapeHTML((identity.displayName || '?')[0])}</div>
-          <div class="avatar-circle theirs" id="avatar-theirs">${escapeHTML((identity.partnerName || '?')[0])}</div>
+      <header class="home-head">
+        <div class="avatar-stack">
+          <div class="avatar-circle mine" id="avatar-mine" title="Tap to change your photo">${escapeHTML(
+            (identity.displayName || '?')[0]
+          )}</div>
+          <div class="avatar-circle theirs" id="avatar-theirs">${escapeHTML(
+            (identity.partnerName || '?')[0]
+          )}</div>
         </div>
-        <div style="flex:1;">
+        <div class="home-greet">
           <div class="eyebrow">Tidelight</div>
-          <h1 style="margin-bottom:16px;">${greetingFor(identity.displayName)}</h1>
+          <h1>${greetingFor(identity.displayName)}</h1>
         </div>
         <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
-      </div>
-      <input type="file" accept="image/*" id="avatar-input" style="display:none;" />
+      </header>
+      <input type="file" accept="image/*" id="avatar-input" hidden />
 
       <div class="hero-scene" id="hero-scene">
         ${heroSceneSVG()}
-        <div class="hero-caption" id="hero-caption">Two shores, one sky.</div>
+        <div class="hero-caption" id="hero-caption"></div>
       </div>
 
-      <div class="card">
-        <div style="display:flex; justify-content:space-between;">
-          <div>
-            <div class="eyebrow">You</div>
-            <div class="stat-number" id="my-time" style="font-size:20px;">--:--</div>
-          </div>
-          <div style="text-align:right;">
-            <div class="eyebrow">${escapeHTML(identity.partnerName || 'Them')}</div>
-            <div class="stat-number" id="partner-time" style="font-size:20px;">--:--</div>
-          </div>
+      <div class="bento">
+        <div class="bento-tile span-4 countdown-tile" id="countdown-tile">
+          <div class="eyebrow" id="countdown-caption">Next shared moment</div>
+          <div class="countdown-title" id="countdown-title">Nothing planned yet</div>
+          <div class="countdown-clock" id="countdown-clock"></div>
         </div>
-      </div>
 
-      <div class="stat-row">
-        <div class="card">
+        <div class="bento-tile span-2 tile-center">
           <div class="stat-number" id="days-together">–</div>
           <div class="stat-caption">days together</div>
         </div>
-        <div class="card">
+
+        <div class="bento-tile span-2 tile-center">
           <div class="stat-number" id="streak-value">–</div>
           <div class="stat-caption">day streak</div>
         </div>
-      </div>
 
-      <div class="card">
-        <div class="eyebrow" id="countdown-caption">Next shared moment</div>
-        <div class="stat-number" id="countdown-value" style="font-size:22px;">–</div>
-      </div>
+        <div class="bento-tile span-4 clock-tile">
+          <div class="clock-side">
+            <div class="eyebrow">You</div>
+            <div class="clock-time" id="my-time">--:--</div>
+            <div class="clock-meta" id="my-meta"></div>
+          </div>
+          <div class="clock-divider"></div>
+          <div class="clock-side right">
+            <div class="eyebrow">${escapeHTML(identity.partnerName || 'Them')}</div>
+            <div class="clock-time" id="partner-time">--:--</div>
+            <div class="clock-meta" id="partner-meta"></div>
+          </div>
+        </div>
 
-      <div class="card" id="together-since-card">
-        <div class="eyebrow">Together since</div>
-        <input type="date" id="together-since-input" />
+        <div class="bento-tile span-2 tile-center">
+          <div class="eyebrow">Their mood</div>
+          <div class="mood-face" id="home-partner-mood">–</div>
+        </div>
+
+        <div class="bento-tile span-2">
+          <div class="eyebrow">Together since</div>
+          <input type="date" id="together-since-input" />
+        </div>
       </div>
     </div>
   `;
 
   document.getElementById('settings-btn').onclick = () => renderSettings();
-
-  // Profile pictures — tapping your own circle lets you set/change it.
   document.getElementById('avatar-mine').onclick = () => document.getElementById('avatar-input').click();
   document.getElementById('avatar-input').onchange = async (e) => {
     const file = e.target.files[0];
     if (!file) return;
-    const compressed = await fileToCompressedBase64(file, { maxDim: 300, quality: 0.75 });
-    await RoomData.setMyAvatar(identity.roomId, sharedKey, compressed);
+    try {
+      const compressed = await fileToCompressedBase64(file, { maxDim: 300, quality: 0.75 });
+      await RoomData.setMyAvatar(identity.roomId, sharedKey, compressed);
+      toast('Photo updated');
+    } catch (err) {
+      toast("Couldn't update that photo");
+    }
+    e.target.value = '';
   };
 
+  const stopType = typeCaption(document.getElementById('hero-caption'), heroCaptionFor('calm'));
+  if (stopType) unsubscribers.push(stopType);
+
   if (identity.partnerUid) {
-    const unsubProfiles = RoomData.listenProfiles(
-      identity.roomId,
-      sharedKey,
-      [lastKnownUid, identity.partnerUid],
-      (uid, avatar) => {
+    unsubscribers.push(
+      RoomData.listenProfiles(identity.roomId, sharedKey, [lastKnownUid, identity.partnerUid], (uid, avatar) => {
         const targetId = uid === lastKnownUid ? 'avatar-mine' : 'avatar-theirs';
         const el = document.getElementById(targetId);
         const src = safeMediaSrc(avatar, 'image');
         if (!el || !src) return;
         el.style.backgroundImage = `url("${src}")`;
         el.textContent = '';
-      }
+      })
     );
-    unsubscribers.push(unsubProfiles);
   }
 
+  // Dual clocks, with a day/night hint so you can tell at a glance whether
+  // it's a decent hour to call.
   function tick() {
     const now = new Date();
-    document.getElementById('my-time').textContent = now.toLocaleTimeString([], {
-      hour: '2-digit',
-      minute: '2-digit',
-      timeZone: identity.timezone,
-    });
-    document.getElementById('partner-time').textContent = identity.partnerTimezone
-      ? now.toLocaleTimeString([], {
-          hour: '2-digit',
-          minute: '2-digit',
-          timeZone: identity.partnerTimezone,
-        })
-      : '--:--';
+    const fmt = (tz) =>
+      tz ? now.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', timeZone: tz }) : '--:--';
+    const hourIn = (tz) => {
+      if (!tz) return null;
+      return Number(now.toLocaleString('en-US', { hour: 'numeric', hour12: false, timeZone: tz }));
+    };
+    const dayNight = (h) => {
+      if (h === null) return '';
+      if (h >= 6 && h < 12) return '🌤 morning';
+      if (h >= 12 && h < 17) return '☀️ afternoon';
+      if (h >= 17 && h < 21) return '🌆 evening';
+      return '🌙 night';
+    };
+    const myEl = document.getElementById('my-time');
+    if (!myEl) return;
+    myEl.textContent = fmt(identity.timezone);
+    document.getElementById('my-meta').textContent = dayNight(hourIn(identity.timezone));
+    document.getElementById('partner-time').textContent = fmt(identity.partnerTimezone);
+    document.getElementById('partner-meta').textContent = dayNight(hourIn(identity.partnerTimezone));
   }
   tick();
-  const clockInterval = setInterval(tick, 1000 * 15);
+  const clockInterval = setInterval(tick, 20000);
   unsubscribers.push(() => clearInterval(clockInterval));
 
   const input = document.getElementById('together-since-input');
   input.onchange = () => {
     RoomData.setTogetherSince(identity.roomId, sharedKey, input.value);
+    toast('Saved');
   };
 
-  const unsubSettings = RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
-    if (settings.togetherSince) {
-      input.value = settings.togetherSince;
+  unsubscribers.push(
+    RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
+      if (!settings.togetherSince) return;
+      const el = document.getElementById('together-since-input');
+      const daysEl = document.getElementById('days-together');
+      if (!el || !daysEl) return;
+      el.value = settings.togetherSince;
       const days = Math.floor((Date.now() - new Date(settings.togetherSince)) / 86400000);
-      document.getElementById('days-together').textContent = days >= 0 ? days : '–';
-    }
-  });
-  unsubscribers.push(unsubSettings);
+      daysEl.textContent = days >= 0 ? days.toLocaleString() : '–';
+    })
+  );
 
-  const unsubCal = RoomData.listenCalendar(identity.roomId, sharedKey, (events) => {
-    const upcoming = events
-      .filter((e) => new Date(e.dateTime).getTime() > Date.now())
-      .sort((a, b) => new Date(a.dateTime) - new Date(b.dateTime))[0];
-    const valueEl = document.getElementById('countdown-value');
-    const captionEl = document.getElementById('countdown-caption');
-    if (upcoming) {
-      const diffMs = new Date(upcoming.dateTime) - Date.now();
-      const days = Math.floor(diffMs / 86400000);
-      const hours = Math.floor((diffMs % 86400000) / 3600000);
-      valueEl.textContent = `${upcoming.title} — ${days > 0 ? `${days}d` : `${hours}h`}`;
-      captionEl.textContent = 'Next shared moment';
-    } else {
-      valueEl.textContent = 'Nothing planned yet';
-      captionEl.textContent = 'Next shared moment';
+  // Live countdown down to the second.
+  let nextEvent = null;
+  function paintCountdown() {
+    const titleEl = document.getElementById('countdown-title');
+    const clockEl = document.getElementById('countdown-clock');
+    if (!titleEl || !clockEl) return;
+    if (!nextEvent) {
+      titleEl.textContent = 'Nothing planned yet';
+      clockEl.innerHTML = `<span class="countdown-hint">Add something in Calendar</span>`;
+      return;
     }
-  });
-  unsubscribers.push(unsubCal);
+    const c = countdownParts(new Date(nextEvent.dateTime).getTime());
+    titleEl.textContent = nextEvent.title;
+    clockEl.innerHTML = `
+      <div class="cd-unit"><span class="cd-num">${c.days}</span><span class="cd-lbl">days</span></div>
+      <div class="cd-sep">:</div>
+      <div class="cd-unit"><span class="cd-num">${pad2(c.hours)}</span><span class="cd-lbl">hrs</span></div>
+      <div class="cd-sep">:</div>
+      <div class="cd-unit"><span class="cd-num">${pad2(c.minutes)}</span><span class="cd-lbl">min</span></div>
+      <div class="cd-sep">:</div>
+      <div class="cd-unit"><span class="cd-num tick">${pad2(c.seconds)}</span><span class="cd-lbl">sec</span></div>`;
+  }
+  unsubscribers.push(
+    RoomData.listenCalendar(identity.roomId, sharedKey, (events) => {
+      nextEvent =
+        events
+          .filter((e) => new Date(e.dateTime).getTime() > Date.now())
+          .sort((a, b) => new Date(a.dateTime) - new Date(b.dateTime))[0] || null;
+      paintCountdown();
+    })
+  );
+  paintCountdown();
+  const cdInterval = setInterval(paintCountdown, 1000);
+  unsubscribers.push(() => clearInterval(cdInterval));
 
   if (identity.partnerUid) {
-    const unsubStreak = listenStreak(identity.roomId, memberUidsOf(identity), (streak) => {
-      const el = document.getElementById('streak-value');
-      if (el) el.textContent = streak > 0 ? `${streak} 🔥` : '0';
-    });
-    unsubscribers.push(unsubStreak);
+    unsubscribers.push(
+      listenStreak(identity.roomId, memberUidsOf(identity), (streak) => {
+        const el = document.getElementById('streak-value');
+        if (el) el.innerHTML = streak > 0 ? `${streak} <span class="flame">🔥</span>` : '0';
+      })
+    );
   }
 
-  // Mood-reactive hero scene — reflects today's check-ins from the Today tab.
-  const unsubHeroMood = RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
-    const todayKey = new Date().toISOString().slice(0, 10);
-    const mine = entries.find((e) => e.date === todayKey && e.senderUid === lastKnownUid);
-    const theirs = entries.find((e) => e.date === todayKey && e.senderUid !== lastKnownUid);
-    const myLow = mine && LOW_MOODS.includes(mine.mood);
-    const theirLow = theirs && LOW_MOODS.includes(theirs.mood);
-    let moodState = 'calm';
-    if (myLow && theirLow) moodState = 'bothLow';
-    else if (myLow) moodState = 'meLow';
-    else if (theirLow) moodState = 'themLow';
+  // Mood-reactive hero — re-renders the scene and re-types the caption.
+  let lastMoodState = null;
+  unsubscribers.push(
+    RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const mine = entries.find((e) => e.date === todayKey && e.senderUid === lastKnownUid);
+      const theirs = entries.find((e) => e.date === todayKey && e.senderUid !== lastKnownUid);
+      const myLow = mine && LOW_MOODS.includes(mine.mood);
+      const theirLow = theirs && LOW_MOODS.includes(theirs.mood);
+      let moodState = 'calm';
+      if (myLow && theirLow) moodState = 'bothLow';
+      else if (myLow) moodState = 'meLow';
+      else if (theirLow) moodState = 'themLow';
 
-    const heroEl = document.getElementById('hero-scene');
-    const captionEl = document.getElementById('hero-caption');
-    if (heroEl) heroEl.innerHTML = heroSceneSVG(moodState) + `<div class="hero-caption" id="hero-caption">${heroCaptionFor(moodState)}</div>`;
+      const moodEl = document.getElementById('home-partner-mood');
+      if (moodEl) moodEl.textContent = theirs ? theirs.mood : '–';
+
+      if (moodState === lastMoodState) return;
+      lastMoodState = moodState;
+      const heroEl = document.getElementById('hero-scene');
+      if (!heroEl) return;
+      heroEl.innerHTML = heroSceneSVG(moodState) + `<div class="hero-caption" id="hero-caption"></div>`;
+      const stop = typeCaption(document.getElementById('hero-caption'), heroCaptionFor(moodState));
+      if (stop) unsubscribers.push(stop);
+    })
+  );
+}
+
+// ---------------- Chat ----------------
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingStartedAt = null;
+
+// Long-press opens actions, double-tap hearts it — the gestures people already
+// know from WhatsApp and Instagram, so no permanent button clutter on bubbles.
+function attachBubbleGestures(el, { onLongPress, onDoubleTap }) {
+  let timer = null;
+  let moved = false;
+  let lastTap = 0;
+  const start = () => {
+    moved = false;
+    clearTimeout(timer);
+    timer = setTimeout(() => {
+      if (!moved) {
+        el.classList.add('bubble-held');
+        setTimeout(() => el.classList.remove('bubble-held'), 200);
+        onLongPress();
+      }
+    }, 480);
+  };
+  const cancel = () => clearTimeout(timer);
+  el.addEventListener('touchstart', start, { passive: true });
+  el.addEventListener('touchmove', () => { moved = true; cancel(); }, { passive: true });
+  el.addEventListener('touchend', cancel);
+  el.addEventListener('touchcancel', cancel);
+  el.addEventListener('mousedown', start);
+  el.addEventListener('mouseup', cancel);
+  el.addEventListener('mouseleave', cancel);
+  el.addEventListener('contextmenu', (e) => e.preventDefault());
+  el.addEventListener('click', () => {
+    const now = Date.now();
+    if (now - lastTap < 330) {
+      lastTap = 0;
+      onDoubleTap();
+    } else {
+      lastTap = now;
+    }
   });
-  unsubscribers.push(unsubHeroMood);
+}
+
+function openSheet(title, actions) {
+  const existing = document.getElementById('sheet');
+  if (existing) existing.remove();
+  const wrap = document.createElement('div');
+  wrap.id = 'sheet';
+  wrap.className = 'sheet-backdrop';
+  wrap.innerHTML = `
+    <div class="sheet">
+      <div class="sheet-grabber"></div>
+      ${title ? `<div class="sheet-title">${title}</div>` : ''}
+      ${actions
+        .map(
+          (a, i) =>
+            `<button class="sheet-action ${a.danger ? 'danger' : ''}" data-i="${i}">${a.icon || ''}<span>${
+              a.label
+            }</span></button>`
+        )
+        .join('')}
+      <button class="sheet-action cancel" data-cancel>Cancel</button>
+    </div>`;
+  document.body.appendChild(wrap);
+  requestAnimationFrame(() => wrap.classList.add('open'));
+  const close = () => {
+    wrap.classList.remove('open');
+    setTimeout(() => wrap.remove(), 200);
+  };
+  wrap.onclick = (e) => {
+    if (e.target === wrap || e.target.hasAttribute('data-cancel')) close();
+  };
+  wrap.querySelectorAll('.sheet-action[data-i]').forEach((btn) => {
+    btn.onclick = () => {
+      close();
+      actions[Number(btn.dataset.i)].onClick();
+    };
+  });
+  return close;
+}
+
+function renderThread(slot) {
+  slot.innerHTML = `
+    <div class="chat-shell">
+      <header class="chat-header">
+        <div class="chat-avatar" id="chat-avatar">${escapeHTML((identity.partnerName || '?')[0])}</div>
+        <div class="chat-head-text">
+          <div class="chat-name">${escapeHTML(identity.partnerName || 'Them')}</div>
+          <div class="chat-status" id="chat-status">&nbsp;</div>
+        </div>
+        <div class="chat-lock" title="End-to-end encrypted">${iconLock()}</div>
+      </header>
+
+      <div class="thread-list" id="thread-list"></div>
+
+      <div class="typing-row" id="typing-row" hidden>
+        <div class="typing-bubble"><span></span><span></span><span></span></div>
+      </div>
+
+      <button class="scroll-down" id="scroll-down" hidden aria-label="Jump to latest">${iconChevronDown()}</button>
+
+      <div class="composer">
+        <label class="composer-attach" aria-label="Send a photo">
+          ${iconPlus()}
+          <input type="file" accept="image/*" id="photo-attach" hidden />
+        </label>
+        <div class="composer-field">
+          <textarea id="thread-input" rows="1" placeholder="Message…"></textarea>
+        </div>
+        <button class="composer-send" id="composer-action" aria-label="Record voice note">${iconMic()}</button>
+      </div>
+    </div>
+  `;
+
+  const listEl = document.getElementById('thread-list');
+  const input = document.getElementById('thread-input');
+  const actionBtn = document.getElementById('composer-action');
+  const scrollBtn = document.getElementById('scroll-down');
+  renderLoading(listEl, 'thread', 4);
+
+  let atBottom = true;
+  listEl.addEventListener(
+    'scroll',
+    () => {
+      atBottom = listEl.scrollHeight - listEl.scrollTop - listEl.clientHeight < 90;
+      scrollBtn.hidden = atBottom;
+    },
+    { passive: true }
+  );
+  scrollBtn.onclick = () => {
+    listEl.scrollTo({ top: listEl.scrollHeight, behavior: 'smooth' });
+  };
+
+  // Partner presence → header status + typing bubble.
+  if (identity.partnerUid) {
+    unsubscribers.push(
+      listenPartnerPresence(identity.roomId, identity.partnerUid, (p) => {
+        const statusEl = document.getElementById('chat-status');
+        const typingRow = document.getElementById('typing-row');
+        if (!statusEl || !typingRow) return;
+        typingRow.hidden = !p.typing;
+        if (p.typing) statusEl.innerHTML = '<span class="status-typing">typing…</span>';
+        else if (p.online) statusEl.innerHTML = '<span class="status-online">● online</span>';
+        else if (p.lastSeen) statusEl.textContent = `last seen ${relativeTime(p.lastSeen)}`;
+        else statusEl.innerHTML = '&nbsp;';
+        if (p.typing && atBottom) listEl.scrollTop = listEl.scrollHeight;
+      })
+    );
+    unsubscribers.push(
+      RoomData.listenProfiles(identity.roomId, sharedKey, [identity.partnerUid], (uid, avatar) => {
+        const el = document.getElementById('chat-avatar');
+        const src = safeMediaSrc(avatar, 'image');
+        if (!el || !src) return;
+        el.style.backgroundImage = `url("${src}")`;
+        el.textContent = '';
+      })
+    );
+  }
+
+  let firstPaint = true;
+  unsubscribers.push(
+    RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
+      if (messages.length === 0) {
+        listEl.innerHTML = `<div class="empty-state">
+          <div class="empty-emoji">🌙</div>
+          Nothing here yet. Say hello.
+        </div>`;
+        return;
+      }
+
+      const wasAtBottom = atBottom || firstPaint;
+      listEl.innerHTML = messages.map((m, idx) => bubbleHTML(m, idx, messages)).join('');
+
+      // Gestures + media handlers, bound per paint.
+      listEl.querySelectorAll('.bubble').forEach((el) => {
+        const idx = Number(el.dataset.idx);
+        const message = messages[idx];
+        if (!message) return;
+        attachBubbleGestures(el, {
+          onLongPress: () => openMessageActions(message),
+          onDoubleTap: () => quickReact(message),
+        });
+      });
+
+      listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
+        img.onclick = () => {
+          const message = messages[Number(img.dataset.idx)];
+          img.classList.remove('blurred');
+          img.closest('.bubble')?.querySelector('.view-once-tag')?.remove();
+          setTimeout(() => RoomData.deleteThreadMessage(identity.roomId, message.id), 6000);
+        };
+      });
+
+      listEl.querySelectorAll('.voice-play-btn').forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const message = messages[Number(btn.dataset.idx)];
+          const src = safeMediaSrc(message.audio, 'audio');
+          if (!src) return;
+          const audio = new Audio(src);
+          btn.classList.add('playing');
+          audio.onended = () => btn.classList.remove('playing');
+          audio.play().catch(() => btn.classList.remove('playing'));
+        };
+      });
+
+      if (wasAtBottom) {
+        listEl.scrollTop = listEl.scrollHeight;
+        scrollBtn.hidden = true;
+      } else {
+        scrollBtn.hidden = false;
+      }
+      firstPaint = false;
+    })
+  );
+
+  function quickReact(message) {
+    const reactions = { ...(message.reactions || {}) };
+    reactions[lastKnownUid] = reactions[lastKnownUid] === '❤️' ? null : '❤️';
+    if (!reactions[lastKnownUid]) delete reactions[lastKnownUid];
+    RoomData.setReaction(identity.roomId, sharedKey, message.id, reactions).catch(() =>
+      toast("Couldn't save that reaction")
+    );
+  }
+
+  function openMessageActions(message) {
+    const mine = message.senderUid === lastKnownUid;
+    const actions = [
+      {
+        label: 'React ❤️',
+        onClick: () => quickReact(message),
+      },
+      {
+        label: 'Save as memory',
+        onClick: async () => {
+          await RoomData.pinMessageAsMemory(identity.roomId, sharedKey, message);
+          toast('Pinned to Memories');
+        },
+      },
+    ];
+    if (message.type === 'text') {
+      actions.push({
+        label: 'Copy text',
+        onClick: async () => {
+          try {
+            await navigator.clipboard.writeText(message.text || '');
+            toast('Copied');
+          } catch (e) {
+            toast("Couldn't copy");
+          }
+        },
+      });
+    }
+    actions.push({
+      label: 'Delete for both of you',
+      danger: true,
+      onClick: () => {
+        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
+          RoomData.deleteThreadMessage(identity.roomId, message.id).catch(() => toast("Couldn't delete"));
+        }
+      },
+    });
+    openSheet(mine ? 'Your message' : escapeHTML(identity.partnerName || 'Their message'), actions);
+  }
+
+  // --- composer ---
+  const syncActionButton = () => {
+    const hasText = input.value.trim().length > 0;
+    actionBtn.classList.toggle('is-send', hasText);
+    actionBtn.innerHTML = hasText ? iconSend() : iconMic();
+    actionBtn.setAttribute('aria-label', hasText ? 'Send message' : 'Record voice note');
+  };
+  const autoGrow = () => {
+    input.style.height = 'auto';
+    input.style.height = Math.min(input.scrollHeight, 120) + 'px';
+  };
+  const send = async () => {
+    const text = input.value.trim();
+    if (!text) return;
+    input.value = '';
+    autoGrow();
+    syncActionButton();
+    if (presenceEnabled()) clearTyping(identity.roomId);
+    try {
+      await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
+    } catch (e) {
+      toast("Message didn't send — check your connection");
+      input.value = text;
+      autoGrow();
+      syncActionButton();
+    }
+  };
+
+  input.oninput = () => {
+    autoGrow();
+    syncActionButton();
+    if (presenceEnabled() && input.value.trim()) signalTyping(identity.roomId);
+  };
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      send();
+    }
+  };
+  syncActionButton();
+
+  actionBtn.onclick = () => {
+    if (actionBtn.classList.contains('is-send')) return send();
+    toggleRecording(actionBtn);
+  };
+
+  document.getElementById('photo-attach').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const viewOnce = confirm('Send as view-once? It will disappear once opened.\n\nOK = view-once, Cancel = normal photo');
+    try {
+      const compressed = await fileToCompressedBase64(file);
+      await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
+    } catch (err) {
+      toast("Couldn't send that photo");
+    }
+    e.target.value = '';
+  };
+}
+
+function bubbleHTML(m, idx, messages) {
+  const mine = m.senderUid === lastKnownUid;
+  const prev = messages[idx - 1];
+  const next = messages[idx + 1];
+
+  const newDay = !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString();
+  const divider = newDay ? `<div class="day-divider"><span>${escapeHTML(dayLabel(m.createdAt))}</span></div>` : '';
+
+  // Group consecutive messages from the same person within 5 minutes.
+  const GROUP_MS = 5 * 60 * 1000;
+  const sameAsPrev =
+    !newDay && prev && prev.senderUid === m.senderUid &&
+    new Date(m.createdAt) - new Date(prev.createdAt) < GROUP_MS;
+  const sameAsNext =
+    next && next.senderUid === m.senderUid &&
+    new Date(next.createdAt) - new Date(m.createdAt) < GROUP_MS &&
+    new Date(next.createdAt).toDateString() === new Date(m.createdAt).toDateString();
+
+  const pos = `${sameAsPrev ? 'grp-mid' : 'grp-first'} ${sameAsNext ? '' : 'grp-last'}`;
+  const time = escapeHTML(timeLabel(m.createdAt));
+  const meta = sameAsNext
+    ? ''
+    : `<div class="msg-meta ${mine ? 'right' : ''}">${time}${
+        mine ? `<span class="msg-state">${m.pending ? '🕘' : '✓'}</span>` : ''
+      }</div>`;
+
+  const rx = Object.values(m.reactions || {}).filter(Boolean);
+  const reactionChip = rx.length ? `<div class="reaction-chip">${escapeHTML(rx.join(''))}</div>` : '';
+
+  let inner;
+  if (m.type === 'photo') {
+    const src = safeMediaSrc(m.image, 'image');
+    inner = `
+      ${src
+        ? `<img src="${src}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" alt="" />`
+        : `<div class="media-missing">⚠️ Photo unavailable</div>`}
+      ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}`;
+  } else if (m.type === 'voice') {
+    inner = `
+      <button class="voice-play-btn" data-idx="${idx}" aria-label="Play voice note">${iconPlay()}</button>
+      <div class="voice-wave">${Array.from({ length: 14 })
+        .map((_, i) => `<i style="height:${6 + ((i * 5) % 14)}px"></i>`)
+        .join('')}</div>
+      <span class="voice-dur">${Math.max(1, Number(m.audioDuration) || 0)}s</span>`;
+  } else {
+    inner = escapeHTML(m.text);
+  }
+
+  const typeClass = m.type === 'photo' ? 'photo-bubble' : m.type === 'voice' ? 'voice-bubble' : '';
+  return `${divider}
+    <div class="msg-row ${mine ? 'mine' : 'theirs'} ${m.pending ? 'is-pending' : ''}">
+      <div class="bubble ${mine ? 'me' : 'them'} ${typeClass} ${pos}" data-idx="${idx}">
+        ${inner}${reactionChip}
+      </div>
+      ${meta}
+    </div>`;
+}
+
+async function toggleRecording(micBtn) {
+  if (!navigator.mediaDevices || !window.MediaRecorder) {
+    toast("Voice recording isn't supported in this browser");
+    return;
+  }
+  if (mediaRecorder && mediaRecorder.state === 'recording') {
+    mediaRecorder.stop();
+    return;
+  }
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+    recordedChunks = [];
+    mediaRecorder = new MediaRecorder(stream);
+    recordingStartedAt = Date.now();
+    micBtn.classList.add('mic-recording');
+    toast('Recording… tap again to send');
+
+    mediaRecorder.ondataavailable = (e) => recordedChunks.push(e.data);
+    mediaRecorder.onstop = async () => {
+      micBtn.classList.remove('mic-recording');
+      stream.getTracks().forEach((t) => t.stop());
+      const durationSeconds = Math.round((Date.now() - recordingStartedAt) / 1000);
+      const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+      if (blob.size > 900 * 1024) {
+        toast('That voice note is too long to send — keep it under a minute');
+        return;
+      }
+      try {
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        await RoomData.sendThreadVoice(identity.roomId, sharedKey, base64, durationSeconds);
+      } catch (e) {
+        toast("Voice note didn't send");
+      }
+    };
+
+    mediaRecorder.start();
+    setTimeout(() => {
+      if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+    }, 60000);
+  } catch (e) {
+    toast("Couldn't access the microphone — check permissions");
+  }
+}
+
+// ---------------- Today ----------------
+const MOODS = [
+  { emoji: '😄', label: 'Great' },
+  { emoji: '🙂', label: 'Good' },
+  { emoji: '😐', label: 'Okay' },
+  { emoji: '😔', label: 'Low' },
+  { emoji: '😢', label: 'Really low' },
+];
+const LOW_MOODS = ['😔', '😢'];
+
+function renderToday(slot) {
+  slot.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">How today felt</div>
+      <h2 class="screen-title">Today</h2>
+      <div class="card">
+        <div class="eyebrow">Your mood</div>
+        <div class="mood-picker" id="mood-picker">
+          ${MOODS.map(
+            (m) => `<button class="mood-option" data-mood="${m.emoji}">
+              <span class="mood-emoji">${m.emoji}</span>
+              <span class="mood-label">${m.label}</span>
+            </button>`
+          ).join('')}
+        </div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">${escapeHTML(identity.partnerName || 'Their')} mood today</div>
+        <div class="mood-face" id="partner-mood">–</div>
+      </div>
+      <div class="card">
+        <div class="eyebrow">A photo from today</div>
+        <label class="file-drop" id="photo-drop">
+          ${iconPhoto()}<span>Choose a photo</span>
+          <input type="file" accept="image/*" id="photo-input" hidden />
+        </label>
+        <div class="photo-grid" id="photo-grid"></div>
+      </div>
+    </div>
+  `;
+
+  document.querySelectorAll('.mood-option').forEach((el) => {
+    el.onclick = async () => {
+      el.classList.add('bump');
+      setTimeout(() => el.classList.remove('bump'), 320);
+      try {
+        await RoomData.setTodayMood(identity.roomId, sharedKey, el.dataset.mood);
+      } catch (e) {
+        toast("Couldn't save your mood");
+      }
+    };
+  });
+
+  unsubscribers.push(
+    RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
+      const todayKey = new Date().toISOString().slice(0, 10);
+      const mine = entries.find((e) => e.date === todayKey && e.senderUid === lastKnownUid);
+      const theirs = entries.find((e) => e.date === todayKey && e.senderUid !== lastKnownUid);
+      document.querySelectorAll('.mood-option').forEach((el) => {
+        el.classList.toggle('selected', !!mine && el.dataset.mood === mine.mood);
+      });
+      const partnerMoodEl = document.getElementById('partner-mood');
+      if (partnerMoodEl) partnerMoodEl.textContent = theirs ? theirs.mood : 'Not shared yet';
+    })
+  );
+
+  document.getElementById('photo-input').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    try {
+      const compressed = await fileToCompressedBase64(file);
+      await RoomData.setTodayPhoto(identity.roomId, sharedKey, compressed);
+      toast('Photo shared');
+    } catch (err) {
+      toast("Couldn't share that photo");
+    }
+    e.target.value = '';
+  };
+
+  const grid = document.getElementById('photo-grid');
+  renderLoading(grid, 'photos', 2);
+  unsubscribers.push(
+    RoomData.listenPhotos(identity.roomId, sharedKey, (photos) => {
+      if (!grid) return;
+      const usable = photos.map((p) => ({ ...p, src: safeMediaSrc(p.image, 'image') })).filter((p) => p.src);
+      if (usable.length === 0) {
+        grid.innerHTML = `<div class="empty-state small">No photos yet</div>`;
+        return;
+      }
+      grid.innerHTML = usable
+        .map((p, i) => `<img src="${p.src}" alt="${escapeHTML(p.date || '')}" style="animation-delay:${i * 40}ms" />`)
+        .join('');
+    })
+  );
+}
+
+// ---------------- Calendar ----------------
+function renderCalendar(slot) {
+  slot.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Plans together</div>
+      <h2 class="screen-title">Calendar</h2>
+      <div class="card">
+        <input type="text" id="event-title" placeholder="Event title" />
+        <input type="datetime-local" id="event-time" style="margin:8px 0 10px;" />
+        <button class="btn-primary" id="add-event">Add event</button>
+      </div>
+      <div id="event-list"></div>
+    </div>
+  `;
+  document.getElementById('add-event').onclick = async () => {
+    const title = document.getElementById('event-title').value.trim();
+    const dateTime = document.getElementById('event-time').value;
+    if (!title || !dateTime) return;
+    try {
+      await RoomData.addCalendarEvent(identity.roomId, sharedKey, {
+        title,
+        dateTime: new Date(dateTime).toISOString(),
+      });
+      document.getElementById('event-title').value = '';
+      document.getElementById('event-time').value = '';
+      toast('Event added');
+    } catch (e) {
+      toast("Couldn't add that event");
+    }
+  };
+
+  const listEl = document.getElementById('event-list');
+  renderLoading(listEl, 'calendar', 3);
+  unsubscribers.push(
+    RoomData.listenCalendar(identity.roomId, sharedKey, (events) => {
+      if (events.length === 0) {
+        listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">📅</div>No events yet</div>`;
+        return;
+      }
+      const now = Date.now();
+      const upcoming = events.filter((e) => new Date(e.dateTime).getTime() >= now);
+      const past = events.filter((e) => new Date(e.dateTime).getTime() < now).reverse();
+      const rowsFor = (arr, dim) =>
+        arr
+          .map(
+            (e, i) => `
+        <div class="list-row ${dim ? 'dim' : ''}" style="animation-delay:${i * 30}ms">
+          <div class="date-chip">
+            <span class="date-chip-day">${new Date(e.dateTime).getDate()}</span>
+            <span class="date-chip-mon">${new Date(e.dateTime).toLocaleDateString([], { month: 'short' })}</span>
+          </div>
+          <div class="grow">
+            <div>${escapeHTML(e.title)}</div>
+            <div class="row-meta">${new Date(e.dateTime).toLocaleString([], {
+              weekday: 'short', hour: '2-digit', minute: '2-digit',
+            })}</div>
+          </div>
+        </div>`
+          )
+          .join('');
+      listEl.innerHTML =
+        (upcoming.length ? `<div class="card">${rowsFor(upcoming, false)}</div>` : '') +
+        (past.length
+          ? `<div class="eyebrow" style="margin-top:4px;">Past</div><div class="card">${rowsFor(past, true)}</div>`
+          : '');
+    })
+  );
+}
+
+// ---------------- Bucket list ----------------
+function renderBucketList(slot) {
+  slot.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Things to do together</div>
+      <h2 class="screen-title">List</h2>
+      <div class="card">
+        <div class="inline-add">
+          <input type="text" id="item-input" placeholder="Add something…" />
+          <button class="btn-primary compact" id="add-item">Add</button>
+        </div>
+      </div>
+      <div id="item-list"></div>
+    </div>
+  `;
+  const add = async () => {
+    const el = document.getElementById('item-input');
+    const text = el.value.trim();
+    if (!text) return;
+    el.value = '';
+    try {
+      await RoomData.addBucketItem(identity.roomId, sharedKey, text);
+    } catch (e) {
+      toast("Couldn't add that");
+    }
+  };
+  document.getElementById('add-item').onclick = add;
+  document.getElementById('item-input').onkeydown = (e) => {
+    if (e.key === 'Enter') add();
+  };
+
+  const listEl = document.getElementById('item-list');
+  renderLoading(listEl, 'list', 4);
+  unsubscribers.push(
+    RoomData.listenBucketList(identity.roomId, sharedKey, (items) => {
+      if (items.length === 0) {
+        listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">✨</div>Nothing yet — add your first idea</div>`;
+        return;
+      }
+      const done = items.filter((i) => i.done).length;
+      listEl.innerHTML = `
+        <div class="card">
+          <div class="list-progress">
+            <div class="progress-track"><div class="progress-fill" style="width:${Math.round(
+              (done / items.length) * 100
+            )}%"></div></div>
+            <div class="stat-caption">${done} of ${items.length} done</div>
+          </div>
+          ${items
+            .map(
+              (i, idx) => `
+            <div class="list-row tappable" data-idx="${idx}" style="animation-delay:${idx * 25}ms">
+              <div class="checkbox ${i.done ? 'done' : ''}">${i.done ? '✓' : ''}</div>
+              <div class="grow ${i.done ? 'done-text' : ''}">${escapeHTML(i.text)}</div>
+            </div>`
+            )
+            .join('')}
+        </div>`;
+      listEl.querySelectorAll('.list-row').forEach((row) => {
+        const item = items[Number(row.dataset.idx)];
+        row.onclick = () => {
+          RoomData.toggleBucketItem(identity.roomId, sharedKey, item.id, item.text, item.done);
+        };
+      });
+    })
+  );
+}
+
+// ---------------- More ----------------
+function renderMore(slot) {
+  slot.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Tidelight</div>
+      <h2 class="screen-title">More</h2>
+      <div class="shortcut-grid">
+        ${[
+          ['tile-expense', iconExpense(), 'Expenses', 'Shared spending'],
+          ['tile-savings', iconSavings(), 'Savings', 'Goals you’re building toward'],
+          ['tile-journal', iconJournal(), 'Journal', 'Longer thoughts, shared'],
+          ['tile-letters', iconLetter(), 'Letters', 'Written now, opened later'],
+          ['tile-memories', iconMemory(), 'Memories', 'Pinned from Chat'],
+          ['tile-settings', iconSettings(), 'Settings', 'Security &amp; account'],
+        ]
+          .map(
+            ([id, icon, label, caption], i) => `
+          <button class="shortcut-tile" id="${id}" style="animation-delay:${i * 40}ms">
+            ${icon}
+            <div class="shortcut-tile-label">${label}</div>
+            <div class="shortcut-tile-caption">${caption}</div>
+          </button>`
+          )
+          .join('')}
+      </div>
+    </div>
+  `;
+  document.getElementById('tile-expense').onclick = () => renderExpenseTracker();
+  document.getElementById('tile-savings').onclick = () => renderSavingsTracker();
+  document.getElementById('tile-journal').onclick = () => renderJournal();
+  document.getElementById('tile-letters').onclick = () => renderLetters();
+  document.getElementById('tile-memories').onclick = () => renderMemories();
+  document.getElementById('tile-settings').onclick = () => renderSettings();
+}
+
+// ---------------- Expenses (with categories) ----------------
+function renderExpenseTracker() {
+  clearListeners();
+  let activeCategory = 'All';
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="back-more-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Shared spending</div>
+          <h2>Expenses</h2>
+        </div>
+      </div>
+
+      <div class="card balance-card" id="expense-summary"></div>
+
+      <div class="card">
+        <input type="text" id="expense-desc" placeholder="What was it for?" />
+        <div class="field-row" style="margin-top:8px;">
+          <input type="number" id="expense-amount" inputmode="decimal" placeholder="Amount" />
+          <select id="expense-category">
+            ${RoomData.EXPENSE_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join('')}
+          </select>
+        </div>
+        <select id="expense-paidby" style="margin-top:8px;">
+          <option value="${lastKnownUid}">I paid</option>
+          <option value="${identity.partnerUid || ''}">${escapeHTML(identity.partnerName || 'They')} paid</option>
+        </select>
+        <button class="btn-primary" id="add-expense-btn" style="margin-top:10px;">Add expense</button>
+      </div>
+
+      <div class="chip-row" id="category-chips"></div>
+      <div id="expense-list"></div>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-expense-btn').onclick = async () => {
+    const description = document.getElementById('expense-desc').value.trim();
+    const amount = parseFloat(document.getElementById('expense-amount').value);
+    const paidBy = document.getElementById('expense-paidby').value;
+    const category = document.getElementById('expense-category').value;
+    if (!description || !amount) return;
+    try {
+      await RoomData.addExpense(identity.roomId, sharedKey, { description, amount, paidBy, category });
+      document.getElementById('expense-desc').value = '';
+      document.getElementById('expense-amount').value = '';
+      toast('Expense added');
+    } catch (e) {
+      toast("Couldn't add that expense");
+    }
+  };
+
+  const listEl = document.getElementById('expense-list');
+  const summaryEl = document.getElementById('expense-summary');
+  renderLoading(listEl, 'expenses', 4);
+  summaryEl.innerHTML = `<div class="stat-caption">Counting your cash…</div>`;
+
+  let allExpenses = [];
+
+  function paint() {
+    const shown = activeCategory === 'All' ? allExpenses : allExpenses.filter((e) => e.category === activeCategory);
+
+    // The balance is always computed across EVERYTHING, not the filtered view —
+    // a filter is for reading, it should never change what you owe.
+    const totalMine = allExpenses.filter((e) => e.paidBy === lastKnownUid).reduce((s, e) => s + e.amount, 0);
+    const totalTheirs = allExpenses.filter((e) => e.paidBy === identity.partnerUid).reduce((s, e) => s + e.amount, 0);
+    const diff = totalMine - totalTheirs;
+    let summaryText;
+    let cls = 'even';
+    if (Math.abs(diff) < 0.01) summaryText = "You're even.";
+    else if (diff > 0) {
+      summaryText = `${escapeHTML(identity.partnerName || 'They')} owes you ${(diff / 2).toFixed(2)}`;
+      cls = 'positive';
+    } else {
+      summaryText = `You owe ${escapeHTML(identity.partnerName || 'them')} ${(Math.abs(diff) / 2).toFixed(2)}`;
+      cls = 'negative';
+    }
+    summaryEl.innerHTML = `
+      <div class="eyebrow">Balance</div>
+      <div class="balance-value ${cls}">${summaryText}</div>
+      <div class="balance-split">
+        <span>You paid <strong>${totalMine.toFixed(2)}</strong></span>
+        <span>${escapeHTML(identity.partnerName || 'They')} paid <strong>${totalTheirs.toFixed(2)}</strong></span>
+      </div>`;
+
+    const cats = ['All', ...RoomData.EXPENSE_CATEGORIES.filter((c) => allExpenses.some((e) => e.category === c))];
+    const chipRow = document.getElementById('category-chips');
+    chipRow.innerHTML = cats
+      .map((c) => {
+        const total = c === 'All' ? allExpenses.reduce((s, e) => s + e.amount, 0)
+                                  : allExpenses.filter((e) => e.category === c).reduce((s, e) => s + e.amount, 0);
+        return `<button class="chip ${c === activeCategory ? 'active' : ''}" data-cat="${escapeHTML(c)}">${escapeHTML(
+          c
+        )} <span class="chip-count">${total.toFixed(0)}</span></button>`;
+      })
+      .join('');
+    chipRow.querySelectorAll('.chip').forEach((chip) => {
+      chip.onclick = () => {
+        activeCategory = chip.dataset.cat;
+        paint();
+      };
+    });
+
+    if (shown.length === 0) {
+      listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">🧾</div>${
+        allExpenses.length ? 'Nothing in this category' : 'No expenses logged yet'
+      }</div>`;
+      return;
+    }
+    listEl.innerHTML = `<div class="card">${shown
+      .map(
+        (e, i) => `
+      <div class="money-row" data-id="${e.id}" style="animation-delay:${i * 25}ms">
+        <div class="grow">
+          <div>${escapeHTML(e.description)}</div>
+          <div class="row-meta">${
+            e.paidBy === lastKnownUid ? 'You paid' : `${escapeHTML(identity.partnerName || 'They')} paid`
+          } · ${escapeHTML(e.category)} · ${escapeHTML(relativeTime(e.createdAt))}</div>
+        </div>
+        <div class="money-amount">${e.amount.toFixed(2)}</div>
+      </div>`
+      )
+      .join('')}</div>
+      <p class="fine-print">Long-press an entry to remove it.</p>`;
+
+    listEl.querySelectorAll('.money-row').forEach((row) => {
+      attachBubbleGestures(row, {
+        onLongPress: () =>
+          openSheet('Expense', [
+            {
+              label: 'Delete',
+              danger: true,
+              onClick: () => RoomData.deleteExpense(identity.roomId, row.dataset.id),
+            },
+          ]),
+        onDoubleTap: () => {},
+      });
+    });
+  }
+
+  unsubscribers.push(
+    RoomData.listenExpenses(identity.roomId, sharedKey, (expenses) => {
+      allExpenses = expenses;
+      paint();
+    })
+  );
+}
+
+// ---------------- Savings (multiple goals) ----------------
+function renderSavingsTracker() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="back-more-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Saving together</div>
+          <h2>Savings</h2>
+        </div>
+      </div>
+
+      <div id="goals-list"></div>
+
+      <details class="card details-card">
+        <summary>New goal</summary>
+        <input type="text" id="goal-label" placeholder="e.g. Flight to see her" style="margin-top:10px;" />
+        <input type="number" id="goal-amount" inputmode="decimal" placeholder="Target amount" style="margin-top:8px;" />
+        <button class="btn-primary" id="save-goal-btn" style="margin-top:10px;">Add goal</button>
+      </details>
+
+      <details class="card details-card">
+        <summary>Add a contribution</summary>
+        <input type="text" id="entry-label" placeholder="What's this contribution for?" style="margin-top:10px;" />
+        <div class="field-row" style="margin-top:8px;">
+          <input type="number" id="entry-amount" inputmode="decimal" placeholder="Amount" />
+          <select id="entry-goal"></select>
+        </div>
+        <button class="btn-primary" id="add-entry-btn" style="margin-top:10px;">Add contribution</button>
+      </details>
+
+      <div class="eyebrow" style="margin-top:6px;">Recent contributions</div>
+      <div id="savings-list"></div>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+
+  let goals = [];
+  let entries = [];
+  let goalsLoaded = false;
+  let entriesLoaded = false;
+
+  const goalsEl = document.getElementById('goals-list');
+  const listEl = document.getElementById('savings-list');
+  renderLoading(goalsEl, 'savings', 2);
+  renderLoading(listEl, 'savings', 3);
+
+  document.getElementById('save-goal-btn').onclick = async () => {
+    const label = document.getElementById('goal-label').value.trim();
+    const target = parseFloat(document.getElementById('goal-amount').value);
+    if (!label || !target) return;
+    try {
+      await RoomData.addSavingsGoal(identity.roomId, sharedKey, { label, target });
+      document.getElementById('goal-label').value = '';
+      document.getElementById('goal-amount').value = '';
+      toast('Goal added');
+    } catch (e) {
+      toast("Couldn't add that goal");
+    }
+  };
+
+  document.getElementById('add-entry-btn').onclick = async () => {
+    const label = document.getElementById('entry-label').value.trim();
+    const amount = parseFloat(document.getElementById('entry-amount').value);
+    const goalId = document.getElementById('entry-goal').value || null;
+    if (!label || !amount) return;
+    try {
+      await RoomData.addSavingsEntry(identity.roomId, sharedKey, { label, amount, goalId });
+      document.getElementById('entry-label').value = '';
+      document.getElementById('entry-amount').value = '';
+      toast('Contribution added');
+    } catch (e) {
+      toast("Couldn't add that contribution");
+    }
+  };
+
+  function totalFor(goalId) {
+    return entries.filter((e) => e.goalId === goalId).reduce((s, e) => s + e.amount, 0);
+  }
+
+  function paint() {
+    if (!goalsLoaded || !entriesLoaded) return;
+
+    const sel = document.getElementById('entry-goal');
+    if (sel) {
+      const prev = sel.value;
+      sel.innerHTML =
+        goals.map((g) => `<option value="${g.id}">${escapeHTML(g.label)}</option>`).join('') +
+        `<option value="">Unassigned</option>`;
+      if (prev) sel.value = prev;
+    }
+
+    if (goals.length === 0) {
+      goalsEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">🎯</div>No goals yet — add one below</div>`;
+    } else {
+      goalsEl.innerHTML = goals
+        .map((g, i) => {
+          const total = totalFor(g.id);
+          const pct = g.target > 0 ? Math.min(100, Math.round((total / g.target) * 100)) : 0;
+          const done = g.target > 0 && total >= g.target;
+          return `
+          <div class="card goal-card ${done ? 'goal-done' : ''}" data-goal="${g.id}" style="animation-delay:${i * 50}ms">
+            <div class="goal-head">
+              <div class="goal-label">${escapeHTML(g.label)}${done ? ' <span class="goal-badge">reached</span>' : ''}</div>
+              <button class="btn-icon subtle" data-goal-menu="${g.id}" aria-label="Goal options">${iconMore()}</button>
+            </div>
+            <div class="goal-figures"><strong>${total.toFixed(2)}</strong> <span>of ${g.target.toFixed(2)}</span></div>
+            <div class="progress-track"><div class="progress-fill" style="width:${pct}%"></div></div>
+            <div class="stat-caption">${pct}% there${
+              g.target > total ? ` · ${(g.target - total).toFixed(2)} to go` : ''
+            }</div>
+          </div>`;
+        })
+        .join('');
+
+      goalsEl.querySelectorAll('[data-goal-menu]').forEach((btn) => {
+        btn.onclick = (e) => {
+          e.stopPropagation();
+          const id = btn.dataset.goalMenu;
+          const goal = goals.find((g) => g.id === id);
+          openSheet(escapeHTML(goal?.label || 'Goal'), [
+            {
+              label: 'Rename / change target',
+              onClick: () => editGoal(goal),
+            },
+            {
+              label: 'Delete goal',
+              danger: true,
+              onClick: () => {
+                if (
+                  confirm(
+                    'Delete this goal? Contributions already logged against it stay in your history, but become unassigned.'
+                  )
+                ) {
+                  RoomData.deleteSavingsGoal(identity.roomId, id);
+                }
+              },
+            },
+          ]);
+        };
+      });
+    }
+
+    const unassigned = totalFor(null);
+    if (unassigned > 0) {
+      goalsEl.innerHTML += `<div class="card subtle-card">
+        <div class="eyebrow">Unassigned</div>
+        <div class="goal-figures"><strong>${unassigned.toFixed(2)}</strong> <span>not linked to a goal</span></div>
+      </div>`;
+    }
+
+    if (entries.length === 0) {
+      listEl.innerHTML = `<div class="empty-state small">No contributions yet</div>`;
+      return;
+    }
+    listEl.innerHTML = `<div class="card">${entries
+      .map((e, i) => {
+        const goal = goals.find((g) => g.id === e.goalId);
+        return `
+      <div class="money-row" data-id="${e.id}" style="animation-delay:${i * 25}ms">
+        <div class="grow">
+          <div>${escapeHTML(e.label)}</div>
+          <div class="row-meta">${
+            e.contributedBy === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')
+          } · ${goal ? escapeHTML(goal.label) : 'Unassigned'} · ${escapeHTML(relativeTime(e.createdAt))}</div>
+        </div>
+        <div class="money-amount">+${e.amount.toFixed(2)}</div>
+      </div>`;
+      })
+      .join('')}</div>
+      <p class="fine-print">Long-press a contribution to remove it.</p>`;
+
+    listEl.querySelectorAll('.money-row').forEach((row) => {
+      attachBubbleGestures(row, {
+        onLongPress: () =>
+          openSheet('Contribution', [
+            {
+              label: 'Delete',
+              danger: true,
+              onClick: () => RoomData.deleteSavingsEntry(identity.roomId, row.dataset.id),
+            },
+          ]),
+        onDoubleTap: () => {},
+      });
+    });
+  }
+
+  function editGoal(goal) {
+    if (!goal) return;
+    const label = prompt('Goal name', goal.label);
+    if (label === null) return;
+    const target = prompt('Target amount', String(goal.target));
+    if (target === null) return;
+    RoomData.updateSavingsGoal(identity.roomId, sharedKey, goal.id, {
+      label: label.trim() || goal.label,
+      target: parseFloat(target) || goal.target,
+    }).catch(() => toast("Couldn't update that goal"));
+  }
+
+  unsubscribers.push(
+    RoomData.listenSavingsGoals(identity.roomId, sharedKey, (g) => {
+      goals = g;
+      goalsLoaded = true;
+      paint();
+    })
+  );
+  unsubscribers.push(
+    RoomData.listenSavings(identity.roomId, sharedKey, (e) => {
+      entries = e;
+      entriesLoaded = true;
+      paint();
+    })
+  );
+}
+
+// ---------------- Journal ----------------
+function renderJournal() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="back-more-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Longer thoughts, shared</div>
+          <h2>Journal</h2>
+        </div>
+      </div>
+      <div class="card">
+        <textarea id="journal-input" rows="4" placeholder="Write something that doesn't fit in a quick message…"></textarea>
+        <button class="btn-primary" id="add-journal-btn" style="margin-top:10px;">Save entry</button>
+      </div>
+      <div id="journal-list"></div>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-journal-btn').onclick = async () => {
+    const el = document.getElementById('journal-input');
+    const text = el.value.trim();
+    if (!text) return;
+    el.value = '';
+    try {
+      await RoomData.addJournalEntry(identity.roomId, sharedKey, text);
+      toast('Saved');
+    } catch (e) {
+      toast("Couldn't save that entry");
+    }
+  };
+
+  const listEl = document.getElementById('journal-list');
+  renderLoading(listEl, 'journal', 3);
+  unsubscribers.push(
+    RoomData.listenJournal(identity.roomId, sharedKey, (entries) => {
+      if (entries.length === 0) {
+        listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">📖</div>No entries yet</div>`;
+        return;
+      }
+      listEl.innerHTML = `<div class="card">${entries
+        .map(
+          (e, idx) => `
+        <div class="journal-entry" style="animation-delay:${idx * 30}ms">
+          <div>${escapeHTML(e.text)}</div>
+          <div class="row-meta">
+            ${e.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')} · ${escapeHTML(
+            relativeTime(e.createdAt)
+          )}
+            ${
+              e.senderUid === lastKnownUid
+                ? ` · <span class="link-action journal-delete" data-idx="${idx}">delete</span>`
+                : ''
+            }
+          </div>
+        </div>`
+        )
+        .join('')}</div>`;
+      listEl.querySelectorAll('.journal-delete').forEach((btn) => {
+        btn.onclick = () => {
+          const entry = entries[Number(btn.dataset.idx)];
+          if (confirm('Delete this journal entry?')) RoomData.deleteJournalEntry(identity.roomId, entry.id);
+        };
+      });
+    })
+  );
+}
+
+// ---------------- Letters ----------------
+function renderLetters() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="back-more-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Written now, opened later</div>
+          <h2>Letters</h2>
+        </div>
+      </div>
+      <div class="card">
+        <textarea id="letter-text" rows="4" placeholder="Write something for them to find later…"></textarea>
+        <div class="eyebrow" style="margin-top:10px;">Unlocks on</div>
+        <input type="date" id="letter-unlock" style="margin-bottom:10px;" />
+        <button class="btn-primary" id="add-letter-btn">Seal it</button>
+        <p class="fine-print">
+          The date is an honor-system reveal between just the two of you — the letter itself
+          stays properly encrypted either way, only the app's own screen won't show the words until then.
+        </p>
+      </div>
+      <div id="letter-list"></div>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-letter-btn').onclick = async () => {
+    const text = document.getElementById('letter-text').value.trim();
+    const unlockDate = document.getElementById('letter-unlock').value;
+    if (!text || !unlockDate) return;
+    try {
+      await RoomData.addLetter(identity.roomId, sharedKey, {
+        text,
+        unlockAt: new Date(unlockDate).toISOString(),
+      });
+      document.getElementById('letter-text').value = '';
+      document.getElementById('letter-unlock').value = '';
+      toast('Sealed');
+    } catch (e) {
+      toast("Couldn't seal that letter");
+    }
+  };
+
+  const listEl = document.getElementById('letter-list');
+  renderLoading(listEl, 'letters', 3);
+  unsubscribers.push(
+    RoomData.listenLetters(identity.roomId, sharedKey, (letters) => {
+      if (letters.length === 0) {
+        listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">✉️</div>No letters yet</div>`;
+        return;
+      }
+      listEl.innerHTML = `<div class="card">${letters
+        .map((l, idx) => {
+          if (!l.unlocked) {
+            const c = countdownParts(new Date(l.unlockAt).getTime());
+            return `<div class="letter-row locked" style="animation-delay:${idx * 30}ms">
+              <div class="letter-locked">🔒 Sealed until ${new Date(l.unlockAt).toLocaleDateString()}</div>
+              <div class="row-meta">${c.days > 0 ? `${c.days} days to go` : 'Opens today'}</div>
+            </div>`;
+          }
+          return `<div class="letter-row" style="animation-delay:${idx * 30}ms">
+            <div>${escapeHTML(l.text)}</div>
+            <div class="row-meta">
+              ${l.senderUid === lastKnownUid ? 'From you' : `From ${escapeHTML(identity.partnerName || 'them')}`}
+              ${
+                l.senderUid === lastKnownUid
+                  ? ` · <span class="link-action letter-delete" data-idx="${idx}">delete</span>`
+                  : ''
+              }
+            </div>
+          </div>`;
+        })
+        .join('')}</div>`;
+      listEl.querySelectorAll('.letter-delete').forEach((btn) => {
+        btn.onclick = () => {
+          const letter = letters[Number(btn.dataset.idx)];
+          if (confirm('Delete this letter?')) RoomData.deleteLetter(identity.roomId, letter.id);
+        };
+      });
+    })
+  );
+}
+
+// ---------------- Memories ----------------
+function renderMemories() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="back-more-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Pinned from Chat</div>
+          <h2>Memories</h2>
+        </div>
+      </div>
+      <div id="memories-list"></div>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+
+  const listEl = document.getElementById('memories-list');
+  renderLoading(listEl, 'memories', 3);
+  unsubscribers.push(
+    RoomData.listenMemories(identity.roomId, sharedKey, (memories) => {
+      if (memories.length === 0) {
+        listEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">📌</div>Nothing pinned yet — long-press any message in Chat</div>`;
+        return;
+      }
+      listEl.innerHTML = memories
+        .map((m, idx) => {
+          let body;
+          if (m.type === 'photo') {
+            const src = safeMediaSrc(m.image, 'image');
+            body = src
+              ? `<img src="${src}" class="memory-photo" alt="" />`
+              : `<div class="media-missing">⚠️ Photo unavailable</div>`;
+          } else if (m.type === 'voice') {
+            body = `<div>🎤 Voice note · ${Math.max(1, Number(m.audioDuration) || 0)}s</div>`;
+          } else {
+            body = `<div class="memory-text">${escapeHTML(m.text)}</div>`;
+          }
+          return `<div class="card memory-card" style="animation-delay:${idx * 40}ms">
+            ${body}
+            <div class="row-meta">${escapeHTML(
+              m.createdAt.toLocaleDateString()
+            )} · <span class="link-action memory-delete" data-idx="${idx}">unpin</span></div>
+          </div>`;
+        })
+        .join('');
+      listEl.querySelectorAll('.memory-delete').forEach((btn) => {
+        btn.onclick = () => {
+          const memory = memories[Number(btn.dataset.idx)];
+          RoomData.deleteMemory(identity.roomId, memory.id);
+        };
+      });
+    })
+  );
 }
 
 // ---------------- Settings ----------------
 function renderSettings() {
   clearListeners();
+  const perm = notificationPermission();
+  const notifyLabel =
+    perm === 'granted' ? 'Notifications are on'
+    : perm === 'denied' ? 'Blocked in your browser settings'
+    : perm === 'unsupported' ? 'Not supported in this browser'
+    : 'Not enabled yet';
+
   root.innerHTML = `
     <div class="screen">
-      <div class="eyebrow">Tidelight</div>
-      <h1 style="margin-bottom:16px;">Settings</h1>
+      <div class="page-head">
+        <button class="btn-icon" id="back-home-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Tidelight</div>
+          <h2>Settings</h2>
+        </div>
+      </div>
 
       <div class="card">
         <div class="eyebrow">Encryption</div>
-        <p style="font-size:13.5px; color:var(--text-dim);">
+        <p class="body-dim">
           Every message, photo, and entry is end-to-end encrypted with a key that's generated on your device
           and never leaves it. Tidelight's servers only ever store unreadable ciphertext.
         </p>
       </div>
 
       <div class="card">
+        <div class="eyebrow">Notifications</div>
+        <p class="body-dim">${notifyLabel}.</p>
+        <p class="fine-print">
+          Honest limit: these are local notifications. They arrive while Tidelight is open or still running in
+          the background — but if the app is fully closed or your phone clears it from memory, nothing will
+          come through until you open it again. Delivery to a closed app needs a server to send the push, which
+          this app deliberately doesn't have.
+        </p>
+        ${
+          perm === 'default'
+            ? '<button class="btn-secondary" id="enable-notify-btn" style="margin-top:10px;">Turn on notifications</button>'
+            : ''
+        }
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Typing &amp; online status</div>
+        <p class="body-dim">${
+          presenceEnabled()
+            ? 'They can see when you’re online and typing.'
+            : 'Your typing and online status are hidden.'
+        }</p>
+        <p class="fine-print">
+          These two signals are stored as plain timestamps, not encrypted content — the same category as the
+          message times the app already keeps. The server can see <em>when</em> you're active, never a word of
+          <em>what</em> you write. Turn it off and nothing is written at all.
+        </p>
+        <button class="btn-secondary" id="toggle-presence-btn" style="margin-top:10px;">
+          ${presenceEnabled() ? 'Turn off' : 'Turn on'}
+        </button>
+      </div>
+
+      <div class="card">
         <div class="eyebrow">Network privacy</div>
-        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
+        <p class="body-dim">
           Tidelight can't change your device's network settings — no website can. What genuinely helps is
           turning on <strong>DNS-over-HTTPS</strong> in your phone or browser, which stops your internet
           provider from seeing which sites you visit as plain text lookups.
         </p>
-        <button class="btn-secondary" id="dns-help-btn">How to turn this on</button>
+        <button class="btn-secondary" id="dns-help-btn" style="margin-top:10px;">How to turn this on</button>
       </div>
 
       <div class="card">
         <div class="eyebrow">App lock</div>
-        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
+        <p class="body-dim">
           ${identity.pinEnabled ? 'A PIN is protecting this device.' : 'No PIN set — anyone with your unlocked phone can open this app.'}
         </p>
-        <button class="btn-secondary" id="toggle-pin-btn">${identity.pinEnabled ? 'Change PIN' : 'Set a PIN'}</button>
+        <button class="btn-secondary" id="toggle-pin-btn" style="margin-top:10px;">${
+          identity.pinEnabled ? 'Change PIN' : 'Set a PIN'
+        }</button>
       </div>
 
       <div class="card">
         <div class="eyebrow">Recovery</div>
-        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
-          ${identity.recoveryEmail ? `Recovery is set up for ${escapeHTML(identity.recoveryEmail)}.` : "You're anonymous — losing this device means losing access permanently, with no way to recover."}
+        <p class="body-dim">
+          ${
+            identity.recoveryEmail
+              ? `Recovery is set up for ${escapeHTML(identity.recoveryEmail)}.`
+              : "You're anonymous — losing this device means losing access permanently, with no way to recover."
+          }
         </p>
-        ${identity.recoveryEmail ? '' : '<button class="btn-secondary" id="setup-recovery-later-btn">Set up recovery</button>'}
+        ${identity.recoveryEmail ? '' : '<button class="btn-secondary" id="setup-recovery-later-btn" style="margin-top:10px;">Set up recovery</button>'}
       </div>
 
       <div class="card">
         <div class="eyebrow">Photo &amp; message privacy</div>
-        <p style="font-size:13.5px; color:var(--text-dim);">
+        <p class="body-dim">
           View-once photos in Chat delete themselves after your partner opens them once. Any message or
           photo either of you deletes is removed from the database entirely — nothing lingers. The app also
           blurs images the instant it's backgrounded, so they can't appear in your phone's recent-apps preview.
@@ -784,17 +2389,15 @@ function renderSettings() {
 
       <div class="card">
         <div class="eyebrow">Log out</div>
-        <p style="font-size:13.5px; color:var(--text-dim); margin: 4px 0 10px;">
+        <p class="body-dim">
           ${
             identity.recoveryEmail
               ? 'You can safely log out — sign back in anytime with your recovery email and password to restore everything.'
               : "You haven't set up recovery. Logging out now means permanently losing access to your account and paired room — there is no way back in."
           }
         </p>
-        <button class="btn-secondary" id="logout-btn" style="color:var(--horizon); border-color: var(--horizon);">Log out</button>
+        <button class="btn-danger" id="logout-btn" style="margin-top:10px;">Log out</button>
       </div>
-
-      <button class="btn-secondary" id="back-home-btn">Back to Home</button>
     </div>
   `;
 
@@ -802,6 +2405,30 @@ function renderSettings() {
   document.getElementById('toggle-pin-btn').onclick = () => renderPinChoiceFromSettings();
   document.getElementById('logout-btn').onclick = () => handleLogout();
   document.getElementById('dns-help-btn').onclick = () => renderDnsHelp();
+
+  const notifyBtn = document.getElementById('enable-notify-btn');
+  if (notifyBtn)
+    notifyBtn.onclick = async () => {
+      const result = await requestNotificationPermission();
+      if (result === 'granted') {
+        showNotification('Tidelight', 'Notifications are on. This is what they’ll look like.');
+        toast('Notifications enabled');
+      } else if (result === 'denied') {
+        toast('Blocked — you can re-enable them in browser settings');
+      }
+      renderSettings();
+    };
+
+  document.getElementById('toggle-presence-btn').onclick = async () => {
+    const next = !presenceEnabled();
+    identity = await updateIdentity({ presenceEnabled: next });
+    if (next) startHeartbeat(identity.roomId);
+    else {
+      stopHeartbeat();
+      clearTyping(identity.roomId);
+    }
+    renderSettings();
+  };
 
   const recoveryBtn = document.getElementById('setup-recovery-later-btn');
   if (recoveryBtn) recoveryBtn.onclick = () => renderRecoverySetupFromSettings();
@@ -811,31 +2438,35 @@ function renderDnsHelp() {
   clearListeners();
   root.innerHTML = `
     <div class="screen">
-      <div class="eyebrow">Network privacy</div>
-      <h1 style="margin-bottom:16px;">Turning on DNS-over-HTTPS</h1>
+      <div class="page-head">
+        <button class="btn-icon" id="back-settings-btn" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Network privacy</div>
+          <h2>DNS-over-HTTPS</h2>
+        </div>
+      </div>
       <div class="card">
         <div class="eyebrow">Android</div>
-        <p style="font-size:13.5px; color:var(--text-dim);">
+        <p class="body-dim">
           Settings → Network &amp; internet → Private DNS → choose "Private DNS provider hostname" →
           enter <strong>dns.google</strong> or <strong>1dot1dot1dot1.cloudflare-dns.com</strong>.
         </p>
       </div>
       <div class="card">
         <div class="eyebrow">Chrome browser</div>
-        <p style="font-size:13.5px; color:var(--text-dim);">
+        <p class="body-dim">
           Settings → Privacy and security → Security → "Use secure DNS" → pick a provider from the list.
         </p>
       </div>
       <div class="card">
         <div class="eyebrow">What this does — and doesn't do</div>
-        <p style="font-size:13.5px; color:var(--text-dim);">
+        <p class="body-dim">
           It stops your local network or ISP from seeing plain-text records of which domains you look up.
           It does not hide the destination IP address itself from a sufficiently resourced network operator,
           and it doesn't change what Tidelight already protects with encryption. Think of it as one more
           honest layer, not a cloak of invisibility.
         </p>
       </div>
-      <button class="btn-secondary" id="back-settings-btn">Back to Settings</button>
     </div>
   `;
   document.getElementById('back-settings-btn').onclick = () => renderSettings();
@@ -850,11 +2481,12 @@ async function handleLogout() {
   if (!confirmed) return;
 
   clearListeners();
+  clearGlobalListeners();
   await clearIdentity();
   try {
     await signOutOfAccount();
   } catch (e) {
-    // even if sign-out fails, local identity is already wiped — reload to restart cleanly
+    /* local identity already wiped — reload regardless */
   }
   window.location.reload();
 }
@@ -865,12 +2497,12 @@ function renderPinChoiceFromSettings() {
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Set a PIN</h1>
-      <div class="card" style="width:100%;">
-        <input type="text" inputmode="numeric" pattern="[0-9]*" id="pin-input" placeholder="4–6 digit PIN" maxlength="6" />
+      <div class="card">
+        <input type="password" inputmode="numeric" pattern="[0-9]*" id="pin-input" placeholder="4–6 digit PIN" maxlength="6" />
       </div>
-      <button class="btn-primary" id="save-pin-btn" style="width:100%;">Save</button>
+      <button class="btn-primary" id="save-pin-btn">Save</button>
       <div id="pin-error" class="error-text"></div>
-      <button class="btn-secondary" id="cancel-btn" style="width:100%;">Cancel</button>
+      <button class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
   `;
   document.getElementById('cancel-btn').onclick = () => renderSettings();
@@ -881,9 +2513,10 @@ function renderPinChoiceFromSettings() {
       return;
     }
     const plaintextSecretKey = identity.secretKey;
-    const locked = await lockIdentityWithPin(identity, pin); // locked never contains a plaintext secretKey
+    const locked = await lockIdentityWithPin(identity, pin);
     identity = await saveIdentity(locked);
-    identity.secretKey = plaintextSecretKey; // kept in memory for this session only, never persisted
+    identity.secretKey = plaintextSecretKey; // memory only, never persisted
+    toast('PIN saved');
     renderSettings();
   };
 }
@@ -894,779 +2527,38 @@ function renderRecoverySetupFromSettings() {
     <div class="screen center-col">
       <div class="mark"></div>
       <h1>Set up recovery</h1>
-      <div class="card" style="width:100%;">
-        <input type="text" id="recovery-email" placeholder="Email" style="margin-bottom:8px;" />
-        <input type="text" id="recovery-password" placeholder="Choose a password" />
+      <div class="card">
+        <input type="email" id="recovery-email" placeholder="Email" autocomplete="email" />
+        <input type="password" id="recovery-password" placeholder="Choose a password" autocomplete="new-password" style="margin-top:8px;" />
       </div>
-      <button class="btn-primary" id="save-recovery-btn" style="width:100%;">Save</button>
+      <button class="btn-primary" id="save-recovery-btn">Save</button>
       <div id="recovery-error" class="error-text"></div>
-      <button class="btn-secondary" id="cancel-btn" style="width:100%;">Cancel</button>
+      <button class="btn-secondary" id="cancel-btn">Cancel</button>
     </div>
   `;
   document.getElementById('cancel-btn').onclick = () => renderSettings();
-  document.getElementById('save-recovery-btn').onclick = async () => {
+  const btn = document.getElementById('save-recovery-btn');
+  btn.onclick = async () => {
     const email = document.getElementById('recovery-email').value.trim();
     const password = document.getElementById('recovery-password').value;
     if (!email || password.length < 6) {
-      document.getElementById('recovery-error').textContent = 'Enter an email and a password of at least 6 characters.';
+      document.getElementById('recovery-error').textContent =
+        'Enter an email and a password of at least 6 characters.';
       return;
     }
+    btn.disabled = true;
+    btn.textContent = 'Saving…';
     try {
       await setUpRecovery(email, password, identity);
       identity = await updateIdentity({ recoveryEmail: email });
+      toast('Recovery is set up');
       renderSettings();
     } catch (e) {
       document.getElementById('recovery-error').textContent = e.message;
+      btn.disabled = false;
+      btn.textContent = 'Save';
     }
   };
-}
-
-// ---------------- Thread ----------------
-let mediaRecorder = null;
-let recordedChunks = [];
-let recordingStartedAt = null;
-
-function renderThread(slot) {
-  slot.innerHTML = `
-    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
-      <div class="eyebrow">Just the two of you</div>
-      <h2 style="margin-bottom:12px;">Chat</h2>
-      <div class="thread-list" id="thread-list" style="flex:1; overflow-y:auto;"></div>
-      <div class="composer">
-        <label class="btn-icon" style="cursor:pointer;">
-          ${iconPhoto()}
-          <input type="file" accept="image/*" id="photo-attach" style="display:none;" />
-        </label>
-        <button class="btn-icon" id="mic-btn" aria-label="Record voice note">${iconMic()}</button>
-        <input type="text" id="thread-input" placeholder="Say something quiet..." />
-        <button id="thread-send">Send</button>
-      </div>
-    </div>
-  `;
-  const listEl = document.getElementById('thread-list');
-
-  const unsub = RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
-    if (messages.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">Nothing here yet. Say hello.</div>`;
-      return;
-    }
-    listEl.innerHTML = messages
-      .map((m, idx) => {
-        const mine = m.senderUid === lastKnownUid;
-        const prev = messages[idx - 1];
-        const divider =
-          !prev || new Date(prev.createdAt).toDateString() !== new Date(m.createdAt).toDateString()
-            ? `<div class="day-divider">${escapeHTML(dayLabel(m.createdAt))}</div>`
-            : '';
-        const when = escapeHTML(timeLabel(m.createdAt));
-        const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
-        const pinBtn = `<span class="bubble-pin" data-pin-idx="${idx}" title="Save as a memory">${iconPinSmall()}</span>`;
-        const sendingTag = mine && m.pending
-          ? `<div class="sending-tag"><span class="sending-dot"></span> Sending…</div>`
-          : '';
-
-        if (m.type === 'photo') {
-          const src = safeMediaSrc(m.image, 'image');
-          return `${divider}<div>
-            <div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}" title="${when}">
-              ${deleteBtn}${pinBtn}
-              ${src
-                ? `<img src="${src}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />`
-                : `<div class="empty-state" style="padding:20px;">⚠️ Photo unavailable</div>`}
-              ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}
-            </div>${sendingTag}
-          </div>`;
-        }
-        if (m.type === 'voice') {
-          return `${divider}<div>
-            <div class="bubble ${mine ? 'me' : 'them'} voice-bubble" data-idx="${idx}" title="${when}">
-              ${deleteBtn}${pinBtn}
-              <button class="voice-play-btn" data-idx="${idx}">${iconPlay()}</button>
-              <span>Voice note · ${m.audioDuration || 0}s</span>
-            </div>${sendingTag}
-          </div>`;
-        }
-        return `${divider}<div>
-          <div class="bubble ${mine ? 'me' : 'them'}" title="${when}">${deleteBtn}${pinBtn}${escapeHTML(m.text)}</div>${sendingTag}
-        </div>`;
-      })
-      .join('');
-    listEl.scrollTop = listEl.scrollHeight;
-
-    listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
-      img.onclick = () => {
-        const idx = Number(img.dataset.idx);
-        const message = messages[idx];
-        img.classList.remove('blurred');
-        img.parentElement.querySelector('.view-once-tag')?.remove();
-        setTimeout(() => {
-          RoomData.deleteThreadMessage(identity.roomId, message.id);
-        }, 6000);
-      };
-    });
-
-    listEl.querySelectorAll('.voice-play-btn').forEach((btn) => {
-      btn.onclick = () => {
-        const idx = Number(btn.dataset.idx);
-        const message = messages[idx];
-        const src = safeMediaSrc(message.audio, 'audio');
-        if (!src) return;
-        const audio = new Audio(src);
-        audio.play().catch(() => {});
-      };
-    });
-
-    listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const idx = Number(btn.dataset.deleteIdx);
-        const message = messages[idx];
-        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
-          RoomData.deleteThreadMessage(identity.roomId, message.id);
-        }
-      };
-    });
-
-    listEl.querySelectorAll('.bubble-pin').forEach((btn) => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const idx = Number(btn.dataset.pinIdx);
-        const message = messages[idx];
-        RoomData.pinMessageAsMemory(identity.roomId, sharedKey, message);
-        btn.textContent = '✓';
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-
-  const input = document.getElementById('thread-input');
-  const send = async () => {
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
-  };
-  document.getElementById('thread-send').onclick = send;
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter') send();
-  };
-
-  document.getElementById('photo-attach').onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const viewOnce = confirm('Send as view-once? It will disappear once opened.\n\nOK = view-once, Cancel = normal photo');
-    const compressed = await fileToCompressedBase64(file);
-    await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
-    e.target.value = '';
-  };
-
-  const micBtn = document.getElementById('mic-btn');
-  micBtn.onclick = async () => {
-    if (!navigator.mediaDevices || !window.MediaRecorder) {
-      alert("Voice recording isn't supported in this browser.");
-      return;
-    }
-    if (mediaRecorder && mediaRecorder.state === 'recording') {
-      mediaRecorder.stop();
-      return;
-    }
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      recordedChunks = [];
-      mediaRecorder = new MediaRecorder(stream);
-      recordingStartedAt = Date.now();
-      micBtn.classList.add('mic-recording');
-
-      mediaRecorder.ondataavailable = (e) => recordedChunks.push(e.data);
-      mediaRecorder.onstop = async () => {
-        micBtn.classList.remove('mic-recording');
-        stream.getTracks().forEach((t) => t.stop());
-        const durationSeconds = Math.round((Date.now() - recordingStartedAt) / 1000);
-        const blob = new Blob(recordedChunks, { type: 'audio/webm' });
-        if (blob.size > 900 * 1024) {
-          alert('That voice note is too long to send — try keeping it under a minute.');
-          return;
-        }
-        const base64 = await new Promise((resolve, reject) => {
-          const reader = new FileReader();
-          reader.onload = () => resolve(reader.result);
-          reader.onerror = reject;
-          reader.readAsDataURL(blob);
-        });
-        await RoomData.sendThreadVoice(identity.roomId, sharedKey, base64, durationSeconds);
-      };
-
-      mediaRecorder.start();
-      // Safety cap: auto-stop at 60 seconds so the encrypted doc stays well under the size limit.
-      setTimeout(() => {
-        if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
-      }, 60000);
-    } catch (e) {
-      alert("Couldn't access the microphone. Check your browser's permission settings.");
-    }
-  };
-}
-
-// ---------------- Today (Check-in + Play) ----------------
-const MOODS = [
-  { emoji: '😄', label: 'Great' },
-  { emoji: '🙂', label: 'Good' },
-  { emoji: '😐', label: 'Okay' },
-  { emoji: '😔', label: 'Low' },
-  { emoji: '😢', label: 'Really low' },
-];
-const LOW_MOODS = ['😔', '😢'];
-
-function renderToday(slot) {
-  slot.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">How today felt</div>
-      <h2 style="margin-bottom:14px;">Today</h2>
-      <div class="card">
-        <div class="eyebrow">Your mood</div>
-        <div class="mood-picker" id="mood-picker">
-          ${MOODS.map(
-            (m) => `<div class="mood-option" data-mood="${m.emoji}">
-              <div>${m.emoji}</div>
-              <div style="font-size:9.5px; color:var(--text-dim); margin-top:2px;">${m.label}</div>
-            </div>`
-          ).join('')}
-        </div>
-      </div>
-      <div class="card" id="partner-mood-card">
-        <div class="eyebrow">${escapeHTML(identity.partnerName || 'Their')} mood today</div>
-        <div style="font-size:26px;" id="partner-mood">–</div>
-      </div>
-      <div class="card">
-        <div class="eyebrow">A photo from today</div>
-        <input type="file" accept="image/*" id="photo-input" style="margin:8px 0;" />
-        <div class="photo-grid" id="photo-grid"></div>
-      </div>
-    </div>
-  `;
-
-  document.querySelectorAll('.mood-option').forEach((el) => {
-    el.onclick = async () => {
-      await RoomData.setTodayMood(identity.roomId, sharedKey, el.dataset.mood);
-    };
-  });
-
-  const unsubMood = RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
-    const todayKey = new Date().toISOString().slice(0, 10);
-    const mine = entries.find((e) => e.date === todayKey && e.senderUid === lastKnownUid);
-    const theirs = entries.find((e) => e.date === todayKey && e.senderUid !== lastKnownUid);
-    document.querySelectorAll('.mood-option').forEach((el) => {
-      el.classList.toggle('selected', mine && el.dataset.mood === mine.mood);
-    });
-    const partnerMoodEl = document.getElementById('partner-mood');
-    if (partnerMoodEl) partnerMoodEl.textContent = theirs ? theirs.mood : 'Not shared yet';
-  });
-  unsubscribers.push(unsubMood);
-
-  document.getElementById('photo-input').onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const compressed = await fileToCompressedBase64(file);
-    await RoomData.setTodayPhoto(identity.roomId, sharedKey, compressed);
-  };
-
-  const unsubPhotos = RoomData.listenPhotos(identity.roomId, sharedKey, (photos) => {
-    const grid = document.getElementById('photo-grid');
-    if (!grid) return;
-    if (photos.length === 0) {
-      grid.innerHTML = `<div class="empty-state">No photos yet</div>`;
-      return;
-    }
-    grid.innerHTML = photos
-      .map((p) => ({ ...p, src: safeMediaSrc(p.image, 'image') }))
-      .filter((p) => p.src)
-      .map((p) => `<img src="${p.src}" alt="${escapeHTML(p.date || '')}" />`)
-      .join('');
-  });
-  unsubscribers.push(unsubPhotos);
-}
-
-// ---------------- Calendar ----------------
-function renderCalendar(slot) {
-  slot.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Plans together</div>
-      <h2 style="margin-bottom:14px;">Calendar</h2>
-      <div class="card">
-        <input type="text" id="event-title" placeholder="Event title" style="margin-bottom:8px;" />
-        <input type="datetime-local" id="event-time" style="margin-bottom:10px;" />
-        <button class="btn-primary" id="add-event">Add event</button>
-      </div>
-      <div class="card" id="event-list"></div>
-    </div>
-  `;
-  document.getElementById('add-event').onclick = async () => {
-    const title = document.getElementById('event-title').value.trim();
-    const dateTime = document.getElementById('event-time').value;
-    if (!title || !dateTime) return;
-    await RoomData.addCalendarEvent(identity.roomId, sharedKey, {
-      title,
-      dateTime: new Date(dateTime).toISOString(),
-    });
-    document.getElementById('event-title').value = '';
-    document.getElementById('event-time').value = '';
-  };
-
-  const unsub = RoomData.listenCalendar(identity.roomId, sharedKey, (events) => {
-    const listEl = document.getElementById('event-list');
-    if (events.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">No events yet</div>`;
-      return;
-    }
-    listEl.innerHTML = events
-      .map(
-        (e) => `
-      <div class="list-row">
-        <div>
-          <div>${escapeHTML(e.title)}</div>
-          <div style="font-size:12px; color:var(--text-dim);">${new Date(e.dateTime).toLocaleString()}</div>
-        </div>
-      </div>`
-      )
-      .join('');
-  });
-  unsubscribers.push(unsub);
-}
-
-// ---------------- Bucket list ----------------
-function renderBucketList(slot) {
-  slot.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Things to do together</div>
-      <h2 style="margin-bottom:14px;">List</h2>
-      <div class="card">
-        <input type="text" id="item-input" placeholder="Add something..." style="margin-bottom:8px;" />
-        <button class="btn-primary" id="add-item">Add</button>
-      </div>
-      <div class="card" id="item-list"></div>
-    </div>
-  `;
-  document.getElementById('add-item').onclick = async () => {
-    const text = document.getElementById('item-input').value.trim();
-    if (!text) return;
-    document.getElementById('item-input').value = '';
-    await RoomData.addBucketItem(identity.roomId, sharedKey, text);
-  };
-
-  const unsub = RoomData.listenBucketList(identity.roomId, sharedKey, (items) => {
-    const listEl = document.getElementById('item-list');
-    if (items.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">Nothing yet — add your first idea</div>`;
-      return;
-    }
-    listEl.innerHTML = items
-      .map(
-        (i, idx) => `
-      <div class="list-row" data-idx="${idx}">
-        <div class="checkbox ${i.done ? 'done' : ''}">${i.done ? '✓' : ''}</div>
-        <div class="${i.done ? 'done-text' : ''}">${escapeHTML(i.text)}</div>
-      </div>`
-      )
-      .join('');
-    listEl.querySelectorAll('.list-row').forEach((row) => {
-      const item = items[Number(row.dataset.idx)];
-      row.onclick = () => {
-        RoomData.toggleBucketItem(identity.roomId, sharedKey, item.id, item.text, item.done);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-}
-
-// ---------------- More (Shortcuts) ----------------
-function renderMore(slot) {
-  slot.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Tidelight</div>
-      <h2 style="margin-bottom:16px;">More</h2>
-      <div class="shortcut-grid">
-        <div class="shortcut-tile" id="tile-expense">
-          ${iconExpense()}
-          <div class="shortcut-tile-label">Expenses</div>
-          <div class="shortcut-tile-caption">Shared spending</div>
-        </div>
-        <div class="shortcut-tile" id="tile-savings">
-          ${iconSavings()}
-          <div class="shortcut-tile-label">Savings</div>
-          <div class="shortcut-tile-caption">Toward your next visit</div>
-        </div>
-        <div class="shortcut-tile" id="tile-journal">
-          ${iconJournal()}
-          <div class="shortcut-tile-label">Journal</div>
-          <div class="shortcut-tile-caption">Longer thoughts, shared</div>
-        </div>
-        <div class="shortcut-tile" id="tile-letters">
-          ${iconLetter()}
-          <div class="shortcut-tile-label">Letters</div>
-          <div class="shortcut-tile-caption">Written now, opened later</div>
-        </div>
-        <div class="shortcut-tile" id="tile-memories">
-          ${iconMemory()}
-          <div class="shortcut-tile-label">Memories</div>
-          <div class="shortcut-tile-caption">Pinned from Chat</div>
-        </div>
-        <div class="shortcut-tile" id="tile-settings">
-          ${iconSettings()}
-          <div class="shortcut-tile-label">Settings</div>
-          <div class="shortcut-tile-caption">Security &amp; account</div>
-        </div>
-      </div>
-    </div>
-  `;
-  document.getElementById('tile-expense').onclick = () => renderExpenseTracker();
-  document.getElementById('tile-savings').onclick = () => renderSavingsTracker();
-  document.getElementById('tile-journal').onclick = () => renderJournal();
-  document.getElementById('tile-letters').onclick = () => renderLetters();
-  document.getElementById('tile-memories').onclick = () => renderMemories();
-  document.getElementById('tile-settings').onclick = () => renderSettings();
-}
-
-function renderLetters() {
-  clearListeners();
-  root.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Written now, opened later</div>
-      <h2 style="margin-bottom:14px;">Letters</h2>
-      <div class="card">
-        <textarea id="letter-text" rows="4" placeholder="Write something for them to find later..." style="resize:vertical; margin-bottom:8px;"></textarea>
-        <div class="eyebrow">Unlocks on</div>
-        <input type="date" id="letter-unlock" style="margin-bottom:10px;" />
-        <button class="btn-primary" id="add-letter-btn">Seal it</button>
-        <p style="font-size:11.5px; color:var(--text-dim); margin-top:8px;">
-          The date is an honor-system reveal between just the two of you — the letter itself
-          stays properly encrypted either way, only the app's own screen won't show the words until then.
-        </p>
-      </div>
-      <div id="letter-list"></div>
-      <button class="btn-secondary" id="back-more-btn">Back</button>
-    </div>
-  `;
-  document.getElementById('back-more-btn').onclick = () => renderMain();
-  document.getElementById('add-letter-btn').onclick = async () => {
-    const text = document.getElementById('letter-text').value.trim();
-    const unlockDate = document.getElementById('letter-unlock').value;
-    if (!text || !unlockDate) return;
-    await RoomData.addLetter(identity.roomId, sharedKey, {
-      text,
-      unlockAt: new Date(unlockDate).toISOString(),
-    });
-    document.getElementById('letter-text').value = '';
-    document.getElementById('letter-unlock').value = '';
-  };
-
-  const unsub = RoomData.listenLetters(identity.roomId, sharedKey, (letters) => {
-    const listEl = document.getElementById('letter-list');
-    if (letters.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">No letters yet</div>`;
-      return;
-    }
-    listEl.innerHTML = `<div class="card">${letters
-      .map((l, idx) => {
-        if (!l.unlocked) {
-          return `<div class="letter-row">
-            <div class="letter-locked">🔒 Sealed until ${new Date(l.unlockAt).toLocaleDateString()}</div>
-          </div>`;
-        }
-        return `<div class="letter-row" data-idx="${idx}">
-          <div>${escapeHTML(l.text)}</div>
-          <div class="journal-meta">
-            ${l.senderUid === lastKnownUid ? 'From you' : `From ${escapeHTML(identity.partnerName || 'them')}`} · opened
-            ${l.senderUid === lastKnownUid ? ' · <span class="letter-delete" data-idx="' + idx + '" style="cursor:pointer; text-decoration:underline;">delete</span>' : ''}
-          </div>
-        </div>`;
-      })
-      .join('')}</div>`;
-
-    listEl.querySelectorAll('.letter-delete').forEach((btn) => {
-      btn.onclick = () => {
-        const letter = letters[Number(btn.dataset.idx)];
-        if (confirm('Delete this letter?')) RoomData.deleteLetter(identity.roomId, letter.id);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-}
-
-function renderMemories() {
-  clearListeners();
-  root.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Pinned from Chat</div>
-      <h2 style="margin-bottom:14px;">Memories</h2>
-      <div id="memories-list"></div>
-      <button class="btn-secondary" id="back-more-btn">Back</button>
-    </div>
-  `;
-  document.getElementById('back-more-btn').onclick = () => renderMain();
-
-  const unsub = RoomData.listenMemories(identity.roomId, sharedKey, (memories) => {
-    const listEl = document.getElementById('memories-list');
-    if (memories.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">Nothing pinned yet — tap the pin icon on any message in Chat</div>`;
-      return;
-    }
-    listEl.innerHTML = memories
-      .map((m, idx) => {
-        let body = '';
-        if (m.type === 'photo') {
-          const src = safeMediaSrc(m.image, 'image');
-          body = src
-            ? `<img src="${src}" style="width:100%; border-radius:13px;" />`
-            : `<div class="empty-state" style="padding:16px;">⚠️ Photo unavailable</div>`;
-        } else if (m.type === 'voice') body = `<div>Voice note · ${m.audioDuration || 0}s</div>`;
-        else body = `<div>${escapeHTML(m.text)}</div>`;
-        return `<div class="card" data-idx="${idx}">
-          ${body}
-          <div class="journal-meta">${m.createdAt.toLocaleDateString()} · <span class="memory-delete" data-idx="${idx}" style="cursor:pointer; text-decoration:underline;">unpin</span></div>
-        </div>`;
-      })
-      .join('');
-
-    listEl.querySelectorAll('.memory-delete').forEach((btn) => {
-      btn.onclick = () => {
-        const memory = memories[Number(btn.dataset.idx)];
-        RoomData.deleteMemory(identity.roomId, memory.id);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-}
-
-// ---------------- Expense tracker ----------------
-function renderExpenseTracker() {
-  clearListeners();
-  root.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Shared spending</div>
-      <h2 style="margin-bottom:14px;">Expenses</h2>
-      <div class="card" id="expense-summary">
-        <div class="stat-caption">Loading…</div>
-      </div>
-      <div class="card">
-        <input type="text" id="expense-desc" placeholder="What was it for?" style="margin-bottom:8px;" />
-        <input type="number" id="expense-amount" placeholder="Amount" style="margin-bottom:8px;" />
-        <select id="expense-paidby" style="width:100%; background:var(--surface-2); border:1px solid var(--border); border-radius:13px; color:var(--text); padding:12px 14px; margin-bottom:10px;">
-          <option value="${lastKnownUid}">I paid</option>
-          <option value="${identity.partnerUid || ''}">${escapeHTML(identity.partnerName || 'They')} paid</option>
-        </select>
-        <button class="btn-primary" id="add-expense-btn">Add expense</button>
-      </div>
-      <div class="card" id="expense-list"></div>
-      <button class="btn-secondary" id="back-more-btn">Back</button>
-    </div>
-  `;
-  document.getElementById('back-more-btn').onclick = () => renderMain();
-  document.getElementById('add-expense-btn').onclick = async () => {
-    const description = document.getElementById('expense-desc').value.trim();
-    const amount = parseFloat(document.getElementById('expense-amount').value);
-    const paidBy = document.getElementById('expense-paidby').value;
-    if (!description || !amount) return;
-    await RoomData.addExpense(identity.roomId, sharedKey, { description, amount, paidBy });
-    document.getElementById('expense-desc').value = '';
-    document.getElementById('expense-amount').value = '';
-  };
-
-  const unsub = RoomData.listenExpenses(identity.roomId, sharedKey, (expenses) => {
-    const listEl = document.getElementById('expense-list');
-    const summaryEl = document.getElementById('expense-summary');
-
-    if (expenses.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">No expenses logged yet</div>`;
-      summaryEl.innerHTML = `<div class="stat-caption">Nothing tracked yet</div>`;
-      return;
-    }
-
-    const totalMine = expenses.filter((e) => e.paidBy === lastKnownUid).reduce((s, e) => s + e.amount, 0);
-    const totalTheirs = expenses.filter((e) => e.paidBy === identity.partnerUid).reduce((s, e) => s + e.amount, 0);
-    const diff = totalMine - totalTheirs;
-    let summaryText;
-    if (Math.abs(diff) < 0.01) summaryText = "You're even.";
-    else if (diff > 0) summaryText = `${escapeHTML(identity.partnerName || 'They')} owes you ${(diff / 2).toFixed(2)}`;
-    else summaryText = `You owe ${escapeHTML(identity.partnerName || 'them')} ${(Math.abs(diff) / 2).toFixed(2)}`;
-
-    summaryEl.innerHTML = `
-      <div class="eyebrow">Balance</div>
-      <div class="stat-number" style="font-size:20px;">${summaryText}</div>
-    `;
-
-    listEl.innerHTML = expenses
-      .map(
-        (e) => `
-      <div class="money-row" data-id="${e.id}">
-        <div>
-          <div>${escapeHTML(e.description)}</div>
-          <div class="journal-meta">${e.paidBy === lastKnownUid ? 'You paid' : `${escapeHTML(identity.partnerName || 'They')} paid`}</div>
-        </div>
-        <div class="money-amount">${e.amount.toFixed(2)}</div>
-      </div>`
-      )
-      .join('');
-
-    listEl.querySelectorAll('.money-row').forEach((row) => {
-      row.ondblclick = () => {
-        if (confirm('Delete this expense?')) RoomData.deleteExpense(identity.roomId, row.dataset.id);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-}
-
-// ---------------- Savings tracker ----------------
-function renderSavingsTracker() {
-  clearListeners();
-  root.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Saving together</div>
-      <h2 style="margin-bottom:14px;">Savings</h2>
-      <div class="card" id="savings-progress">
-        <div class="stat-caption">Loading…</div>
-      </div>
-      <div class="card">
-        <div class="eyebrow">Goal</div>
-        <input type="text" id="goal-label" placeholder="e.g. Flight to see her" style="margin-bottom:8px;" />
-        <input type="number" id="goal-amount" placeholder="Goal amount" style="margin-bottom:10px;" />
-        <button class="btn-secondary" id="save-goal-btn">Set goal</button>
-      </div>
-      <div class="card">
-        <input type="text" id="entry-label" placeholder="What's this contribution for?" style="margin-bottom:8px;" />
-        <input type="number" id="entry-amount" placeholder="Amount" style="margin-bottom:10px;" />
-        <button class="btn-primary" id="add-entry-btn">Add contribution</button>
-      </div>
-      <div class="card" id="savings-list"></div>
-      <button class="btn-secondary" id="back-more-btn">Back</button>
-    </div>
-  `;
-  document.getElementById('back-more-btn').onclick = () => renderMain();
-
-  document.getElementById('save-goal-btn').onclick = async () => {
-    const label = document.getElementById('goal-label').value.trim();
-    const amount = parseFloat(document.getElementById('goal-amount').value);
-    if (!label || !amount) return;
-    await RoomData.setSavingsGoal(identity.roomId, sharedKey, amount, label);
-  };
-
-  document.getElementById('add-entry-btn').onclick = async () => {
-    const label = document.getElementById('entry-label').value.trim();
-    const amount = parseFloat(document.getElementById('entry-amount').value);
-    if (!label || !amount) return;
-    await RoomData.addSavingsEntry(identity.roomId, sharedKey, { label, amount });
-    document.getElementById('entry-label').value = '';
-    document.getElementById('entry-amount').value = '';
-  };
-
-  let goalAmount = 0;
-  let goalLabel = '';
-  const unsubSettings = RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
-    goalAmount = settings.savingsGoal || 0;
-    goalLabel = settings.savingsGoalLabel || '';
-    if (goalLabel) document.getElementById('goal-label').value = goalLabel;
-    if (goalAmount) document.getElementById('goal-amount').value = goalAmount;
-    renderSavingsProgress();
-  });
-  unsubscribers.push(unsubSettings);
-
-  let currentTotal = 0;
-  function renderSavingsProgress() {
-    const el = document.getElementById('savings-progress');
-    if (!el) return;
-    if (!goalAmount) {
-      el.innerHTML = `<div class="stat-caption">Set a goal to start tracking progress</div>`;
-      return;
-    }
-    const pct = Math.min(100, Math.round((currentTotal / goalAmount) * 100));
-    el.innerHTML = `
-      <div class="eyebrow">${escapeHTML(goalLabel || 'Goal')}</div>
-      <div class="stat-number" style="font-size:22px;">${currentTotal.toFixed(2)} / ${goalAmount.toFixed(2)}</div>
-      <div class="progress-track"><div class="progress-fill" style="width:${pct}%;"></div></div>
-      <div class="stat-caption">${pct}% there</div>
-    `;
-  }
-
-  const unsub = RoomData.listenSavings(identity.roomId, sharedKey, (entries) => {
-    currentTotal = entries.reduce((s, e) => s + e.amount, 0);
-    renderSavingsProgress();
-
-    const listEl = document.getElementById('savings-list');
-    if (entries.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">No contributions yet</div>`;
-      return;
-    }
-    listEl.innerHTML = entries
-      .map(
-        (e) => `
-      <div class="money-row" data-id="${e.id}">
-        <div>
-          <div>${escapeHTML(e.label)}</div>
-          <div class="journal-meta">${e.contributedBy === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')}</div>
-        </div>
-        <div class="money-amount">+${e.amount.toFixed(2)}</div>
-      </div>`
-      )
-      .join('');
-    listEl.querySelectorAll('.money-row').forEach((row) => {
-      row.ondblclick = () => {
-        if (confirm('Delete this contribution?')) RoomData.deleteSavingsEntry(identity.roomId, row.dataset.id);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
-}
-
-// ---------------- Journal ----------------
-function renderJournal() {
-  clearListeners();
-  root.innerHTML = `
-    <div class="screen">
-      <div class="eyebrow">Longer thoughts, shared</div>
-      <h2 style="margin-bottom:14px;">Journal</h2>
-      <div class="card">
-        <textarea id="journal-input" rows="4" placeholder="Write something that doesn't fit in a quick message..." style="resize:vertical;"></textarea>
-        <button class="btn-primary" id="add-journal-btn" style="margin-top:10px;">Save entry</button>
-      </div>
-      <div id="journal-list"></div>
-      <button class="btn-secondary" id="back-more-btn">Back</button>
-    </div>
-  `;
-  document.getElementById('back-more-btn').onclick = () => renderMain();
-  document.getElementById('add-journal-btn').onclick = async () => {
-    const text = document.getElementById('journal-input').value.trim();
-    if (!text) return;
-    document.getElementById('journal-input').value = '';
-    await RoomData.addJournalEntry(identity.roomId, sharedKey, text);
-  };
-
-  const unsub = RoomData.listenJournal(identity.roomId, sharedKey, (entries) => {
-    const listEl = document.getElementById('journal-list');
-    if (entries.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">No entries yet</div>`;
-      return;
-    }
-    listEl.innerHTML = `<div class="card">${entries
-      .map(
-        (e, idx) => `
-      <div class="journal-entry" data-idx="${idx}">
-        <div>${escapeHTML(e.text)}</div>
-        <div class="journal-meta">
-          ${e.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They')} · ${e.createdAt.toLocaleDateString()}
-          ${e.senderUid === lastKnownUid ? ' · <span class="journal-delete" data-idx="' + idx + '" style="cursor:pointer; text-decoration:underline;">delete</span>' : ''}
-        </div>
-      </div>`
-      )
-      .join('')}</div>`;
-
-    listEl.querySelectorAll('.journal-delete').forEach((btn) => {
-      btn.onclick = () => {
-        const entry = entries[Number(btn.dataset.idx)];
-        if (confirm('Delete this journal entry?')) RoomData.deleteJournalEntry(identity.roomId, entry.id);
-      };
-    });
-  });
-  unsubscribers.push(unsub);
 }
 
 // ---------------- Utilities ----------------
@@ -1677,14 +2569,13 @@ function escapeHTML(str) {
 }
 
 // Defense-in-depth: content is E2E-encrypted between two trusted people, but we
-// still never trust a decrypted blob to be a well-formed data: URL. Only allow
-// genuine base64 data URLs of the expected kind — anything else (a crafted
-// payload trying to break out of an attribute or a url()) renders as nothing.
+// still never trust a decrypted blob to be a well-formed data: URL.
 function safeMediaSrc(value, kind = 'image') {
   const s = String(value ?? '');
-  const re = kind === 'audio'
-    ? /^data:audio\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i
-    : /^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i;
+  const re =
+    kind === 'audio'
+      ? /^data:audio\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i
+      : /^data:image\/[a-z0-9.+-]+;base64,[A-Za-z0-9+/=]+$/i;
   return re.test(s) ? s : '';
 }
 
@@ -1703,10 +2594,12 @@ function timeLabel(date) {
 
 function greetingFor(name) {
   const h = new Date().getHours();
-  const part = h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : h < 21 ? 'Good evening' : 'Good night';
+  const part =
+    h < 5 ? 'Late night' : h < 12 ? 'Good morning' : h < 17 ? 'Good afternoon' : h < 21 ? 'Good evening' : 'Good night';
   return `${part}, ${escapeHTML(name)}`;
 }
 
+// ---------------- Icons ----------------
 function iconHome() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v9a1 1 0 001 1h4v-6h4v6h4a1 1 0 001-1v-9"/></svg>';
 }
@@ -1741,13 +2634,16 @@ function iconJournal() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 4h9a2 2 0 012 2v14l-4-2-4 2-4-2-2 2V6a2 2 0 012-2z"/><path d="M9 9h6M9 13h4"/></svg>';
 }
 function iconMic() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>';
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" width="20" height="20"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>';
+}
+function iconSend() {
+  return '<svg viewBox="0 0 24 24" fill="currentColor" width="19" height="19"><path d="M3.4 20.4l17.5-8.4a.7.7 0 000-1.3L3.4 2.3a.7.7 0 00-1 .8L4.6 10l9.4 2-9.4 2-2.2 6.9a.7.7 0 001 .8z"/></svg>';
+}
+function iconPlus() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="20" height="20"><path d="M12 5v14M5 12h14"/></svg>';
 }
 function iconPlay() {
-  return '<svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M7 5l12 7-12 7z"/></svg>';
-}
-function iconPinSmall() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="11" height="11"><path d="M12 2v6M8 8h8l2 8H6z"/><path d="M9 16l-2 6M15 16l2 6"/></svg>';
+  return '<svg viewBox="0 0 24 24" fill="currentColor" width="13" height="13"><path d="M7 5l12 7-12 7z"/></svg>';
 }
 function iconLetter() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>';
@@ -1755,15 +2651,26 @@ function iconLetter() {
 function iconMemory() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 21s-7-4.4-9.5-8.8C.7 8.4 2.6 5 6 5c2 0 3.3 1 4 2 0.7-1 2-2 4-2 3.4 0 5.3 3.4 3.5 7.2C19 16.6 12 21 12 21z"/></svg>';
 }
+function iconLock() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" width="14" height="14"><rect x="4" y="10" width="16" height="10" rx="2"/><path d="M8 10V7a4 4 0 018 0v3"/></svg>';
+}
+function iconChevronLeft() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="20" height="20"><path d="M15 5l-7 7 7 7"/></svg>';
+}
+function iconChevronDown() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="18" height="18"><path d="M5 9l7 7 7-7"/></svg>';
+}
 
-// ---------------- Photo privacy: blur on background, auto-lock on return ----------------
+// ---------------- Privacy: blur on background, auto-lock on return ----------------
 document.addEventListener('visibilitychange', () => {
   document.body.classList.toggle('privacy-blur', document.hidden);
   if (document.hidden) {
     lastHiddenAt = Date.now();
+    if (identity?.roomId && presenceEnabled()) clearTyping(identity.roomId);
   } else if (identity?.pinEnabled && lastHiddenAt && Date.now() - lastHiddenAt > 15000) {
     identity.secretKey = undefined;
     sharedKey = null;
+    clearGlobalListeners();
     renderLockScreen();
   }
 });
@@ -1772,9 +2679,7 @@ window.addEventListener('focus', () => document.body.classList.remove('privacy-b
 
 // Catch anything that slips through so the app never just goes blank.
 window.addEventListener('error', (e) => {
-  if (root.innerHTML.trim() === '') {
-    renderFatalError(e.error || new Error(e.message));
-  }
+  if (root.innerHTML.trim() === '') renderFatalError(e.error || new Error(e.message));
 });
 window.addEventListener('unhandledrejection', (e) => {
   if (root.innerHTML.trim() === '') {
