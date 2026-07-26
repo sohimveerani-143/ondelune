@@ -1,4 +1,13 @@
-import { loadIdentity, updateIdentity, saveIdentity, clearIdentity, isPaired } from './store.js';
+import {
+  loadIdentity,
+  updateIdentity,
+  saveIdentity,
+  clearIdentity,
+  isPaired,
+  loadSeen,
+  setSeen,
+  clearSeen,
+} from './store.js';
 import { generateKeyPair, deriveSharedKey } from './crypto.js';
 import {
   pairingLinkFor,
@@ -22,6 +31,8 @@ import {
   relativeTime,
   openLightbox,
   nextMilestone,
+  promptModal,
+  confirmModal,
 } from './ui.js';
 import { encryptWithPassphrase, decryptWithPassphrase } from './crypto.js';
 import {
@@ -30,7 +41,10 @@ import {
   signalTyping,
   clearTyping,
   listenPartnerPresence,
+  startGamePresence,
+  stopGamePresence,
 } from './presence.js';
+import * as Game from './game-tictactoe.js';
 import {
   notificationsSupported,
   notificationPermission,
@@ -49,6 +63,91 @@ let lastKnownUid = null;
 let lastHiddenAt = null;
 let notifyPrimed = false;
 let lastNotifiedId = null;
+let markers = {};
+let seenCounts = {};
+
+// Which sections roll up into which bottom-nav tab.
+const TAB_SECTIONS = {
+  thread: ['thread'],
+  today: ['today'],
+  calendar: ['calendar'],
+  list: ['list'],
+  more: ['journal', 'letters', 'memories', 'expenses', 'savings', 'game'],
+};
+
+// Unread = things THEY added that this device hasn't acknowledged. Your own
+// writes bump your own counter, which is never consulted here.
+function unreadFor(section) {
+  if (!identity?.partnerUid) return 0;
+  const theirs = markers[section]?.counts?.[identity.partnerUid] || 0;
+  return Math.max(0, theirs - (seenCounts[section] || 0));
+}
+
+function unreadForTab(tab) {
+  return (TAB_SECTIONS[tab] || []).reduce((sum, s) => sum + unreadFor(s), 0);
+}
+
+async function markSectionsSeen(sections) {
+  if (!identity?.partnerUid) return;
+  let changed = false;
+  for (const section of sections) {
+    const theirs = markers[section]?.counts?.[identity.partnerUid] || 0;
+    if ((seenCounts[section] || 0) !== theirs) {
+      seenCounts = await setSeen(section, theirs);
+      changed = true;
+    }
+  }
+  if (changed) paintBadges();
+}
+
+function badgeHTML(count) {
+  if (!count) return '';
+  return `<span class="badge">${count > 9 ? '9+' : count}</span>`;
+}
+
+function paintBadges() {
+  document.querySelectorAll('.nav button').forEach((btn) => {
+    const tab = btn.dataset.tab;
+    const count = unreadForTab(tab);
+    let dot = btn.querySelector('.badge');
+    if (!count) {
+      if (dot) dot.remove();
+      return;
+    }
+    if (!dot) {
+      dot = document.createElement('span');
+      dot.className = 'badge';
+      btn.appendChild(dot);
+    }
+    dot.textContent = count > 9 ? '9+' : String(count);
+  });
+
+  // Individual tiles on the More screen, when it's the visible screen.
+  const tileMap = {
+    'tile-journal': 'journal',
+    'tile-letters': 'letters',
+    'tile-memories': 'memories',
+    'tile-expense': 'expenses',
+    'tile-savings': 'savings',
+    'tile-game': 'game',
+  };
+  Object.entries(tileMap).forEach(([id, section]) => {
+    const tile = document.getElementById(id);
+    if (!tile) return;
+    const count = unreadFor(section);
+    let dot = tile.querySelector('.badge');
+    if (!count) {
+      if (dot) dot.remove();
+      return;
+    }
+    if (!dot) {
+      dot = document.createElement('span');
+      dot.className = 'badge tile-badge';
+      tile.appendChild(dot);
+    }
+    dot.textContent = count > 9 ? '9+' : String(count);
+  });
+}
 
 function clearListeners() {
   unsubscribers.forEach((u) => {
@@ -89,6 +188,7 @@ async function boot() {
     tryEnableOfflinePersistence();
 
     identity = await loadIdentity();
+    seenCounts = await loadSeen();
 
     if (!identity || !identity.displayName) {
       return renderEntryChoice();
@@ -104,6 +204,14 @@ async function boot() {
 
 function continueAfterUnlock() {
   const urlPairingId = getPairingIdFromUrl();
+
+  // Honours the manifest shortcuts (#tab=thread etc.) so a long-press on the
+  // installed icon lands where it says it will.
+  const tabMatch = window.location.hash.match(/tab=([a-z]+)/);
+  if (tabMatch && TAB_SECTIONS[tabMatch[1]]) {
+    activeTab = tabMatch[1];
+    history.replaceState(null, '', window.location.pathname);
+  }
 
   if (isPaired(identity)) {
     sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
@@ -210,12 +318,44 @@ function renderNameStep() {
     const kp = generateKeyPair();
     const timezone = Intl.DateTimeFormat().resolvedOptions().timeZone;
     identity = { displayName: name, timezone, publicKey: kp.publicKey, secretKey: kp.secretKey };
-    renderRecoveryChoice();
+    renderGenderStep();
   };
   document.getElementById('continue-btn').onclick = go;
   document.getElementById('name-input').onkeydown = (e) => {
     if (e.key === 'Enter') go();
   };
+}
+
+const GENDERS = [
+  { id: 'woman', label: 'Woman' },
+  { id: 'man', label: 'Man' },
+  { id: 'nonbinary', label: 'Non-binary' },
+  { id: 'unspecified', label: 'Rather not say' },
+];
+
+function renderGenderStep() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>How should we draw you?</h1>
+      <p class="lede">
+        This only shapes the little figure of you standing on the shore on the Home screen.
+        It's shared with your person and nobody else.
+      </p>
+      <div class="choice-list" id="gender-list">
+        ${GENDERS.map(
+          (g) => `<button class="choice" data-gender="${g.id}">${g.label}</button>`
+        ).join('')}
+      </div>
+    </div>
+  `;
+  document.querySelectorAll('.choice').forEach((btn) => {
+    btn.onclick = () => {
+      identity.gender = btn.dataset.gender;
+      renderRecoveryChoice();
+    };
+  });
 }
 
 function renderRecoveryChoice() {
@@ -593,6 +733,16 @@ function setUpGlobalListeners() {
 
   if (presenceEnabled()) startHeartbeat(identity.roomId);
 
+  // Publish gender into the encrypted room profile once, so the partner's hero
+  // scene can draw you. Guarded by a local flag to avoid a write per app open.
+  if (identity.gender && !identity.genderPublished) {
+    RoomData.setMyGender(identity.roomId, sharedKey, identity.gender)
+      .then(() => updateIdentity({ genderPublished: true }).then((i) => (identity = i)))
+      .catch(() => {
+        /* retried on next open */
+      });
+  }
+
   // App-wide new-message watcher: powers notifications and the in-app toast no
   // matter which tab you're on. Only ever holds the single newest message.
   notifyPrimed = false;
@@ -658,6 +808,85 @@ function setUpGlobalListeners() {
     }
   });
   globalUnsubscribers.push(unsubNudge);
+
+  // One listener over ~10 tiny counter docs powers every badge in the app.
+  const unsubMarkers = RoomData.listenMarkers(identity.roomId, (m) => {
+    markers = m;
+    paintBadges();
+    // The tab you're already looking at shouldn't accumulate a badge — but the
+    // 'more' menu is excluded for the same reason as in renderTab().
+    if (activeTab !== 'more') markSectionsSeen(TAB_SECTIONS[activeTab] || []);
+  });
+  globalUnsubscribers.push(unsubMarkers);
+}
+
+// Short note that sits on their Home screen. Capped length on purpose — it's a
+// line to come back to, not another inbox.
+function openNoteEditor(current) {
+  const wrap = document.createElement('div');
+  wrap.id = 'sheet';
+  wrap.className = 'sheet-backdrop';
+  wrap.innerHTML = `
+    <div class="sheet">
+      <div class="sheet-grabber"></div>
+      <div class="sheet-title">A note on their Home screen</div>
+      <div class="sheet-form">
+        <textarea id="note-input" rows="3" maxlength="${RoomData.NOTE_MAX}" placeholder="Something small to find later…">${escapeHTML(
+          current || ''
+        )}</textarea>
+        <div class="char-count"><span id="note-count">0</span>/${RoomData.NOTE_MAX}</div>
+        <button class="btn-primary" id="note-save">Save</button>
+        ${current ? '<button class="btn-ghost" id="note-clear">Remove the note</button>' : ''}
+        <button class="btn-ghost" data-cancel>Cancel</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  setTimeout(() => wrap.classList.add('open'), 0);
+
+  const close = () => {
+    wrap.classList.remove('open');
+    setTimeout(() => wrap.remove(), 200);
+  };
+  wrap.onclick = (e) => {
+    if (e.target === wrap || e.target.hasAttribute('data-cancel')) close();
+  };
+
+  const input = wrap.querySelector('#note-input');
+  const count = wrap.querySelector('#note-count');
+  // maxlength only constrains typing — a paste can exceed it in some browsers,
+  // so clamp here as well. (room-data.js also slices, so an over-long note can
+  // never reach Firestore regardless of what the UI does.)
+  const sync = () => {
+    if (input.value.length > RoomData.NOTE_MAX) input.value = input.value.slice(0, RoomData.NOTE_MAX);
+    count.textContent = input.value.length;
+    count.classList.toggle('at-limit', input.value.length >= RoomData.NOTE_MAX);
+  };
+  input.oninput = sync;
+  sync();
+  input.focus();
+
+  wrap.querySelector('#note-save').onclick = async () => {
+    const text = input.value.trim();
+    close();
+    try {
+      if (!text) await RoomData.clearMyNote(identity.roomId);
+      else await RoomData.setMyNote(identity.roomId, sharedKey, text);
+      toast(text ? 'They’ll see it on their Home screen' : 'Note removed');
+    } catch (e) {
+      toast("Couldn't save that note");
+    }
+  };
+  const clearBtn = wrap.querySelector('#note-clear');
+  if (clearBtn)
+    clearBtn.onclick = async () => {
+      close();
+      try {
+        await RoomData.clearMyNote(identity.roomId);
+        toast('Note removed');
+      } catch (e) {
+        toast("Couldn't remove that note");
+      }
+    };
 }
 
 // A brief full-screen bloom when a nudge arrives — the whole point is that it
@@ -703,8 +932,13 @@ function bindNav() {
 
 function renderTab(tab) {
   clearListeners();
+  // 'more' is only a menu — its badge is a roll-up of the screens behind it, so
+  // opening the menu must NOT mark those as read. Each sub-screen clears its own
+  // section when actually opened, which is what keeps the per-tile badges useful.
+  if (tab !== 'more') markSectionsSeen(TAB_SECTIONS[tab] || []);
   const slot = document.getElementById('screen-slot');
   if (!slot) return;
+  setTimeout(paintBadges, 0);
   if (tab === 'home') return renderHome(slot);
   if (tab === 'thread') return renderThread(slot);
   if (tab === 'today') return renderToday(slot);
@@ -736,24 +970,57 @@ const STARS = (() => {
   }));
 })();
 
-function figuresGroupSVG(moodState) {
+// A single silhouette. Rotating the whole group (rather than the body alone)
+// keeps the head attached when someone leans, which the old version didn't.
+// Sizes are deliberately larger than the first pass — small enough to stay a
+// silhouette on the horizon, big enough to actually read as two people.
+function figureSVG({ cx, lean = 0, gender = 'unspecified' }) {
+  const FILL = '#0d0a1a';
+  const cyBody = 194;
+  const cyHead = 168;
+  const bodyRx = gender === 'man' ? 13 : 11.5;
+  const bodyRy = 21;
+  const headR = 7.6;
+
+  // Long hair reads as a distinct silhouette without resorting to caricature.
+  const hair =
+    gender === 'woman'
+      ? `<ellipse cx="${cx}" cy="${cyHead + 5}" rx="${headR + 2.4}" ry="${headR + 2}" fill="${FILL}"/>`
+      : '';
+  // A slight flare at the hem, again silhouette-only.
+  const skirt =
+    gender === 'woman'
+      ? `<path d="M${cx - bodyRx - 2},${cyBody + 20} Q${cx},${cyBody + 8} ${cx + bodyRx + 2},${
+          cyBody + 20
+        } Z" fill="${FILL}"/>`
+      : '';
+
+  const rot = lean ? ` transform="rotate(${lean} ${cx} ${cyBody + 20})"` : '';
+  return `<g${rot}>
+    ${skirt}
+    <ellipse cx="${cx}" cy="${cyBody}" rx="${bodyRx}" ry="${bodyRy}" fill="${FILL}"/>
+    ${hair}
+    <circle cx="${cx}" cy="${cyHead}" r="${headR}" fill="${FILL}"/>
+  </g>`;
+}
+
+function figuresGroupSVG(moodState, genders = {}) {
   // Left figure = you, right = partner, by convention.
-  const body = (cx, cy, rot) =>
-    `<ellipse cx="${cx}" cy="${cy}" rx="9" ry="15" fill="#0d0a1a" ${
-      rot ? `transform="rotate(${rot} ${cx} ${cy})"` : ''
-    }/>`;
-  const head = (cx, cy) => `<circle cx="${cx}" cy="${cy}" r="5.6" fill="#0d0a1a"/>`;
+  const me = genders.mine || 'unspecified';
+  const them = genders.theirs || 'unspecified';
 
   if (moodState === 'meLow') {
-    return body(191, 197, 10) + head(196, 181) + body(208, 196, 0) + head(208, 177);
+    // You lean into them; they stand steady and close.
+    return figureSVG({ cx: 186, lean: 13, gender: me }) + figureSVG({ cx: 212, lean: 0, gender: them });
   }
   if (moodState === 'themLow') {
-    return body(188, 196, 0) + head(188, 177) + body(205, 197, -10) + head(200, 181);
+    return figureSVG({ cx: 186, lean: 0, gender: me }) + figureSVG({ cx: 212, lean: -13, gender: them });
   }
   if (moodState === 'bothLow') {
-    return body(193, 197, 7) + head(197, 182) + body(203, 197, -7) + head(199, 182);
+    // Both tip toward each other, shoulders nearly touching.
+    return figureSVG({ cx: 190, lean: 9, gender: me }) + figureSVG({ cx: 210, lean: -9, gender: them });
   }
-  return body(186, 196, 0) + head(186, 177) + body(210, 196, 0) + head(210, 177);
+  return figureSVG({ cx: 178, lean: 0, gender: me }) + figureSVG({ cx: 222, lean: 0, gender: them });
 }
 
 function heroCaptionFor(moodState) {
@@ -763,7 +1030,7 @@ function heroCaptionFor(moodState) {
   return 'Two shores, one sky.';
 }
 
-function heroSceneSVG(moodState = 'calm') {
+function heroSceneSVG(moodState = 'calm', genders = {}) {
   const p = skyPaletteFor(new Date().getHours());
   const stars = STARS.map(
     (s) =>
@@ -822,7 +1089,7 @@ function heroSceneSVG(moodState = 'calm') {
     </g>
 
     <path d="M0,150 Q40,146 80,150 T160,150 T240,150 T320,150 T400,150 V156 Q360,152 320,156 T240,156 T160,156 T80,156 T0,156 Z" fill="${p.top}" opacity="0.55"/>
-    <g class="hero-figures">${figuresGroupSVG(moodState)}</g>
+    <g class="hero-figures">${figuresGroupSVG(moodState, genders)}</g>
   </svg>`;
 }
 
@@ -869,50 +1136,63 @@ function renderHome(slot) {
       </div>
 
       <div class="bento">
-        <div class="bento-tile span-4 countdown-tile" id="countdown-tile">
-          <div class="eyebrow" id="countdown-caption">Next shared moment</div>
+        <div class="bento-tile span-4 tone-note" id="note-tile">
+          <div class="tile-head">${iconNote()}<span class="tile-name" id="note-tile-name">A note from ${escapeHTML(
+            identity.partnerName || 'them'
+          )}</span></div>
+          <div class="note-body" id="note-body">–</div>
+          <button class="note-edit" id="note-edit-btn">${iconPencil()} Leave one for them</button>
+        </div>
+
+        <div class="bento-tile span-4 tone-countdown" id="countdown-tile">
+          <div class="tile-head">${iconCalendar()}<span class="tile-name">Next shared moment</span></div>
           <div class="countdown-title" id="countdown-title">Nothing planned yet</div>
           <div class="countdown-clock" id="countdown-clock"></div>
         </div>
 
-        <div class="bento-tile span-2 tile-center">
+        <div class="bento-tile span-2 tone-days">
+          <div class="tile-head">${iconHeartSmall()}<span class="tile-name">Together</span></div>
           <div class="stat-number" id="days-together">–</div>
-          <div class="stat-caption">days together</div>
+          <div class="stat-caption">days</div>
         </div>
 
-        <div class="bento-tile span-2 tile-center">
+        <div class="bento-tile span-2 tone-streak">
+          <div class="tile-head">${iconFlameSmall()}<span class="tile-name">Streak</span></div>
           <div class="stat-number" id="streak-value">–</div>
-          <div class="stat-caption">day streak</div>
+          <div class="stat-caption">days in a row</div>
         </div>
 
-        <div class="bento-tile span-4 clock-tile">
+        <div class="bento-tile span-4 tone-clock clock-tile">
           <div class="clock-side">
-            <div class="eyebrow">You</div>
+            <div class="tile-head">${iconClockSmall()}<span class="tile-name">Your time</span></div>
             <div class="clock-time" id="my-time">--:--</div>
             <div class="clock-meta" id="my-meta"></div>
           </div>
           <div class="clock-divider"></div>
           <div class="clock-side right">
-            <div class="eyebrow">${escapeHTML(identity.partnerName || 'Them')}</div>
+            <div class="tile-name" style="justify-content:flex-end;">${escapeHTML(
+              identity.partnerName || 'Them'
+            )}</div>
             <div class="clock-time" id="partner-time">--:--</div>
             <div class="clock-meta" id="partner-meta"></div>
           </div>
         </div>
 
-        <div class="bento-tile span-2 tile-center">
-          <div class="eyebrow">Their mood</div>
+        <div class="bento-tile span-2 tone-mood" id="home-mood-tile">
+          <div class="tile-head">${iconToday()}<span class="tile-name">Their mood</span></div>
           <div class="mood-face" id="home-partner-mood">–</div>
         </div>
 
-        <button class="bento-tile span-2 tile-center nudge-tile" id="nudge-btn">
+        <button class="bento-tile span-2 tone-nudge nudge-tile" id="nudge-btn">
+          <div class="tile-head">${iconNudge()}<span class="tile-name">Nudge</span></div>
           <div class="nudge-emoji">💭</div>
-          <div class="stat-caption">Send a nudge</div>
+          <div class="stat-caption">Tap to send</div>
         </button>
 
-        <div class="bento-tile span-4 milestone-tile" id="milestone-tile" hidden></div>
+        <div class="bento-tile span-4 tone-milestone milestone-tile" id="milestone-tile" hidden></div>
 
-        <div class="bento-tile span-4">
-          <div class="eyebrow">Together since</div>
+        <div class="bento-tile span-4 tone-since">
+          <div class="tile-head">${iconAnchorSmall()}<span class="tile-name">Together since</span></div>
           <input type="date" id="together-since-input" />
         </div>
       </div>
@@ -934,18 +1214,44 @@ function renderHome(slot) {
     e.target.value = '';
   };
 
-  const stopType = typeCaption(document.getElementById('hero-caption'), heroCaptionFor('calm'));
-  if (stopType) unsubscribers.push(stopType);
+  // Hero state lives here so mood changes and gender changes can each repaint
+  // it without clobbering the other's contribution.
+  const heroGenders = { mine: identity.gender || 'unspecified', theirs: 'unspecified' };
+  let heroMoodState = 'calm';
+
+  function repaintHero(retype) {
+    const heroEl = document.getElementById('hero-scene');
+    if (!heroEl) return;
+    heroEl.innerHTML =
+      heroSceneSVG(heroMoodState, heroGenders) + `<div class="hero-caption" id="hero-caption"></div>`;
+    const caption = document.getElementById('hero-caption');
+    if (retype) {
+      const stop = typeCaption(caption, heroCaptionFor(heroMoodState));
+      if (stop) unsubscribers.push(stop);
+    } else {
+      caption.textContent = heroCaptionFor(heroMoodState);
+    }
+  }
+  repaintHero(true);
 
   if (identity.partnerUid) {
     unsubscribers.push(
-      RoomData.listenProfiles(identity.roomId, sharedKey, [lastKnownUid, identity.partnerUid], (uid, avatar) => {
-        const targetId = uid === lastKnownUid ? 'avatar-mine' : 'avatar-theirs';
-        const el = document.getElementById(targetId);
-        const src = safeMediaSrc(avatar, 'image');
-        if (!el || !src) return;
-        el.style.backgroundImage = `url("${src}")`;
-        el.textContent = '';
+      RoomData.listenProfiles(identity.roomId, sharedKey, [lastKnownUid, identity.partnerUid], (uid, profile) => {
+        const isMine = uid === lastKnownUid;
+        const el = document.getElementById(isMine ? 'avatar-mine' : 'avatar-theirs');
+        const src = safeMediaSrc(profile.avatar, 'image');
+        if (el && src) {
+          el.style.backgroundImage = `url("${src}")`;
+          el.textContent = '';
+        }
+        // Their gender arrives over the encrypted profile, so an already-paired
+        // couple picks this up without redoing the pairing handshake.
+        const key = isMine ? 'mine' : 'theirs';
+        const next = profile.gender || (isMine ? identity.gender : null) || 'unspecified';
+        if (heroGenders[key] !== next) {
+          heroGenders[key] = next;
+          repaintHero(true);
+        }
       })
     );
   }
@@ -983,6 +1289,35 @@ function renderHome(slot) {
     RoomData.setTogetherSince(identity.roomId, sharedKey, input.value);
     toast('Saved');
   };
+
+  // --- Home note: theirs is shown, yours is editable ---
+  if (identity.partnerUid) {
+    unsubscribers.push(
+      RoomData.listenNote(identity.roomId, sharedKey, identity.partnerUid, (note) => {
+        const body = document.getElementById('note-body');
+        const tile = document.getElementById('note-tile');
+        if (!body) return;
+        if (note && note.text) {
+          body.textContent = note.text;
+          body.classList.remove('empty');
+          tile?.classList.add('has-note');
+        } else {
+          body.textContent = `Nothing from ${identity.partnerName || 'them'} yet.`;
+          body.classList.add('empty');
+          tile?.classList.remove('has-note');
+        }
+      })
+    );
+  }
+  let myNote = '';
+  unsubscribers.push(
+    RoomData.listenNote(identity.roomId, sharedKey, lastKnownUid, (note) => {
+      myNote = note?.text || '';
+      const btn = document.getElementById('note-edit-btn');
+      if (btn) btn.innerHTML = `${iconPencil()} ${myNote ? 'Edit your note' : 'Leave one for them'}`;
+    })
+  );
+  document.getElementById('note-edit-btn').onclick = () => openNoteEditor(myNote);
 
   document.getElementById('nudge-btn').onclick = () => {
     openSheet('Send a nudge', [
@@ -1074,7 +1409,6 @@ function renderHome(slot) {
   }
 
   // Mood-reactive hero — re-renders the scene and re-types the caption.
-  let lastMoodState = null;
   unsubscribers.push(
     RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
       const todayKey = new Date().toISOString().slice(0, 10);
@@ -1087,16 +1421,14 @@ function renderHome(slot) {
       else if (myLow) moodState = 'meLow';
       else if (theirLow) moodState = 'themLow';
 
+      const tile = document.getElementById('home-mood-tile');
       const moodEl = document.getElementById('home-partner-mood');
       if (moodEl) moodEl.textContent = theirs ? theirs.mood : '–';
+      if (tile) applyMoodTint(tile, theirs ? theirs.mood : null);
 
-      if (moodState === lastMoodState) return;
-      lastMoodState = moodState;
-      const heroEl = document.getElementById('hero-scene');
-      if (!heroEl) return;
-      heroEl.innerHTML = heroSceneSVG(moodState) + `<div class="hero-caption" id="hero-caption"></div>`;
-      const stop = typeCaption(document.getElementById('hero-caption'), heroCaptionFor(moodState));
-      if (stop) unsubscribers.push(stop);
+      if (moodState === heroMoodState) return;
+      heroMoodState = moodState;
+      repaintHero(true);
     })
   );
 }
@@ -1164,7 +1496,10 @@ function openSheet(title, actions) {
       <button class="sheet-action cancel" data-cancel>Cancel</button>
     </div>`;
   document.body.appendChild(wrap);
-  requestAnimationFrame(() => wrap.classList.add('open'));
+  // setTimeout, not requestAnimationFrame: rAF is suspended while the page
+  // isn't compositing, which would leave the sheet mounted but permanently
+  // transformed off-screen. A 0ms timeout still lets the transition run.
+  setTimeout(() => wrap.classList.add('open'), 0);
   const close = () => {
     wrap.classList.remove('open');
     setTimeout(() => wrap.remove(), 200);
@@ -1283,6 +1618,7 @@ function renderThread(slot) {
   let replyingTo = null;
   let firstPaint = true;
   let pendingScrollAnchor = null;
+  let lastPaintSignature = null;
 
   const searchBar = document.getElementById('search-bar');
   const searchInput = document.getElementById('search-input');
@@ -1348,8 +1684,11 @@ function renderThread(slot) {
       return;
     }
 
-    // Search mode renders a flat result list instead of the conversation.
+    // Search mode renders a flat result list instead of the conversation, so the
+    // conversation signature no longer describes what's on screen — clear it or
+    // returning from search would be skipped as a no-op.
     if (searchTerm) {
+      lastPaintSignature = null;
       const hits = messages
         .map((m, idx) => ({ m, idx }))
         .filter(({ m }) => m.type === 'text' && String(m.text || '').toLowerCase().includes(searchTerm));
@@ -1392,6 +1731,18 @@ function renderThread(slot) {
     }
 
     const wasAtBottom = atBottom || firstPaint;
+
+    // Firestore fires a snapshot for every metadata change (a local write, then
+    // its server ack). Rebuilding the whole list each time is the single biggest
+    // source of chat lag on a low-RAM phone, so skip the rebuild when nothing
+    // visible actually changed.
+    const signature =
+      messages
+        .map((m) => `${m.id}:${m.pending ? 1 : 0}:${Object.values(m.reactions || {}).join('')}`)
+        .join('|') + `#${reachedStart ? 1 : 0}`;
+    if (signature === lastPaintSignature && pendingScrollAnchor === null) return;
+    lastPaintSignature = signature;
+
     const olderBtn = reachedStart
       ? ''
       : `<button class="load-older" id="load-older">Load earlier messages</button>`;
@@ -1556,11 +1907,26 @@ function renderThread(slot) {
     }
   };
 
+  // Stop-typing is sent explicitly after a short idle, so the partner's
+  // indicator disappears when you actually pause rather than lingering until
+  // the window lapses (or worse, until you finally send).
+  let typingIdleTimer = null;
   input.oninput = () => {
     autoGrow();
     syncActionButton();
-    if (presenceEnabled() && input.value.trim()) signalTyping(identity.roomId);
+    if (!presenceEnabled()) return;
+    if (typingIdleTimer) clearTimeout(typingIdleTimer);
+    if (input.value.trim()) {
+      signalTyping(identity.roomId);
+      typingIdleTimer = setTimeout(() => clearTyping(identity.roomId), 1600);
+    } else {
+      clearTyping(identity.roomId);
+    }
   };
+  unsubscribers.push(() => {
+    if (typingIdleTimer) clearTimeout(typingIdleTimer);
+    if (presenceEnabled()) clearTyping(identity.roomId);
+  });
   input.onkeydown = (e) => {
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -1722,32 +2088,50 @@ async function toggleRecording(micBtn) {
 }
 
 // ---------------- Today ----------------
+// Colours are muted on purpose — they should read as a mood, not a traffic
+// light, and still sit inside the moonlit palette.
 const MOODS = [
-  { emoji: '😄', label: 'Great' },
-  { emoji: '🙂', label: 'Good' },
-  { emoji: '😐', label: 'Okay' },
-  { emoji: '😔', label: 'Low' },
-  { emoji: '😢', label: 'Really low' },
+  { emoji: '😄', label: 'Great', color: '#7fb894' },
+  { emoji: '🙂', label: 'Good', color: '#93bfa8' },
+  { emoji: '😐', label: 'Okay', color: '#c7b491' },
+  { emoji: '😔', label: 'Low', color: '#8b9bc9' },
+  { emoji: '😢', label: 'Really low', color: '#a48ac2' },
 ];
 const LOW_MOODS = ['😔', '😢'];
+
+function moodColor(emoji) {
+  return MOODS.find((m) => m.emoji === emoji)?.color || null;
+}
+
+// Tints a container to match a mood, or clears the tint when there's no mood.
+function applyMoodTint(el, emoji) {
+  const color = moodColor(emoji);
+  if (!color) {
+    el.style.removeProperty('--mood');
+    el.classList.remove('mood-tinted');
+    return;
+  }
+  el.style.setProperty('--mood', color);
+  el.classList.add('mood-tinted');
+}
 
 function renderToday(slot) {
   slot.innerHTML = `
     <div class="screen">
       <div class="eyebrow">How today felt</div>
       <h2 class="screen-title">Today</h2>
-      <div class="card">
+      <div class="card" id="your-mood-card">
         <div class="eyebrow">Your mood</div>
         <div class="mood-picker" id="mood-picker">
           ${MOODS.map(
-            (m) => `<button class="mood-option" data-mood="${m.emoji}">
+            (m) => `<button class="mood-option" data-mood="${m.emoji}" style="--mood:${m.color}">
               <span class="mood-emoji">${m.emoji}</span>
               <span class="mood-label">${m.label}</span>
             </button>`
           ).join('')}
         </div>
       </div>
-      <div class="card">
+      <div class="card" id="partner-mood-card">
         <div class="eyebrow">${escapeHTML(identity.partnerName || 'Their')} mood today</div>
         <div class="mood-face" id="partner-mood">–</div>
       </div>
@@ -1784,6 +2168,10 @@ function renderToday(slot) {
       });
       const partnerMoodEl = document.getElementById('partner-mood');
       if (partnerMoodEl) partnerMoodEl.textContent = theirs ? theirs.mood : 'Not shared yet';
+      const partnerCard = document.getElementById('partner-mood-card');
+      if (partnerCard) applyMoodTint(partnerCard, theirs ? theirs.mood : null);
+      const yourCard = document.getElementById('your-mood-card');
+      if (yourCard) applyMoodTint(yourCard, mine ? mine.mood : null);
     })
   );
 
@@ -1966,6 +2354,7 @@ function renderMore(slot) {
           ['tile-savings', iconSavings(), 'Savings', 'Goals you’re building toward'],
           ['tile-journal', iconJournal(), 'Journal', 'Longer thoughts, shared'],
           ['tile-letters', iconLetter(), 'Letters', 'Written now, opened later'],
+          ['tile-game', iconGame(), 'Tic-Tac-Toe', 'Take a turn each'],
           ['tile-memories', iconMemory(), 'Memories', 'Pinned from Chat'],
           ['tile-settings', iconSettings(), 'Settings', 'Security &amp; account'],
         ]
@@ -1985,13 +2374,246 @@ function renderMore(slot) {
   document.getElementById('tile-savings').onclick = () => renderSavingsTracker();
   document.getElementById('tile-journal').onclick = () => renderJournal();
   document.getElementById('tile-letters').onclick = () => renderLetters();
+  document.getElementById('tile-game').onclick = () => renderGame();
   document.getElementById('tile-memories').onclick = () => renderMemories();
   document.getElementById('tile-settings').onclick = () => renderSettings();
+}
+
+// ---------------- Tic-Tac-Toe ----------------
+function renderGame() {
+  clearListeners();
+  markSectionsSeen(['game']);
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="game-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Take a turn each</div>
+          <h2>Tic-Tac-Toe</h2>
+        </div>
+      </div>
+
+      <div class="card game-status-card">
+        <div class="game-status" id="game-status">Setting up…</div>
+        <div class="game-scores" id="game-scores"></div>
+      </div>
+
+      <div class="game-board" id="game-board"></div>
+
+      <div class="game-actions" id="game-actions"></div>
+      <div id="game-notice"></div>
+      <p class="fine-print">
+        Turn-based, so neither of you has to be here at the same time. The board is encrypted like
+        everything else — only the two of you can read it.
+      </p>
+    </div>
+  `;
+
+  let state = null;
+  let partnerAway = false;
+  let noticeDismissed = null; // remembers which ended-game notice was closed
+  let awayTimer = null;
+
+  const memberUids = memberUidsOf(identity);
+
+  // Faster presence beat while the board is open, so "stepped away" is timely.
+  if (presenceEnabled()) startGamePresence(identity.roomId);
+
+  const leaveScreen = () => {
+    stopGamePresence(identity.roomId);
+    renderMain();
+  };
+  document.getElementById('game-back').onclick = leaveScreen;
+  unsubscribers.push(() => {
+    if (awayTimer) clearInterval(awayTimer);
+    stopGamePresence(identity.roomId);
+  });
+
+  if (identity.partnerUid) {
+    unsubscribers.push(
+      listenPartnerPresence(identity.roomId, identity.partnerUid, (p) => {
+        partnerAway = !p.inGame;
+        paint();
+      })
+    );
+    // The "away" verdict depends on elapsed time, so re-evaluate on a timer as
+    // well as on snapshots — otherwise a partner who simply stops beating would
+    // keep looking present.
+    awayTimer = setInterval(paint, 5000);
+  }
+
+  unsubscribers.push(
+    Game.listenGame(identity.roomId, sharedKey, (s) => {
+      state = s;
+      paint();
+    })
+  );
+
+  function nameFor(uid) {
+    return uid === lastKnownUid ? 'You' : identity.partnerName || 'They';
+  }
+  function markFor(uid) {
+    if (!state) return '';
+    return uid === state.xUid ? 'X' : 'O';
+  }
+
+  function paint() {
+    const statusEl = document.getElementById('game-status');
+    const boardEl = document.getElementById('game-board');
+    const actionsEl = document.getElementById('game-actions');
+    const scoresEl = document.getElementById('game-scores');
+    const noticeEl = document.getElementById('game-notice');
+    if (!statusEl || !boardEl) return;
+
+    // --- no game yet ---
+    if (!state) {
+      statusEl.textContent = 'No game going right now.';
+      scoresEl.innerHTML = '';
+      boardEl.innerHTML = cellsHTML(Array(9).fill(null), null, true);
+      actionsEl.innerHTML = `<button class="btn-primary" id="new-game-btn">Start a game</button>`;
+      noticeEl.innerHTML = '';
+      document.getElementById('new-game-btn').onclick = async () => {
+        try {
+          await Game.startNewGame(identity.roomId, sharedKey, memberUids);
+        } catch (e) {
+          toast("Couldn't start a game");
+        }
+      };
+      return;
+    }
+
+    // --- somebody left ---
+    if (state.status === 'ended') {
+      const byMe = state.endedBy === lastKnownUid;
+      statusEl.textContent = byMe ? 'You left the game.' : `${identity.partnerName || 'They'} left the game.`;
+      boardEl.innerHTML = cellsHTML(state.board, state.winningLine, true);
+      actionsEl.innerHTML = `<button class="btn-primary" id="new-game-btn">Start a new game</button>`;
+      if (!byMe && noticeDismissed !== state.endedAt) {
+        // The partner-facing popup the brief asked for.
+        const endedState = state;
+        openSheet(`${escapeHTML(identity.partnerName || 'They')} left the game`, [
+          {
+            label: 'Start a new game',
+            onClick: () =>
+              Game.startNewGame(identity.roomId, sharedKey, memberUids, { previous: endedState }).catch(() =>
+                toast("Couldn't start a game")
+              ),
+          },
+          { label: 'Back to More', onClick: () => leaveScreen() },
+        ]);
+        // Marked as seen immediately so tapping the backdrop doesn't re-open it.
+        noticeDismissed = state.endedAt;
+      }
+      document.getElementById('new-game-btn').onclick = () =>
+        Game.startNewGame(identity.roomId, sharedKey, memberUids, { previous: state }).catch(() =>
+          toast("Couldn't start a game")
+        );
+      renderScores(scoresEl);
+      noticeEl.innerHTML = '';
+      return;
+    }
+
+    // --- finished round ---
+    if (state.status === 'finished') {
+      if (state.winner === 'draw') {
+        statusEl.textContent = 'A draw.';
+      } else {
+        const winnerUid = state.winner === 'X' ? state.xUid : state.oUid;
+        statusEl.textContent = winnerUid === lastKnownUid ? 'You won 🎉' : `${identity.partnerName || 'They'} won.`;
+      }
+      boardEl.innerHTML = cellsHTML(state.board, state.winningLine, true);
+      actionsEl.innerHTML = `
+        <button class="btn-primary" id="new-game-btn">Play again</button>
+        <button class="btn-secondary" id="leave-btn">Leave</button>`;
+      document.getElementById('new-game-btn').onclick = () =>
+        Game.startNewGame(identity.roomId, sharedKey, memberUids, { previous: state }).catch(() =>
+          toast("Couldn't start a game")
+        );
+      document.getElementById('leave-btn').onclick = () => confirmLeave();
+      renderScores(scoresEl);
+      noticeEl.innerHTML = '';
+      return;
+    }
+
+    // --- active game ---
+    const myTurn = state.turnUid === lastKnownUid;
+    statusEl.innerHTML = myTurn
+      ? `Your turn <span class="game-mark">${markFor(lastKnownUid)}</span>`
+      : `Waiting for ${escapeHTML(identity.partnerName || 'them')} <span class="game-mark">${markFor(
+          state.turnUid
+        )}</span>`;
+    boardEl.innerHTML = cellsHTML(state.board, null, !myTurn);
+    actionsEl.innerHTML = `<button class="btn-secondary" id="leave-btn">Leave game</button>`;
+    document.getElementById('leave-btn').onclick = () => confirmLeave();
+    renderScores(scoresEl);
+
+    // Paused: partner isn't on the board right now. Not an error — they can
+    // come back to the same game whenever, so say exactly that.
+    noticeEl.innerHTML = partnerAway
+      ? `<div class="card game-paused">
+           <div class="eyebrow">Paused</div>
+           <p class="body-dim">
+             ${escapeHTML(identity.partnerName || 'They')} stepped away, so the game is waiting.
+             Their turn is saved — they can pick it up any time, and nothing is lost.
+           </p>
+           <button class="btn-secondary" id="paused-leave-btn" style="margin-top:10px;">Leave the game</button>
+         </div>`
+      : '';
+    const pausedLeave = document.getElementById('paused-leave-btn');
+    if (pausedLeave) pausedLeave.onclick = () => confirmLeave();
+
+    boardEl.querySelectorAll('.game-cell').forEach((cell) => {
+      cell.onclick = async () => {
+        if (!myTurn) return;
+        const i = Number(cell.dataset.i);
+        if (state.board[i]) return;
+        cell.classList.add('placing');
+        try {
+          await Game.makeMove(identity.roomId, sharedKey, state, i);
+        } catch (e) {
+          toast("Couldn't make that move");
+        }
+      };
+    });
+  }
+
+  function renderScores(el) {
+    if (!el || !state) return;
+    const s = state.scores || {};
+    const mine = s[lastKnownUid] || 0;
+    const theirs = s[identity.partnerUid] || 0;
+    const draws = s.draws || 0;
+    el.innerHTML = `<span>You <strong>${mine}</strong></span>
+      <span>${escapeHTML(identity.partnerName || 'They')} <strong>${theirs}</strong></span>
+      <span>Draws <strong>${draws}</strong></span>
+      <span class="game-round">Round ${state.round || 1}</span>`;
+  }
+
+  function confirmLeave() {
+    if (!confirm('Leave the game? It ends for both of you, and they\'ll be told you left.')) return;
+    Game.leaveGame(identity.roomId, sharedKey, state)
+      .then(() => toast('Game ended'))
+      .catch(() => toast("Couldn't leave cleanly"));
+  }
+
+  function cellsHTML(board, winningLine, locked) {
+    return board
+      .map((v, i) => {
+        const win = winningLine && winningLine.includes(i);
+        return `<button class="game-cell ${v ? 'filled' : ''} ${win ? 'win' : ''} ${
+          locked || v ? 'locked' : ''
+        }" data-i="${i}" ${locked || v ? 'disabled' : ''}>${v ? `<span>${v}</span>` : ''}</button>`;
+      })
+      .join('');
+  }
+
+  paint();
 }
 
 // ---------------- Expenses (with categories) ----------------
 function renderExpenseTracker() {
   clearListeners();
+  markSectionsSeen(['expenses']);
   let activeCategory = 'All';
   root.innerHTML = `
     <div class="screen">
@@ -2003,7 +2625,7 @@ function renderExpenseTracker() {
         </div>
       </div>
 
-      <div class="card balance-card" id="expense-summary"></div>
+      <div class="card totals-card" id="expense-summary"></div>
 
       <div class="card">
         <input type="text" id="expense-desc" placeholder="What was it for?" />
@@ -2013,11 +2635,18 @@ function renderExpenseTracker() {
             ${RoomData.EXPENSE_CATEGORIES.map((c) => `<option value="${c}">${c}</option>`).join('')}
           </select>
         </div>
-        <select id="expense-paidby" style="margin-top:8px;">
-          <option value="${lastKnownUid}">I paid</option>
-          <option value="${identity.partnerUid || ''}">${escapeHTML(identity.partnerName || 'They')} paid</option>
+        <div class="eyebrow" style="margin-top:12px;">Whose spending</div>
+        <select id="expense-spentby">
+          <option value="${lastKnownUid}">Mine</option>
+          <option value="${identity.partnerUid || ''}">${escapeHTML(identity.partnerName || 'Theirs')}</option>
         </select>
+        <div class="eyebrow" style="margin-top:12px;">When</div>
+        <input type="datetime-local" id="expense-at" />
         <button class="btn-primary" id="add-expense-btn" style="margin-top:10px;">Add expense</button>
+        <p class="fine-print">
+          You can log something for ${escapeHTML(identity.partnerName || 'them')} too — handy when they ask you
+          to note it down. The date and time default to now; change them to record something from earlier.
+        </p>
       </div>
 
       <div class="chip-row" id="category-chips"></div>
@@ -2025,17 +2654,36 @@ function renderExpenseTracker() {
     </div>
   `;
   document.getElementById('back-more-btn').onclick = () => renderMain();
+
+  const atInput = document.getElementById('expense-at');
+  const resetAt = () => {
+    // datetime-local wants a local 'YYYY-MM-DDTHH:mm' string, not an ISO UTC one.
+    const n = new Date();
+    atInput.value = `${n.getFullYear()}-${pad2(n.getMonth() + 1)}-${pad2(n.getDate())}T${pad2(
+      n.getHours()
+    )}:${pad2(n.getMinutes())}`;
+  };
+  resetAt();
+
   document.getElementById('add-expense-btn').onclick = async () => {
     const description = document.getElementById('expense-desc').value.trim();
     const amount = parseFloat(document.getElementById('expense-amount').value);
-    const paidBy = document.getElementById('expense-paidby').value;
+    const spentBy = document.getElementById('expense-spentby').value;
     const category = document.getElementById('expense-category').value;
+    const atRaw = atInput.value;
     if (!description || !amount) return;
     try {
-      await RoomData.addExpense(identity.roomId, sharedKey, { description, amount, paidBy, category });
+      await RoomData.addExpense(identity.roomId, sharedKey, {
+        description,
+        amount,
+        spentBy,
+        category,
+        at: atRaw ? new Date(atRaw).toISOString() : new Date().toISOString(),
+      });
       document.getElementById('expense-desc').value = '';
       document.getElementById('expense-amount').value = '';
-      toast('Expense added');
+      resetAt();
+      toast('Logged');
     } catch (e) {
       toast("Couldn't add that expense");
     }
@@ -2051,27 +2699,34 @@ function renderExpenseTracker() {
   function paint() {
     const shown = activeCategory === 'All' ? allExpenses : allExpenses.filter((e) => e.category === activeCategory);
 
-    // The balance is always computed across EVERYTHING, not the filtered view —
-    // a filter is for reading, it should never change what you owe.
-    const totalMine = allExpenses.filter((e) => e.paidBy === lastKnownUid).reduce((s, e) => s + e.amount, 0);
-    const totalTheirs = allExpenses.filter((e) => e.paidBy === identity.partnerUid).reduce((s, e) => s + e.amount, 0);
-    const diff = totalMine - totalTheirs;
-    let summaryText;
-    let cls = 'even';
-    if (Math.abs(diff) < 0.01) summaryText = "You're even.";
-    else if (diff > 0) {
-      summaryText = `${escapeHTML(identity.partnerName || 'They')} owes you ${(diff / 2).toFixed(2)}`;
-      cls = 'positive';
-    } else {
-      summaryText = `You owe ${escapeHTML(identity.partnerName || 'them')} ${(Math.abs(diff) / 2).toFixed(2)}`;
-      cls = 'negative';
-    }
+    // Totals only — this tracks what each of you spent. There is deliberately no
+    // "who owes whom": that's a split-the-bill idea, and this isn't that.
+    const sum = (arr) => arr.reduce((s, e) => s + e.amount, 0);
+    const mine = allExpenses.filter((e) => e.spentBy === lastKnownUid);
+    const theirs = allExpenses.filter((e) => e.spentBy === identity.partnerUid);
+
+    const startOfMonth = new Date();
+    startOfMonth.setDate(1);
+    startOfMonth.setHours(0, 0, 0, 0);
+    const thisMonth = allExpenses.filter((e) => e.at >= startOfMonth);
+
     summaryEl.innerHTML = `
-      <div class="eyebrow">Balance</div>
-      <div class="balance-value ${cls}">${summaryText}</div>
-      <div class="balance-split">
-        <span>You paid <strong>${totalMine.toFixed(2)}</strong></span>
-        <span>${escapeHTML(identity.partnerName || 'They')} paid <strong>${totalTheirs.toFixed(2)}</strong></span>
+      <div class="eyebrow">This month</div>
+      <div class="totals-headline">${sum(thisMonth).toFixed(2)}</div>
+      <div class="totals-split">
+        <div class="totals-part">
+          <span class="totals-label">You</span>
+          <span class="totals-value">${sum(mine.filter((e) => e.at >= startOfMonth)).toFixed(2)}</span>
+        </div>
+        <div class="totals-part">
+          <span class="totals-label">${escapeHTML(identity.partnerName || 'Them')}</span>
+          <span class="totals-value">${sum(theirs.filter((e) => e.at >= startOfMonth)).toFixed(2)}</span>
+        </div>
+      </div>
+      <div class="totals-alltime">
+        All time — you <strong>${sum(mine).toFixed(2)}</strong> ·
+        ${escapeHTML(identity.partnerName || 'them')} <strong>${sum(theirs).toFixed(2)}</strong> ·
+        together <strong>${sum(allExpenses).toFixed(2)}</strong>
       </div>`;
 
     const cats = ['All', ...RoomData.EXPENSE_CATEGORIES.filter((c) => allExpenses.some((e) => e.category === c))];
@@ -2099,18 +2754,28 @@ function renderExpenseTracker() {
       return;
     }
     listEl.innerHTML = `<div class="card">${shown
-      .map(
-        (e, i) => `
+      .map((e, i) => {
+        const whose = e.spentBy === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'They');
+        // Worth surfacing when one of you logged it for the other, so an entry
+        // never looks like it appeared out of nowhere.
+        const onBehalf =
+          e.loggedBy && e.spentBy && e.loggedBy !== e.spentBy
+            ? ` · added by ${e.loggedBy === lastKnownUid ? 'you' : escapeHTML(identity.partnerName || 'them')}`
+            : '';
+        return `
       <div class="money-row" data-id="${e.id}" style="animation-delay:${i * 25}ms">
         <div class="grow">
           <div>${escapeHTML(e.description)}</div>
-          <div class="row-meta">${
-            e.paidBy === lastKnownUid ? 'You paid' : `${escapeHTML(identity.partnerName || 'They')} paid`
-          } · ${escapeHTML(e.category)} · ${escapeHTML(relativeTime(e.createdAt))}</div>
+          <div class="row-meta">
+            <span class="whose-chip ${e.spentBy === lastKnownUid ? 'me' : 'them'}">${whose}</span>
+            ${escapeHTML(e.category)} · ${escapeHTML(
+              e.at.toLocaleString([], { day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' })
+            )}${onBehalf}
+          </div>
         </div>
         <div class="money-amount">${e.amount.toFixed(2)}</div>
-      </div>`
-      )
+      </div>`;
+      })
       .join('')}</div>
       <p class="fine-print">Long-press an entry to remove it.</p>`;
 
@@ -2140,6 +2805,7 @@ function renderExpenseTracker() {
 // ---------------- Savings (multiple goals) ----------------
 function renderSavingsTracker() {
   clearListeners();
+  markSectionsSeen(['savings']);
   root.innerHTML = `
     <div class="screen">
       <div class="page-head">
@@ -2325,16 +2991,23 @@ function renderSavingsTracker() {
     });
   }
 
-  function editGoal(goal) {
+  async function editGoal(goal) {
     if (!goal) return;
-    const label = prompt('Goal name', goal.label);
-    if (label === null) return;
-    const target = prompt('Target amount', String(goal.target));
-    if (target === null) return;
+    const values = await promptModal({
+      title: 'Edit goal',
+      submitLabel: 'Save goal',
+      fields: [
+        { name: 'label', label: 'Name', value: goal.label, required: true },
+        { name: 'target', label: 'Target amount', type: 'number', inputmode: 'decimal', value: goal.target },
+      ],
+    });
+    if (!values) return;
     RoomData.updateSavingsGoal(identity.roomId, sharedKey, goal.id, {
-      label: label.trim() || goal.label,
-      target: parseFloat(target) || goal.target,
-    }).catch(() => toast("Couldn't update that goal"));
+      label: values.label.trim() || goal.label,
+      target: parseFloat(values.target) || goal.target,
+    })
+      .then(() => toast('Goal updated'))
+      .catch(() => toast("Couldn't update that goal"));
   }
 
   unsubscribers.push(
@@ -2356,6 +3029,7 @@ function renderSavingsTracker() {
 // ---------------- Journal ----------------
 function renderJournal() {
   clearListeners();
+  markSectionsSeen(['journal']);
   root.innerHTML = `
     <div class="screen">
       <div class="page-head">
@@ -2425,6 +3099,7 @@ function renderJournal() {
 // ---------------- Letters ----------------
 function renderLetters() {
   clearListeners();
+  markSectionsSeen(['letters']);
   root.innerHTML = `
     <div class="screen">
       <div class="page-head">
@@ -2455,7 +3130,7 @@ function renderLetters() {
     try {
       await RoomData.addLetter(identity.roomId, sharedKey, {
         text,
-        unlockAt: new Date(unlockDate).toISOString(),
+        unlockAt: localMidnightISO(unlockDate),
       });
       document.getElementById('letter-text').value = '';
       document.getElementById('letter-unlock').value = '';
@@ -2508,6 +3183,7 @@ function renderLetters() {
 // ---------------- Memories ----------------
 function renderMemories() {
   clearListeners();
+  markSectionsSeen(['memories']);
   root.innerHTML = `
     <div class="screen">
       <div class="page-head">
@@ -2603,6 +3279,21 @@ function renderSettings() {
             ? '<button class="btn-secondary" id="enable-notify-btn" style="margin-top:10px;">Turn on notifications</button>'
             : ''
         }
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">How you're drawn</div>
+        <p class="body-dim">
+          Shapes your figure on the shore in the Home scene. Shared with your person only.
+        </p>
+        <div class="choice-list inline" id="gender-settings">
+          ${GENDERS.map(
+            (g) =>
+              `<button class="choice compact ${
+                (identity.gender || 'unspecified') === g.id ? 'active' : ''
+              }" data-gender="${g.id}">${g.label}</button>`
+          ).join('')}
+        </div>
       </div>
 
       <div class="card">
@@ -2724,6 +3415,21 @@ function renderSettings() {
     renderSettings();
   };
 
+  document.querySelectorAll('#gender-settings .choice').forEach((btn) => {
+    btn.onclick = async () => {
+      const gender = btn.dataset.gender;
+      identity = await updateIdentity({ gender, genderPublished: false });
+      try {
+        await RoomData.setMyGender(identity.roomId, sharedKey, gender);
+        identity = await updateIdentity({ genderPublished: true });
+        toast('Updated');
+      } catch (e) {
+        toast("Saved here, but couldn't share it yet");
+      }
+      renderSettings();
+    };
+  });
+
   document.getElementById('export-btn').onclick = () => handleExportArchive();
   document.getElementById('open-archive-btn').onclick = () =>
     document.getElementById('archive-input').click();
@@ -2738,14 +3444,24 @@ function renderSettings() {
 }
 
 async function handleExportArchive() {
-  const passphrase = prompt(
-    'Choose a passphrase for this archive (at least 8 characters).\n\nThere is no way to recover it — if you lose it, the file is unreadable forever.'
-  );
-  if (passphrase === null) return;
-  if (passphrase.length < 8) {
-    toast('Passphrase must be at least 8 characters');
-    return;
-  }
+  const values = await promptModal({
+    title: 'Protect this archive',
+    note:
+      'There is no way to recover this passphrase. If you lose it, the file is unreadable forever — including by us.',
+    submitLabel: 'Export',
+    fields: [
+      {
+        name: 'passphrase',
+        label: 'Passphrase',
+        type: 'password',
+        placeholder: 'At least 8 characters',
+        required: true,
+        minLength: 8,
+      },
+    ],
+  });
+  if (!values) return;
+  const passphrase = values.passphrase;
   const btn = document.getElementById('export-btn');
   if (btn) {
     btn.disabled = true;
@@ -2778,8 +3494,13 @@ async function handleExportArchive() {
 }
 
 async function handleOpenArchive(file) {
-  const passphrase = prompt('Passphrase for this archive:');
-  if (passphrase === null) return;
+  const values = await promptModal({
+    title: 'Open archive',
+    submitLabel: 'Open',
+    fields: [{ name: 'passphrase', label: 'Passphrase', type: 'password', required: true }],
+  });
+  if (!values) return;
+  const passphrase = values.passphrase;
   try {
     const text = await file.text();
     const parsed = JSON.parse(text);
@@ -2908,6 +3629,7 @@ async function handleLogout() {
   clearListeners();
   clearGlobalListeners();
   await clearIdentity();
+  await clearSeen();
   try {
     await signOutOfAccount();
   } catch (e) {
@@ -3004,6 +3726,15 @@ function safeMediaSrc(value, kind = 'image') {
   return re.test(s) ? s : '';
 }
 
+// `new Date('2026-07-27')` is parsed as UTC midnight, which in Karachi is 5am
+// and in Kolkata 5:30am — so "opens on the 27th" was opening late. Building the
+// date part-by-part gives midnight in the writer's OWN timezone, which is what
+// "right when the day starts" means to the person picking the date.
+function localMidnightISO(yyyyMmDd) {
+  const [y, m, d] = String(yyyyMmDd).split('-').map(Number);
+  return new Date(y, m - 1, d, 0, 0, 0, 0).toISOString();
+}
+
 function dayLabel(date) {
   const d = new Date(date);
   const startOf = (x) => new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime();
@@ -3082,6 +3813,30 @@ function iconLock() {
 function iconChevronLeft() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="20" height="20"><path d="M15 5l-7 7 7 7"/></svg>';
 }
+function iconNote() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M4 5h16v10l-4 4H4z"/><path d="M8 10h8M8 14h4"/></svg>';
+}
+function iconPencil() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="13" height="13"><path d="M4 20h4L20 8l-4-4L4 16z"/></svg>';
+}
+function iconHeartSmall() {
+  return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 20s-6.5-4-8.5-8C1.8 8.6 3.6 5.5 6.8 5.5c1.8 0 3 .9 3.7 1.8.7-.9 1.9-1.8 3.7-1.8 3.2 0 5 3.1 3.3 6.5-2 4-8.5 8-8.5 8z"/></svg>';
+}
+function iconFlameSmall() {
+  return '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 2c2 4-1 5-1 7a3 3 0 006 0c0 5-3 7-5 7s-6-2-6-7c0-4 4-5 6-7z"/></svg>';
+}
+function iconClockSmall() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>';
+}
+function iconAnchorSmall() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="5" r="2.4"/><path d="M12 7.5V21M6 13H4a8 8 0 0016 0h-2"/></svg>';
+}
+function iconNudge() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M18 8a6 6 0 10-12 0c0 4-2 5-2 5h16s-2-1-2-5z"/><path d="M10.5 21a2 2 0 003 0"/></svg>';
+}
+function iconGame() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>';
+}
 function iconSearch() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="19" height="19"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>';
 }
@@ -3089,17 +3844,52 @@ function iconChevronDown() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="18" height="18"><path d="M5 9l7 7 7-7"/></svg>';
 }
 
+// ---------------- Connection state ----------------
+// Firestore queues writes while offline and flushes them on reconnect, so this
+// is reassurance rather than an error: it tells you why a message is sitting on
+// "sending" without implying anything was lost.
+function paintOfflineBanner() {
+  const existing = document.getElementById('offline-banner');
+  if (navigator.onLine) {
+    if (existing) existing.remove();
+    return;
+  }
+  if (existing) return;
+  const el = document.createElement('div');
+  el.id = 'offline-banner';
+  el.className = 'offline-banner';
+  el.setAttribute('role', 'status');
+  el.textContent = 'Offline — anything you write is saved and will send when you reconnect.';
+  document.body.appendChild(el);
+}
+window.addEventListener('online', () => {
+  paintOfflineBanner();
+  toast('Back online');
+});
+window.addEventListener('offline', paintOfflineBanner);
+
 // ---------------- Privacy: blur on background, auto-lock on return ----------------
 document.addEventListener('visibilitychange', () => {
   document.body.classList.toggle('privacy-blur', document.hidden);
   if (document.hidden) {
     lastHiddenAt = Date.now();
-    if (identity?.roomId && presenceEnabled()) clearTyping(identity.roomId);
+    if (identity?.roomId && presenceEnabled()) {
+      clearTyping(identity.roomId);
+      // Leaving the app pauses any game immediately, rather than making the
+      // partner wait out a timeout to learn you stepped away.
+      stopGamePresence(identity.roomId);
+    }
   } else if (identity?.pinEnabled && lastHiddenAt && Date.now() - lastHiddenAt > 15000) {
     identity.secretKey = undefined;
     sharedKey = null;
     clearGlobalListeners();
     renderLockScreen();
+  }
+
+  // Coming back to a game already on screen resumes the fast beat, which tells
+  // the partner you're present again without them doing anything.
+  if (!document.hidden && identity?.roomId && presenceEnabled() && document.getElementById('game-board')) {
+    startGamePresence(identity.roomId);
   }
 });
 window.addEventListener('blur', () => document.body.classList.add('privacy-blur'));
@@ -3115,4 +3905,5 @@ window.addEventListener('unhandledrejection', (e) => {
   }
 });
 
+paintOfflineBanner();
 boot();

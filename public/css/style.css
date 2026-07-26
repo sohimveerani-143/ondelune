@@ -410,6 +410,148 @@ button:disabled { opacity: 0.55; cursor: default; }
 .bento-tile.span-4 { grid-column: span 4; }
 .tile-center { display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; }
 
+/* Each tile gets a named icon + its own accent, so they're tellable apart at a
+   glance instead of being nine identical dark rectangles. The accent is carried
+   in one --tone variable and applied consistently: icon, hairline, and a very
+   faint corner wash. */
+.tile-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 8px;
+  color: var(--tone, var(--text-faint));
+}
+.tile-head svg { width: 14px; height: 14px; flex-shrink: 0; }
+.tile-name {
+  font-size: 10.5px;
+  letter-spacing: 0.07em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: var(--tone, var(--text-faint));
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.bento-tile[class*='tone-'] {
+  position: relative;
+  border-top: 1px solid color-mix(in srgb, var(--tone) 30%, var(--border));
+  background-image: radial-gradient(120% 90% at 100% 0%, color-mix(in srgb, var(--tone) 9%, transparent), transparent 60%);
+  overflow: hidden;
+}
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .bento-tile[class*='tone-'] { border-top-color: var(--border-strong); background-image: none; }
+}
+
+.tone-note      { --tone: #e0906f; }
+.tone-countdown { --tone: #ecd6ad; }
+.tone-days      { --tone: #d98a9c; }
+.tone-streak    { --tone: #e8a765; }
+.tone-clock     { --tone: #8fb4cf; }
+.tone-mood      { --tone: #93bfa8; }
+.tone-nudge     { --tone: #b79ad4; }
+.tone-milestone { --tone: #ecd6ad; }
+.tone-since     { --tone: #9aa7c4; }
+
+/* Home note */
+.note-body {
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  font-size: 16px;
+  line-height: 1.5;
+  color: var(--text);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.note-body.empty { font-style: normal; font-family: 'Manrope', sans-serif; font-size: 13px; color: var(--text-faint); }
+.note-tile.has-note { border-top-color: var(--tone); }
+.note-edit {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin-top: 10px;
+  padding: 7px 11px;
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--tone, var(--horizon));
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 20px;
+  width: auto;
+}
+
+.sheet-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 4px 0; }
+.sheet-form textarea { font-size: 15px; }
+.char-count { font-size: 11px; color: var(--text-faint); text-align: right; }
+.char-count .at-limit { color: var(--horizon); }
+
+/* Unread badges */
+.badge {
+  position: absolute;
+  top: 2px;
+  right: 50%;
+  transform: translateX(15px);
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 20px;
+  background: var(--horizon);
+  color: #1a1430;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 15px;
+  text-align: center;
+  box-shadow: 0 0 0 2px var(--night);
+  animation: pop 0.24s var(--ease) both;
+}
+.nav button { position: relative; }
+.badge.tile-badge {
+  top: 10px;
+  right: 10px;
+  transform: none;
+  box-shadow: 0 0 0 2px var(--surface);
+}
+.shortcut-tile { position: relative; }
+
+/* Expense totals (no split-the-bill maths — see room-data.js) */
+.totals-card { background: linear-gradient(150deg, var(--surface), var(--surface-2)); }
+.totals-headline {
+  font-family: 'Playfair Display', serif;
+  font-size: 30px;
+  color: var(--moonlight);
+  line-height: 1.1;
+}
+.totals-split { display: flex; gap: 10px; margin-top: 12px; }
+.totals-part {
+  flex: 1;
+  background: var(--surface-3);
+  border-radius: var(--r-md);
+  padding: 9px 11px;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+.totals-label { font-size: 10.5px; color: var(--text-faint); text-transform: uppercase; letter-spacing: 0.06em; overflow: hidden; text-overflow: ellipsis; }
+.totals-value { font-family: 'Playfair Display', serif; font-size: 17px; }
+.totals-alltime { font-size: 11.5px; color: var(--text-faint); margin-top: 10px; line-height: 1.6; }
+.totals-alltime strong { color: var(--text-dim); }
+
+.whose-chip {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 20px;
+  margin-right: 6px;
+  border: 1px solid var(--border-strong);
+}
+.whose-chip.me { color: var(--horizon); border-color: rgba(224, 144, 111, 0.4); }
+.whose-chip.them { color: #93bfa8; border-color: rgba(147, 191, 168, 0.4); }
+
 .stat-number {
   font-family: 'Playfair Display', serif;
   font-size: 27px;
@@ -827,12 +969,6 @@ button:disabled { opacity: 0.55; cursor: default; }
 .money-row:last-child { border-bottom: none; }
 .money-amount { font-family: 'Playfair Display', serif; font-size: 16px; color: var(--moonlight); white-space: nowrap; }
 
-.balance-card { background: linear-gradient(150deg, var(--surface), var(--surface-2)); }
-.balance-value { font-family: 'Playfair Display', serif; font-size: 19px; margin-bottom: 8px; }
-.balance-value.positive { color: var(--success); }
-.balance-value.negative { color: var(--horizon); }
-.balance-value.even { color: var(--text-dim); }
-.balance-split { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--text-faint); gap: 10px; }
 
 .progress-track {
   width: 100%; height: 7px;
@@ -1254,6 +1390,127 @@ button:disabled { opacity: 0.55; cursor: default; }
   color: var(--text-faint);
 }
 .archive-counts strong { color: var(--moonlight); font-family: 'Playfair Display', serif; font-size: 14px; }
+
+/* ---------- Mood tinting ---------- */
+/* Each mood carries its own --mood colour; tinting is a soft wash plus a border
+   so it reads as atmosphere rather than a status badge. */
+.mood-tinted {
+  border-color: color-mix(in srgb, var(--mood) 42%, transparent);
+  background-image: linear-gradient(150deg, color-mix(in srgb, var(--mood) 13%, transparent), transparent 70%);
+  transition: border-color var(--dur) var(--ease), background-image var(--dur) var(--ease);
+}
+/* Fallback for engines without color-mix (older Android WebViews): the tint
+   simply doesn't apply and the card keeps its normal styling. */
+@supports not (background: color-mix(in srgb, red 10%, transparent)) {
+  .mood-tinted { border-color: var(--border-strong); }
+}
+
+.mood-option.selected {
+  border-color: var(--mood, var(--moonlight));
+  background: var(--surface-3);
+  box-shadow: inset 0 0 0 1px var(--mood, var(--moonlight));
+}
+.mood-option.selected .mood-label { color: var(--mood, var(--text-dim)); }
+
+/* ---------- Choice lists (gender, etc.) ---------- */
+.choice-list { display: flex; flex-direction: column; gap: 8px; width: 100%; }
+.choice-list.inline { flex-direction: row; flex-wrap: wrap; margin-top: 10px; }
+
+.choice {
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  padding: 14px 16px;
+  border-radius: var(--r-md);
+  font-weight: 500;
+  text-align: left;
+  transition: border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+}
+.choice:active { border-color: var(--horizon); }
+.choice.compact { padding: 9px 13px; font-size: 13px; text-align: center; flex: 0 0 auto; }
+.choice.active { background: var(--horizon); border-color: var(--horizon); color: #1a1430; }
+
+/* ---------- Tic-Tac-Toe ---------- */
+.game-status-card { background: linear-gradient(150deg, var(--surface), var(--surface-2)); }
+.game-status { font-family: 'Playfair Display', serif; font-size: 18px; }
+.game-mark {
+  font-family: 'Manrope', sans-serif;
+  font-size: 12px;
+  font-weight: 700;
+  color: var(--moonlight);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  padding: 1px 6px;
+  vertical-align: middle;
+  margin-left: 4px;
+}
+.game-scores {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 14px;
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+}
+.game-scores strong { color: var(--moonlight); font-family: 'Playfair Display', serif; font-size: 14px; }
+.game-round { margin-left: auto; }
+
+.game-board {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+  margin-bottom: 14px;
+  /* keeps the board square and thumb-friendly without getting huge on tablets */
+  max-width: 340px;
+}
+
+.game-cell {
+  aspect-ratio: 1;
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  font-family: 'Playfair Display', serif;
+  font-size: 34px;
+  color: var(--horizon);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
+}
+.game-cell:not(.locked):active { background: var(--surface-3); border-color: var(--horizon); }
+.game-cell.locked { cursor: default; }
+.game-cell.filled span { animation: pop 0.24s var(--ease) both; display: block; }
+.game-cell.win {
+  border-color: var(--moonlight);
+  background: color-mix(in srgb, var(--moonlight) 12%, var(--surface));
+  color: var(--moonlight);
+}
+.game-cell.placing { border-color: var(--horizon); }
+
+.game-actions { display: flex; gap: 10px; margin-bottom: 12px; }
+.game-actions button { flex: 1; }
+
+.game-paused { border-color: rgba(224, 144, 111, 0.28); }
+
+/* ---------- Modal errors & offline ---------- */
+.modal-error { color: var(--horizon); font-size: 12.5px; min-height: 16px; }
+
+.offline-banner {
+  position: fixed;
+  left: 50%;
+  top: 0;
+  transform: translateX(-50%);
+  width: min(460px, 100%);
+  background: var(--surface-3);
+  border-bottom: 1px solid var(--border-strong);
+  color: var(--text-dim);
+  font-size: 11.5px;
+  text-align: center;
+  padding: calc(6px + env(safe-area-inset-top)) 12px 6px;
+  z-index: 95;
+  animation: rise 0.24s var(--ease) both;
+}
 
 /* ---------- Privacy blur ---------- */
 body.privacy-blur img,

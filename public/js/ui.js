@@ -68,6 +68,119 @@ export function hideToast() {
   if (el) el.className = 'toast';
 }
 
+// ---------- modal form ----------
+// Replaces window.prompt(), which renders a passphrase in plain sight, can't be
+// styled, and is suppressed entirely in some installed-PWA contexts.
+// Resolves to an object of field values, or null if dismissed.
+export function promptModal({ title, note, fields, submitLabel = 'Save' }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'sheet-backdrop';
+    wrap.innerHTML = `
+      <div class="sheet">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-title">${title}</div>
+        <div class="sheet-form">
+          ${note ? `<p class="fine-print" style="margin:0 0 4px;">${note}</p>` : ''}
+          ${fields
+            .map(
+              (f) => `
+            ${f.label ? `<div class="eyebrow" style="margin:4px 0 0;">${f.label}</div>` : ''}
+            <input
+              type="${f.type || 'text'}"
+              id="pm-${f.name}"
+              placeholder="${f.placeholder || ''}"
+              value="${String(f.value ?? '').replace(/"/g, '&quot;')}"
+              ${f.type === 'password' ? 'autocomplete="off"' : ''}
+              ${f.inputmode ? `inputmode="${f.inputmode}"` : ''}
+            />`
+            )
+            .join('')}
+          <div class="modal-error" id="pm-error"></div>
+          <button class="btn-primary" id="pm-submit">${submitLabel}</button>
+          <button class="btn-ghost" data-cancel>Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    setTimeout(() => wrap.classList.add('open'), 0);
+
+    let settled = false;
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      wrap.classList.remove('open');
+      setTimeout(() => wrap.remove(), 200);
+      resolve(value);
+    };
+
+    wrap.onclick = (e) => {
+      if (e.target === wrap || e.target.hasAttribute('data-cancel')) finish(null);
+    };
+
+    const submit = () => {
+      const values = {};
+      for (const f of fields) {
+        const el = wrap.querySelector(`#pm-${f.name}`);
+        values[f.name] = el.value;
+        if (f.required && !el.value.trim()) {
+          wrap.querySelector('#pm-error').textContent = `${f.label || 'This'} is required.`;
+          el.focus();
+          return;
+        }
+        if (f.minLength && el.value.length < f.minLength) {
+          wrap.querySelector('#pm-error').textContent = `Needs at least ${f.minLength} characters.`;
+          el.focus();
+          return;
+        }
+      }
+      finish(values);
+    };
+
+    wrap.querySelector('#pm-submit').onclick = submit;
+    wrap.querySelectorAll('.sheet-form input').forEach((el) => {
+      el.onkeydown = (e) => {
+        if (e.key === 'Enter') submit();
+      };
+    });
+    const first = wrap.querySelector('.sheet-form input');
+    if (first) first.focus();
+  });
+}
+
+// A styled replacement for window.confirm() on the flows where a native dialog
+// looks jarring. Resolves true/false.
+export function confirmModal({ title, body, confirmLabel = 'Confirm', danger = false }) {
+  return new Promise((resolve) => {
+    const wrap = document.createElement('div');
+    wrap.className = 'sheet-backdrop';
+    wrap.innerHTML = `
+      <div class="sheet">
+        <div class="sheet-grabber"></div>
+        <div class="sheet-title">${title}</div>
+        <div class="sheet-form">
+          ${body ? `<p class="body-dim" style="margin:0 0 6px;">${body}</p>` : ''}
+          <button class="${danger ? 'btn-danger' : 'btn-primary'}" id="cm-yes">${confirmLabel}</button>
+          <button class="btn-ghost" data-cancel>Cancel</button>
+        </div>
+      </div>`;
+    document.body.appendChild(wrap);
+    setTimeout(() => wrap.classList.add('open'), 0);
+
+    let settled = false;
+    const finish = (v) => {
+      if (settled) return;
+      settled = true;
+      wrap.classList.remove('open');
+      setTimeout(() => wrap.remove(), 200);
+      resolve(v);
+    };
+    wrap.onclick = (e) => {
+      if (e.target === wrap || e.target.hasAttribute('data-cancel')) finish(false);
+    };
+    wrap.querySelector('#cm-yes').onclick = () => finish(true);
+  });
+}
+
 // ---------- lightbox ----------
 // Full-screen photo viewer with pinch-zoom, drag-to-pan and double-tap zoom.
 // Written against raw touch events rather than a library: it's ~60 lines, and
@@ -82,7 +195,9 @@ export function openLightbox(src) {
   document.body.appendChild(wrap);
   const img = wrap.querySelector('.lightbox-img');
   img.src = src;
-  requestAnimationFrame(() => wrap.classList.add('open'));
+  // setTimeout rather than rAF — see the note in app.js openSheet(); rAF is
+  // suspended on non-compositing pages, which would leave this fully transparent.
+  setTimeout(() => wrap.classList.add('open'), 0);
 
   let scale = 1;
   let tx = 0;

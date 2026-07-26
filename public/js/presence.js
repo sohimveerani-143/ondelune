@@ -9,7 +9,11 @@
 // isn't wanted, presence can be turned off in Settings and nothing is written.
 import { db, ensureSignedIn, doc, setDoc, onSnapshot, collection } from './firebase.js';
 
-const TYPING_WINDOW_MS = 5000;
+// Tuned for a responsive "typing…" without hammering Firestore. The window is
+// short so a stalled indicator self-clears fast; the throttle is well under the
+// window so a steady typist keeps it alive with one write per second.
+const TYPING_WINDOW_MS = 3500;
+const TYPING_THROTTLE_MS = 900;
 const HEARTBEAT_MS = 45000;
 
 let heartbeatTimer = null;
@@ -42,7 +46,7 @@ export function stopHeartbeat() {
 // Throttled so a fast typist doesn't generate a write per keystroke.
 export async function signalTyping(roomId) {
   const now = Date.now();
-  if (now - lastTypingWrite < 2000) return;
+  if (now - lastTypingWrite < TYPING_THROTTLE_MS) return;
   lastTypingWrite = now;
   try {
     const user = await ensureSignedIn();
@@ -71,20 +75,95 @@ export async function clearTyping(roomId) {
 }
 
 // Reports on the PARTNER only — your own presence is never shown back to you.
+//
+// The important subtlety: `typingUntil` is a moment in the future, so whether
+// someone "is typing" changes with the clock, not just with new data. Snapshots
+// only arrive when the doc is written, so if they stopped typing without another
+// write, a purely snapshot-driven view would show "typing…" forever. We therefore
+// re-evaluate locally with a timer set to fire exactly when the window lapses.
 export function listenPartnerPresence(roomId, partnerUid, onPresence) {
   if (!partnerUid) return () => {};
-  return onSnapshot(
+  let expiryTimer = null;
+  let latest = null;
+
+  const emit = () => {
+    if (expiryTimer) {
+      clearTimeout(expiryTimer);
+      expiryTimer = null;
+    }
+    const now = Date.now();
+    if (!latest) return onPresence({ online: false, typing: false, lastSeen: null, inGame: false, gameSeen: null });
+
+    const typing = !!latest.typingUntil && latest.typingUntil > now;
+    onPresence({
+      online: !!latest.lastSeen && now - latest.lastSeen < HEARTBEAT_MS * 2,
+      typing,
+      lastSeen: latest.lastSeen || null,
+      inGame: !!latest.gameActive && !!latest.gameSeen && now - latest.gameSeen < GAME_AWAY_MS,
+      gameSeen: latest.gameSeen || null,
+    });
+    if (typing) {
+      expiryTimer = setTimeout(emit, latest.typingUntil - now + 50);
+    }
+  };
+
+  const unsub = onSnapshot(
     doc(db, 'rooms', roomId, 'presence', partnerUid),
     (snap) => {
-      const d = snap.data();
-      if (!d) return onPresence({ online: false, typing: false, lastSeen: null });
-      const now = Date.now();
-      onPresence({
-        online: !!d.lastSeen && now - d.lastSeen < HEARTBEAT_MS * 2,
-        typing: !!d.typingUntil && d.typingUntil > now,
-        lastSeen: d.lastSeen || null,
-      });
+      latest = snap.data() || null;
+      emit();
     },
-    () => onPresence({ online: false, typing: false, lastSeen: null })
+    () => {
+      latest = null;
+      emit();
+    }
   );
+
+  return () => {
+    if (expiryTimer) clearTimeout(expiryTimer);
+    unsub();
+  };
+}
+
+// ---------------- Game presence ----------------
+// The game needs a much faster "are they still here" signal than the chat's
+// 45s heartbeat, so it gets its own beat while the board is on screen.
+export const GAME_AWAY_MS = 22000;
+const GAME_BEAT_MS = 8000;
+let gameTimer = null;
+
+export async function startGamePresence(roomId) {
+  stopGamePresence();
+  const beat = async () => {
+    try {
+      const user = await ensureSignedIn();
+      await setDoc(
+        doc(db, 'rooms', roomId, 'presence', user.uid),
+        { uid: user.uid, lastSeen: Date.now(), gameActive: true, gameSeen: Date.now() },
+        { merge: true }
+      );
+    } catch (e) {
+      /* non-critical */
+    }
+  };
+  beat();
+  gameTimer = setInterval(beat, GAME_BEAT_MS);
+}
+
+// Called when leaving the board or backgrounding the app — flips the flag
+// immediately so the partner sees "stepped away" without waiting for a timeout.
+export async function stopGamePresence(roomId) {
+  if (gameTimer) clearInterval(gameTimer);
+  gameTimer = null;
+  if (!roomId) return;
+  try {
+    const user = await ensureSignedIn();
+    await setDoc(
+      doc(db, 'rooms', roomId, 'presence', user.uid),
+      { uid: user.uid, lastSeen: Date.now(), gameActive: false },
+      { merge: true }
+    );
+  } catch (e) {
+    /* non-critical */
+  }
 }

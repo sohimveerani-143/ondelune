@@ -16,12 +16,51 @@ import {
   orderBy,
   limit as fbLimit,
   serverTimestamp,
+  increment,
 } from './firebase.js';
 import { encryptJSON, decryptJSON } from './crypto.js';
 import { recordActivity } from './streak.js';
 
 function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
+}
+
+// ---------- Unread markers ----------
+// A per-section tally of how many things each person has added. This exists so
+// the UI can show unread badges by reading ~10 tiny documents, instead of
+// downloading every message and photo just to count what's new. Only counts and
+// a timestamp are stored — no content, so nothing here needs encrypting.
+export const SECTIONS = [
+  'thread', 'today', 'calendar', 'list', 'journal',
+  'letters', 'memories', 'expenses', 'savings', 'game', 'note',
+];
+
+async function bumpMarker(roomId, section) {
+  try {
+    const user = await ensureSignedIn();
+    await setDoc(
+      doc(db, 'rooms', roomId, 'markers', section),
+      { counts: { [user.uid]: increment(1) }, lastAt: Date.now(), lastBy: user.uid },
+      { merge: true }
+    );
+  } catch (e) {
+    // A missed badge must never break the thing the user actually did.
+  }
+}
+
+export function listenMarkers(roomId, onMarkers) {
+  return onSnapshot(
+    col(roomId, 'markers'),
+    (snap) => {
+      const out = {};
+      snap.docs.forEach((d) => {
+        const data = d.data() || {};
+        out[d.id] = { counts: data.counts || {}, lastAt: data.lastAt || 0, lastBy: data.lastBy || null };
+      });
+      onMarkers(out);
+    },
+    () => onMarkers({})
+  );
 }
 
 // ---------- Thread (shared messages) ----------
@@ -40,6 +79,7 @@ export async function sendThreadMessage(roomId, sharedKey, text, replyTo) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'thread');
 }
 
 // View-once photo: once the RECIPIENT opens it, the doc is deleted for both sides.
@@ -54,6 +94,7 @@ export async function sendThreadPhoto(roomId, sharedKey, base64Image, viewOnce) 
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'thread');
 }
 
 export async function deleteThreadMessage(roomId, messageId) {
@@ -75,6 +116,7 @@ export async function sendThreadVoice(roomId, sharedKey, base64Audio, durationSe
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'thread');
 }
 
 // Memory pinning: copies the message's content into its own collection so it
@@ -96,6 +138,7 @@ export async function pinMessageAsMemory(roomId, sharedKey, message) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await bumpMarker(roomId, 'memories');
 }
 
 export async function deleteMemory(roomId, memoryId) {
@@ -206,6 +249,7 @@ export async function setTodayMood(roomId, sharedKey, mood) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'today');
 }
 
 export function listenMood(roomId, sharedKey, onEntries) {
@@ -235,6 +279,7 @@ export async function addCalendarEvent(roomId, sharedKey, { title, dateTime }) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'calendar');
 }
 
 export function listenCalendar(roomId, sharedKey, onEvents) {
@@ -263,6 +308,7 @@ export async function addBucketItem(roomId, sharedKey, text) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'list');
 }
 
 export async function toggleBucketItem(roomId, sharedKey, itemId, currentText, currentDone) {
@@ -304,6 +350,7 @@ export async function setTodayPhoto(roomId, sharedKey, base64Jpeg) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'today');
 }
 
 export function listenPhotos(roomId, sharedKey, onPhotos, max = 14) {
@@ -336,15 +383,6 @@ export async function setTogetherSince(roomId, sharedKey, isoDate) {
   );
 }
 
-export async function setSavingsGoal(roomId, sharedKey, goalAmount, goalLabel) {
-  const current = await getRoomSettingsOnce(roomId, sharedKey);
-  const { ciphertext, nonce } = encryptJSON({ ...current, savingsGoal: goalAmount, savingsGoalLabel: goalLabel }, sharedKey);
-  await setDoc(
-    doc(db, 'rooms', roomId, 'meta', 'settings'),
-    { ciphertext, nonce },
-    { merge: true }
-  );
-}
 
 async function getRoomSettingsOnce(roomId, sharedKey) {
   const snap = await getDoc(doc(db, 'rooms', roomId, 'meta', 'settings'));
@@ -372,10 +410,22 @@ export function listenRoomSettings(roomId, sharedKey, onSettings) {
 // ---------- Expense tracker (shared, split expenses) ----------
 export const EXPENSE_CATEGORIES = ['General', 'Travel', 'Gifts', 'Food', 'Calls', 'Bills', 'Other'];
 
-export async function addExpense(roomId, sharedKey, { description, amount, paidBy, category }) {
+// This is a spend LOG, not a split-the-bill ledger. `spentBy` records whose
+// spending it was, so either of you can add an entry on the other's behalf
+// ("add this for me") — it is deliberately not a debt between you.
+// `at` is the moment the money was actually spent, which you can set yourself;
+// `createdAt` stays the moment it was logged, and the two are often different.
+export async function addExpense(roomId, sharedKey, { description, amount, spentBy, category, at }) {
   const user = await ensureSignedIn();
   const { ciphertext, nonce } = encryptJSON(
-    { description, amount, paidBy: paidBy || user.uid, category: category || 'General' },
+    {
+      description,
+      amount,
+      spentBy: spentBy || user.uid,
+      category: category || 'General',
+      at: at || new Date().toISOString(),
+      loggedBy: user.uid,
+    },
     sharedKey
   );
   await addDoc(col(roomId, 'expenses'), {
@@ -394,20 +444,25 @@ export function listenExpenses(roomId, sharedKey, onExpenses) {
   return onSnapshot(q, (snap) => {
     const expenses = snap.docs.map((d) => {
       const data = d.data();
-      let parsed = { description: '⚠️ Could not decrypt', amount: 0, paidBy: null };
+      let parsed = { description: '⚠️ Could not decrypt', amount: 0, spentBy: null };
       try {
         parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
       } catch (e) {
         /* skip */
       }
+      const createdAt = data.createdAt?.toDate?.() || new Date();
       return {
         id: d.id,
         description: parsed.description,
         amount: Number(parsed.amount) || 0,
-        paidBy: parsed.paidBy,
+        // `paidBy` is the old field name — read it so entries logged before the
+        // rename keep showing against the right person.
+        spentBy: parsed.spentBy || parsed.paidBy || null,
+        loggedBy: parsed.loggedBy || parsed.spentBy || parsed.paidBy || null,
         // Entries written before categories existed simply fall back to General.
         category: parsed.category || 'General',
-        createdAt: data.createdAt?.toDate?.() || new Date(),
+        at: parsed.at ? new Date(parsed.at) : createdAt,
+        createdAt,
       };
     });
     onExpenses(expenses);
@@ -507,6 +562,7 @@ export async function addJournalEntry(roomId, sharedKey, text) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'journal');
 }
 
 export async function deleteJournalEntry(roomId, entryId) {
@@ -550,18 +606,35 @@ export async function addLetter(roomId, sharedKey, { text, unlockAt }) {
     nonce,
     createdAt: serverTimestamp(),
   });
+  await bumpMarker(roomId, 'letters');
 }
 
 export async function deleteLetter(roomId, letterId) {
   await deleteDoc(doc(db, 'rooms', roomId, 'letters', letterId));
 }
 
+// Whether a letter is unlocked depends on the clock, not on new data — so a
+// purely snapshot-driven view would leave a letter sealed past its moment until
+// something else happened to write. We re-emit on a timer set to the next
+// unlock, so a letter opens the instant it's due even if the screen is just
+// sitting there.
 export function listenLetters(roomId, sharedKey, onLetters) {
   const q = query(col(roomId, 'letters'), orderBy('unlockAt', 'asc'));
-  return onSnapshot(q, (snap) => {
-    const letters = snap.docs.map((d) => {
-      const data = d.data();
-      const unlocked = new Date(data.unlockAt).getTime() <= Date.now();
+  let docsCache = [];
+  let timer = null;
+
+  const emit = () => {
+    if (timer) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    const now = Date.now();
+    let nextUnlockAt = Infinity;
+
+    const letters = docsCache.map(({ id, data }) => {
+      const at = new Date(data.unlockAt).getTime();
+      const unlocked = at <= now;
+      if (!unlocked && at < nextUnlockAt) nextUnlockAt = at;
       let text = null;
       if (unlocked) {
         try {
@@ -570,16 +643,26 @@ export function listenLetters(roomId, sharedKey, onLetters) {
           text = '⚠️ Could not decrypt';
         }
       }
-      return {
-        id: d.id,
-        senderUid: data.senderUid,
-        unlockAt: data.unlockAt,
-        unlocked,
-        text,
-      };
+      return { id, senderUid: data.senderUid, unlockAt: data.unlockAt, unlocked, text };
     });
     onLetters(letters);
+
+    if (nextUnlockAt !== Infinity) {
+      // setTimeout saturates past ~24.8 days, so cap the wait and re-check.
+      const wait = Math.min(nextUnlockAt - now + 250, 6 * 60 * 60 * 1000);
+      timer = setTimeout(emit, Math.max(500, wait));
+    }
+  };
+
+  const unsub = onSnapshot(q, (snap) => {
+    docsCache = snap.docs.map((d) => ({ id: d.id, data: d.data() }));
+    emit();
   });
+
+  return () => {
+    if (timer) clearTimeout(timer);
+    unsub();
+  };
 }
 
 // ---------- Nudges ----------
@@ -606,6 +689,7 @@ export async function sendNudge(roomId, sharedKey, nudgeId) {
     createdAt: serverTimestamp(),
   });
   await recordActivity(roomId);
+  await bumpMarker(roomId, 'note');
 }
 
 export function listenLatestNudge(roomId, sharedKey, onNudge) {
@@ -627,6 +711,47 @@ export function listenLatestNudge(roomId, sharedKey, onNudge) {
       createdAt: data.createdAt?.toDate?.() || new Date(),
     });
   });
+}
+
+// ---------- Home note ----------
+// A short line you leave on their Home screen. Each person writes only their own
+// doc, so there's no contention, and the cap is enforced here as well as in the
+// UI so a long note can't slip in another way.
+export const NOTE_MAX = 90;
+
+export async function setMyNote(roomId, sharedKey, text) {
+  const user = await ensureSignedIn();
+  const trimmed = String(text || '').slice(0, NOTE_MAX);
+  const { ciphertext, nonce } = encryptJSON({ text: trimmed }, sharedKey);
+  await setDoc(doc(db, 'rooms', roomId, 'notes', user.uid), {
+    ciphertext,
+    nonce,
+    updatedAt: Date.now(),
+  });
+  await bumpMarker(roomId, 'note');
+}
+
+export async function clearMyNote(roomId) {
+  const user = await ensureSignedIn();
+  await deleteDoc(doc(db, 'rooms', roomId, 'notes', user.uid));
+}
+
+export function listenNote(roomId, sharedKey, uid, onNote) {
+  if (!uid) return () => {};
+  return onSnapshot(
+    doc(db, 'rooms', roomId, 'notes', uid),
+    (snap) => {
+      const data = snap.data();
+      if (!data) return onNote(null);
+      try {
+        const parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+        onNote({ text: parsed.text || '', updatedAt: data.updatedAt || null });
+      } catch (e) {
+        onNote(null);
+      }
+    },
+    () => onNote(null)
+  );
 }
 
 // ---------- Archive export ----------
@@ -688,25 +813,50 @@ export async function buildRoomArchive(roomId, sharedKey) {
 // ---------- Profile pictures ----------
 // Stored per-uid so each person only ever writes their own; both are readable
 // by both members under the same room rules as everything else.
-export async function setMyAvatar(roomId, sharedKey, base64Image) {
+// The profile doc holds several fields (avatar, gender), all inside one
+// ciphertext — so every write has to read-modify-write, or setting one field
+// would silently wipe the other.
+async function readMyProfile(roomId, sharedKey, uid) {
+  try {
+    const snap = await getDoc(doc(db, 'rooms', roomId, 'profiles', uid));
+    const data = snap.data();
+    if (!data) return {};
+    return decryptJSON(data.ciphertext, data.nonce, sharedKey) || {};
+  } catch (e) {
+    return {};
+  }
+}
+
+async function writeMyProfile(roomId, sharedKey, patch) {
   const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ avatar: base64Image }, sharedKey);
+  const current = await readMyProfile(roomId, sharedKey, user.uid);
+  const { ciphertext, nonce } = encryptJSON({ ...current, ...patch }, sharedKey);
   await setDoc(doc(db, 'rooms', roomId, 'profiles', user.uid), { ciphertext, nonce });
 }
 
-export function listenProfiles(roomId, sharedKey, memberUids, onProfiles) {
+export async function setMyAvatar(roomId, sharedKey, base64Image) {
+  await writeMyProfile(roomId, sharedKey, { avatar: base64Image });
+}
+
+// Shared so the partner's hero scene can draw you the way you describe yourself.
+export async function setMyGender(roomId, sharedKey, gender) {
+  await writeMyProfile(roomId, sharedKey, { gender });
+}
+
+// Calls back with (uid, profile) where profile is { avatar, gender }.
+export function listenProfiles(roomId, sharedKey, memberUids, onProfile) {
   const unsubs = memberUids.map((uid) =>
     onSnapshot(doc(db, 'rooms', roomId, 'profiles', uid), (snap) => {
       const data = snap.data();
-      let avatar = null;
+      let profile = {};
       if (data) {
         try {
-          avatar = decryptJSON(data.ciphertext, data.nonce, sharedKey).avatar;
+          profile = decryptJSON(data.ciphertext, data.nonce, sharedKey) || {};
         } catch (e) {
-          /* skip */
+          /* leave empty rather than breaking the caller */
         }
       }
-      onProfiles(uid, avatar);
+      onProfile(uid, profile);
     })
   );
   return () => unsubs.forEach((u) => u());
