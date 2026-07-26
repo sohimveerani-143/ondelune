@@ -10,9 +10,9 @@ import {
 } from './pairing.js';
 import * as RoomData from './room-data.js';
 import { fileToCompressedBase64 } from './image-utils.js';
-import { auth, ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
+import { ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
-import { setUpRecovery, recoverFromEmail, refreshRecoveryBackup } from './auth-recovery.js';
+import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
 
 const root = document.getElementById('app');
@@ -22,13 +22,6 @@ let activeTab = 'home';
 let unsubscribers = [];
 let lastKnownUid = null;
 let lastHiddenAt = null;
-
-let globalUnsubscribers = [];
-let threadMessages = [];
-let unreadCount = 0;
-let partnerPresence = null;
-let lastReadTimeLocal = Number(localStorage.getItem('lastReadTime')) || 0;
-let typingTimeout = null;
 
 function clearListeners() {
   unsubscribers.forEach((u) => u());
@@ -138,9 +131,6 @@ function renderRecoverStep() {
     if (!email || !password) return;
     try {
       const recovered = await recoverFromEmail(email, password);
-      // signInWithEmailAndPassword (inside recoverFromEmail) restored the original UID.
-      // Update lastKnownUid so Firestore rule checks and senderUid comparisons work.
-      lastKnownUid = auth.currentUser.uid;
       identity = await saveIdentity({ ...recovered, recoveryEmail: email, pending: null });
       continueAfterUnlock();
     } catch (e) {
@@ -338,7 +328,7 @@ function renderWaitingScreen(pairingId) {
     const roomId = await finalizeRoomAsCreator({
       myPublicKey: identity.publicKey,
       partnerPublicKey: data.joinerPublicKey,
-      myUid: lastKnownUid,
+      myUid: data.creatorUid,
       partnerUid: data.joinerUid,
     });
     identity = await updateIdentity({
@@ -350,9 +340,6 @@ function renderWaitingScreen(pairingId) {
       pending: null,
     });
     sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
-    // Refresh the recovery backup so it includes the pairing data.
-    // Without this, recovering the account would lose the pairing.
-    refreshRecoveryBackup(identity).catch((e) => console.warn('Could not refresh recovery backup:', e));
     renderMain();
   });
   unsubscribers.push(unsub);
@@ -386,8 +373,6 @@ function renderJoinScreen(pairingId) {
         pending: null,
       });
       sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
-      // Refresh the recovery backup so it includes the pairing data.
-      refreshRecoveryBackup(identity).catch((e) => console.warn('Could not refresh recovery backup:', e));
       history.replaceState(null, '', window.location.pathname);
       renderMain();
     } catch (e) {
@@ -399,59 +384,15 @@ function renderJoinScreen(pairingId) {
 // ---------------- Main app shell ----------------
 function renderMain() {
   clearListeners();
-  if (globalUnsubscribers.length === 0) {
-    setupGlobalListeners();
-  }
   root.innerHTML = `<div id="screen-slot"></div>${navHTML()}`;
   bindNav();
   renderTab(activeTab);
 }
 
-function setupGlobalListeners() {
-  globalUnsubscribers.push(RoomData.listenPresence(identity.roomId, sharedKey, identity.partnerUid, (presence) => {
-    partnerPresence = presence;
-    const typingEl = document.getElementById('typing-indicator');
-    if (typingEl) {
-      if (presence?.isTyping) {
-        typingEl.textContent = `${identity.partnerName || 'They'} is typing...`;
-      } else if (presence && (Date.now() - new Date(presence.updatedAt).getTime() < 60000)) {
-        typingEl.textContent = 'Online';
-      } else {
-        typingEl.textContent = '';
-      }
-    }
-  }));
-
-  globalUnsubscribers.push(RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
-    threadMessages = messages;
-    unreadCount = messages.filter(m => m.senderUid !== lastKnownUid && new Date(m.createdAt).getTime() > lastReadTimeLocal).length;
-    
-    if (activeTab === 'thread') {
-      lastReadTimeLocal = Date.now();
-      localStorage.setItem('lastReadTime', lastReadTimeLocal);
-      unreadCount = 0;
-      renderThreadContent(document.getElementById('thread-list'), messages);
-    }
-    updateNavBadge();
-  }));
-}
-
-function updateNavBadge() {
-  const badgeEl = document.getElementById('chat-badge');
-  if (badgeEl) {
-    if (unreadCount > 0) {
-      badgeEl.textContent = unreadCount > 9 ? '9+' : unreadCount;
-      badgeEl.style.display = 'flex';
-    } else {
-      badgeEl.style.display = 'none';
-    }
-  }
-}
-
 function navHTML() {
   const tabs = [
     { id: 'home', label: 'Home', icon: iconHome() },
-    { id: 'thread', label: 'Chat', icon: iconThread() + '<div id="chat-badge" class="nav-badge" style="display:none;"></div>' },
+    { id: 'thread', label: 'Chat', icon: iconThread() },
     { id: 'today', label: 'Today', icon: iconToday() },
     { id: 'calendar', label: 'Calendar', icon: iconCalendar() },
     { id: 'list', label: 'List', icon: iconList() },
@@ -471,12 +412,6 @@ function bindNav() {
       activeTab = btn.dataset.tab;
       document.querySelectorAll('.nav button').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
-      if (activeTab === 'thread') {
-        lastReadTimeLocal = Date.now();
-        localStorage.setItem('lastReadTime', lastReadTimeLocal);
-        unreadCount = 0;
-        updateNavBadge();
-      }
       renderTab(activeTab);
     };
   });
@@ -494,13 +429,50 @@ function renderTab(tab) {
 }
 
 // ---------------- Home ----------------
-function heroSceneSVG() {
-  // Original SVG recreation (not a copy of any reference image) of a moonlit
-  // ocean horizon — the app's one signature visual. `data-mood="calm"` is a
-  // hook for a later feature: swapping the two shore figures for closer poses
-  // when one or both partners are feeling low, without rebuilding the scene.
+function figuresGroupSVG(moodState) {
+  // left figure = you, right figure = partner, by convention.
+  if (moodState === 'meLow') {
+    return `
+      <ellipse cx="192" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(8 192 198)"/>
+      <circle cx="197" cy="182" r="6" fill="#161029"/>
+      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="208" cy="178" r="6" fill="#161029"/>`;
+  }
+  if (moodState === 'themLow') {
+    return `
+      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="188" cy="178" r="6" fill="#161029"/>
+      <ellipse cx="204" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(-8 204 198)"/>
+      <circle cx="199" cy="182" r="6" fill="#161029"/>`;
+  }
+  if (moodState === 'bothLow') {
+    return `
+      <ellipse cx="193" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(6 193 198)"/>
+      <circle cx="197" cy="183" r="6" fill="#161029"/>
+      <ellipse cx="203" cy="198" rx="10" ry="13" fill="#161029" transform="rotate(-6 203 198)"/>
+      <circle cx="199" cy="183" r="6" fill="#161029"/>`;
+  }
   return `
-  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="calm">
+      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="188" cy="178" r="6" fill="#161029"/>
+      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
+      <circle cx="208" cy="178" r="6" fill="#161029"/>`;
+}
+
+function heroCaptionFor(moodState) {
+  if (moodState === 'meLow') return 'Lean on them a little today.';
+  if (moodState === 'themLow') return 'They could use you close today.';
+  if (moodState === 'bothLow') return 'A quiet day. You have each other.';
+  return 'Two shores, one sky.';
+}
+
+function heroSceneSVG(moodState = 'calm') {
+  // Original SVG recreation (not a copy of any reference image) of a moonlit
+  // ocean horizon — the app's one signature visual. The two shore figures
+  // reposition based on today's moods: closer and leaning when one or both
+  // of you are feeling low, upright and apart when things are calm.
+  return `
+  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="${moodState}">
     <defs>
       <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" stop-color="#1b1533"/>
@@ -522,29 +494,29 @@ function heroSceneSVG() {
     <circle class="hero-moon" cx="200" cy="58" r="22" fill="#f3d9a8"/>
     <polygon points="185,150 215,150 230,220 170,220" fill="#f3d9a8" opacity="0.14"/>
     <path d="M0,150 Q40,145 80,150 T160,150 T240,150 T320,150 T400,150 V158 Q360,153 320,158 T240,158 T160,158 T80,158 T0,158 Z" fill="#241c40" opacity="0.5"/>
-    <g class="figures">
-      <ellipse cx="188" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="188" cy="178" r="6" fill="#161029"/>
-      <ellipse cx="208" cy="196" rx="10" ry="14" fill="#161029"/>
-      <circle cx="208" cy="178" r="6" fill="#161029"/>
-    </g>
+    <g class="figures">${figuresGroupSVG(moodState)}</g>
   </svg>`;
 }
 
 function renderHome(slot) {
   slot.innerHTML = `
     <div class="screen">
-      <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-        <div>
+      <div style="display:flex; justify-content:space-between; align-items:flex-start; gap:12px;">
+        <div class="avatar-stack" id="avatar-stack">
+          <div class="avatar-circle mine" id="avatar-mine">${escapeHTML((identity.displayName || '?')[0])}</div>
+          <div class="avatar-circle theirs" id="avatar-theirs">${escapeHTML((identity.partnerName || '?')[0])}</div>
+        </div>
+        <div style="flex:1;">
           <div class="eyebrow">Tidelight</div>
           <h1 style="margin-bottom:16px;">Evening, ${escapeHTML(identity.displayName)}</h1>
         </div>
         <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
       </div>
+      <input type="file" accept="image/*" id="avatar-input" style="display:none;" />
 
-      <div class="hero-scene">
+      <div class="hero-scene" id="hero-scene">
         ${heroSceneSVG()}
-        <div class="hero-caption">Two shores, one sky.</div>
+        <div class="hero-caption" id="hero-caption">Two shores, one sky.</div>
       </div>
 
       <div class="card">
@@ -584,6 +556,31 @@ function renderHome(slot) {
   `;
 
   document.getElementById('settings-btn').onclick = () => renderSettings();
+
+  // Profile pictures — tapping your own circle lets you set/change it.
+  document.getElementById('avatar-mine').onclick = () => document.getElementById('avatar-input').click();
+  document.getElementById('avatar-input').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const compressed = await fileToCompressedBase64(file, { maxDim: 300, quality: 0.75 });
+    await RoomData.setMyAvatar(identity.roomId, sharedKey, compressed);
+  };
+
+  if (identity.partnerUid) {
+    const unsubProfiles = RoomData.listenProfiles(
+      identity.roomId,
+      sharedKey,
+      [lastKnownUid, identity.partnerUid],
+      (uid, avatar) => {
+        const targetId = uid === lastKnownUid ? 'avatar-mine' : 'avatar-theirs';
+        const el = document.getElementById(targetId);
+        if (!el || !avatar) return;
+        el.style.backgroundImage = `url(${avatar})`;
+        el.textContent = '';
+      }
+    );
+    unsubscribers.push(unsubProfiles);
+  }
 
   function tick() {
     const now = new Date();
@@ -644,6 +641,24 @@ function renderHome(slot) {
     });
     unsubscribers.push(unsubStreak);
   }
+
+  // Mood-reactive hero scene — reflects today's check-ins from the Today tab.
+  const unsubHeroMood = RoomData.listenMood(identity.roomId, sharedKey, (entries) => {
+    const todayKey = new Date().toISOString().slice(0, 10);
+    const mine = entries.find((e) => e.date === todayKey && e.senderUid === lastKnownUid);
+    const theirs = entries.find((e) => e.date === todayKey && e.senderUid !== lastKnownUid);
+    const myLow = mine && LOW_MOODS.includes(mine.mood);
+    const theirLow = theirs && LOW_MOODS.includes(theirs.mood);
+    let moodState = 'calm';
+    if (myLow && theirLow) moodState = 'bothLow';
+    else if (myLow) moodState = 'meLow';
+    else if (theirLow) moodState = 'themLow';
+
+    const heroEl = document.getElementById('hero-scene');
+    const captionEl = document.getElementById('hero-caption');
+    if (heroEl) heroEl.innerHTML = heroSceneSVG(moodState) + `<div class="hero-caption" id="hero-caption">${heroCaptionFor(moodState)}</div>`;
+  });
+  unsubscribers.push(unsubHeroMood);
 }
 
 // ---------------- Settings ----------------
@@ -838,181 +853,120 @@ function renderRecoverySetupFromSettings() {
 }
 
 // ---------------- Thread ----------------
+let mediaRecorder = null;
+let recordedChunks = [];
+let recordingStartedAt = null;
+
 function renderThread(slot) {
   slot.innerHTML = `
     <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
-      <div class="eyebrow" style="display:flex; justify-content:space-between; align-items:center;">
-        <span>Just the two of you</span>
-        <span id="typing-indicator" style="color:var(--horizon); font-size:11px; text-transform:none; letter-spacing:normal;"></span>
-      </div>
+      <div class="eyebrow">Just the two of you</div>
       <h2 style="margin-bottom:12px;">Chat</h2>
       <div class="thread-list" id="thread-list" style="flex:1; overflow-y:auto;"></div>
       <div class="composer">
-        <label class="btn-icon" style="cursor:pointer;" title="Send Photo">
+        <label class="btn-icon" style="cursor:pointer;">
           ${iconPhoto()}
           <input type="file" accept="image/*" id="photo-attach" style="display:none;" />
         </label>
-        <button class="btn-icon" id="mic-btn" title="Voice Note">${iconMic()}</button>
-        <button class="btn-icon" id="letter-btn" title="Write a Letter">${iconLetter()}</button>
+        <button class="btn-icon" id="mic-btn" aria-label="Record voice note">${iconMic()}</button>
         <input type="text" id="thread-input" placeholder="Say something quiet..." />
         <button id="thread-send">Send</button>
       </div>
     </div>
   `;
   const listEl = document.getElementById('thread-list');
-  renderThreadContent(listEl, threadMessages); // render cached messages immediately
 
-  // presence update for typing indicator
-  if (partnerPresence) {
-    const typingEl = document.getElementById('typing-indicator');
-    if (typingEl) {
-      if (partnerPresence.isTyping) {
-        typingEl.textContent = `${identity.partnerName || 'They'} is typing...`;
-      } else if (Date.now() - new Date(partnerPresence.updatedAt).getTime() < 60000) {
-        typingEl.textContent = 'Online';
-      }
+  const unsub = RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
+    if (messages.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">Nothing here yet. Say hello.</div>`;
+      return;
     }
-  }
+    listEl.innerHTML = messages
+      .map((m, idx) => {
+        const mine = m.senderUid === lastKnownUid;
+        const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
+        const pinBtn = `<span class="bubble-pin" data-pin-idx="${idx}" title="Save as a memory">${iconPinSmall()}</span>`;
+        const sendingTag = mine && m.pending
+          ? `<div class="sending-tag"><span class="sending-dot"></span> Sending…</div>`
+          : '';
+
+        if (m.type === 'photo') {
+          return `<div>
+            <div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}">
+              ${deleteBtn}${pinBtn}
+              <img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
+              ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}
+            </div>${sendingTag}
+          </div>`;
+        }
+        if (m.type === 'voice') {
+          return `<div>
+            <div class="bubble ${mine ? 'me' : 'them'} voice-bubble" data-idx="${idx}">
+              ${deleteBtn}${pinBtn}
+              <button class="voice-play-btn" data-idx="${idx}">${iconPlay()}</button>
+              <span>Voice note · ${m.audioDuration || 0}s</span>
+            </div>${sendingTag}
+          </div>`;
+        }
+        return `<div>
+          <div class="bubble ${mine ? 'me' : 'them'}">${deleteBtn}${pinBtn}${escapeHTML(m.text)}</div>${sendingTag}
+        </div>`;
+      })
+      .join('');
+    listEl.scrollTop = listEl.scrollHeight;
+
+    listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
+      img.onclick = () => {
+        const idx = Number(img.dataset.idx);
+        const message = messages[idx];
+        img.classList.remove('blurred');
+        img.parentElement.querySelector('.view-once-tag')?.remove();
+        setTimeout(() => {
+          RoomData.deleteThreadMessage(identity.roomId, message.id);
+        }, 6000);
+      };
+    });
+
+    listEl.querySelectorAll('.voice-play-btn').forEach((btn) => {
+      btn.onclick = () => {
+        const idx = Number(btn.dataset.idx);
+        const message = messages[idx];
+        if (!message.audio) return;
+        const audio = new Audio(message.audio);
+        audio.play();
+      };
+    });
+
+    listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.deleteIdx);
+        const message = messages[idx];
+        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
+          RoomData.deleteThreadMessage(identity.roomId, message.id);
+        }
+      };
+    });
+
+    listEl.querySelectorAll('.bubble-pin').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const idx = Number(btn.dataset.pinIdx);
+        const message = messages[idx];
+        RoomData.pinMessageAsMemory(identity.roomId, sharedKey, message);
+        btn.textContent = '✓';
+      };
+    });
+  });
+  unsubscribers.push(unsub);
 
   const input = document.getElementById('thread-input');
-  
-  input.oninput = () => {
-    RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: true, lastReadTime: Date.now() });
-    clearTimeout(typingTimeout);
-    typingTimeout = setTimeout(() => {
-      RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: false, lastReadTime: Date.now() });
-    }, 2000);
-  };
-
   const send = async () => {
     const text = input.value.trim();
     if (!text) return;
-    const original = text;
     input.value = '';
-    clearTimeout(typingTimeout);
-    RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: false, lastReadTime: Date.now() });
-    try {
-      await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
-    } catch (err) {
-      console.error('Failed to send message:', err);
-      input.value = original; // restore so the user doesn't lose their text
-      const sendBtn = document.getElementById('thread-send');
-      if (sendBtn) {
-        sendBtn.textContent = 'Failed — retry';
-        setTimeout(() => { if (sendBtn) sendBtn.textContent = 'Send'; }, 3000);
-      }
-    }
+    await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
   };
-  document.getElementById('thread-send').onclick = send;
-  input.onkeydown = (e) => {
-    if (e.key === 'Enter') send();
-  };
-
-  document.getElementById('photo-attach').onchange = async (e) => {
-    const file = e.target.files[0];
-    if (!file) return;
-    const viewOnce = confirm('Send as view-once? It will disappear once opened.\\n\\nOK = view-once, Cancel = normal photo');
-    const compressed = await fileToCompressedBase64(file);
-    await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
-    e.target.value = '';
-  };
-
-  document.getElementById('mic-btn').onclick = () => renderVoiceRecorder();
-  document.getElementById('letter-btn').onclick = () => renderLetterComposer();
-}
-
-function renderThreadContent(listEl, messages) {
-  if (!listEl) return;
-  if (messages.length === 0) {
-    listEl.innerHTML = `<div class="empty-state">Nothing here yet. Say hello.</div>`;
-    return;
-  }
-  
-  const formatter = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
-  
-  listEl.innerHTML = messages
-    .map((m, idx) => {
-      const mine = m.senderUid === lastKnownUid;
-      const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
-      const timeStr = formatter.format(new Date(m.createdAt));
-      const timeTag = `<div class="bubble-time">${timeStr}</div>`;
-      
-      const reactionBadge = Object.keys(m.reactions || {}).length > 0 ? 
-        `<div class="bubble-reactions" data-idx="${idx}">` + 
-        Object.values(m.reactions).join('') + 
-        `</div>` : '';
-
-      const content = m.type === 'photo' ? 
-        `<img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
-         ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}` :
-        m.type === 'audio' ? 
-        `<audio controls src="${m.audio}" class="thread-audio"></audio>` :
-        m.type === 'letter' ?
-        `<div class="thread-letter" data-idx="${idx}">${iconLetter()} <span>Open Letter</span></div>` :
-        escapeHTML(m.text);
-
-      return `<div class="bubble-wrapper ${mine ? 'me' : 'them'}" data-idx="${idx}">
-        <div class="bubble ${mine ? 'me' : 'them'} ${m.type === 'photo' ? 'photo-bubble' : ''}" data-idx="${idx}">
-          ${deleteBtn}
-          ${content}
-          ${reactionBadge}
-        </div>
-        ${timeTag}
-      </div>`;
-    })
-    .join('');
-    
-  listEl.scrollTop = listEl.scrollHeight;
-
-  // View-once photo logic
-  listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
-    img.onclick = () => {
-      const idx = Number(img.dataset.idx);
-      const message = messages[idx];
-      img.classList.remove('blurred');
-      img.parentElement.querySelector('.view-once-tag')?.remove();
-      setTimeout(() => {
-        RoomData.deleteThreadMessage(identity.roomId, message.id);
-      }, 6000);
-    };
-  });
-
-  // Letter opening logic
-  listEl.querySelectorAll('.thread-letter').forEach((el) => {
-    el.onclick = () => {
-      const idx = Number(el.dataset.idx);
-      const message = messages[idx];
-      renderReadLetter(message.text, message.createdAt);
-    };
-  });
-
-  // Delete logic
-  listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
-    btn.onclick = (e) => {
-      e.stopPropagation();
-      const idx = Number(btn.dataset.deleteIdx);
-      const message = messages[idx];
-      if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
-        RoomData.deleteThreadMessage(identity.roomId, message.id);
-      }
-    };
-  });
-
-  // Reaction logic (dblclick to like)
-  listEl.querySelectorAll('.bubble-wrapper').forEach((wrapper) => {
-    let lastTap = 0;
-    wrapper.addEventListener('click', (e) => {
-      const now = Date.now();
-      if (now - lastTap < 300) { // double tap
-        e.preventDefault();
-        const idx = Number(wrapper.dataset.idx);
-        const message = messages[idx];
-        RoomData.toggleThreadReaction(identity.roomId, sharedKey, message.id, message.originalObj, lastKnownUid, '❤️');
-      }
-      lastTap = now;
-    });
-  });
-}
   document.getElementById('thread-send').onclick = send;
   input.onkeydown = (e) => {
     if (e.key === 'Enter') send();
@@ -1026,10 +980,63 @@ function renderThreadContent(listEl, messages) {
     await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
     e.target.value = '';
   };
+
+  const micBtn = document.getElementById('mic-btn');
+  micBtn.onclick = async () => {
+    if (!navigator.mediaDevices || !window.MediaRecorder) {
+      alert("Voice recording isn't supported in this browser.");
+      return;
+    }
+    if (mediaRecorder && mediaRecorder.state === 'recording') {
+      mediaRecorder.stop();
+      return;
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+      recordedChunks = [];
+      mediaRecorder = new MediaRecorder(stream);
+      recordingStartedAt = Date.now();
+      micBtn.classList.add('mic-recording');
+
+      mediaRecorder.ondataavailable = (e) => recordedChunks.push(e.data);
+      mediaRecorder.onstop = async () => {
+        micBtn.classList.remove('mic-recording');
+        stream.getTracks().forEach((t) => t.stop());
+        const durationSeconds = Math.round((Date.now() - recordingStartedAt) / 1000);
+        const blob = new Blob(recordedChunks, { type: 'audio/webm' });
+        if (blob.size > 900 * 1024) {
+          alert('That voice note is too long to send — try keeping it under a minute.');
+          return;
+        }
+        const base64 = await new Promise((resolve, reject) => {
+          const reader = new FileReader();
+          reader.onload = () => resolve(reader.result);
+          reader.onerror = reject;
+          reader.readAsDataURL(blob);
+        });
+        await RoomData.sendThreadVoice(identity.roomId, sharedKey, base64, durationSeconds);
+      };
+
+      mediaRecorder.start();
+      // Safety cap: auto-stop at 60 seconds so the encrypted doc stays well under the size limit.
+      setTimeout(() => {
+        if (mediaRecorder && mediaRecorder.state === 'recording') mediaRecorder.stop();
+      }, 60000);
+    } catch (e) {
+      alert("Couldn't access the microphone. Check your browser's permission settings.");
+    }
+  };
 }
 
 // ---------------- Today (Check-in + Play) ----------------
-const MOODS = ['😊', '😌', '😴', '😔', '😤', '🥰'];
+const MOODS = [
+  { emoji: '😄', label: 'Great' },
+  { emoji: '🙂', label: 'Good' },
+  { emoji: '😐', label: 'Okay' },
+  { emoji: '😔', label: 'Low' },
+  { emoji: '😢', label: 'Really low' },
+];
+const LOW_MOODS = ['😔', '😢'];
 
 function renderToday(slot) {
   slot.innerHTML = `
@@ -1039,7 +1046,12 @@ function renderToday(slot) {
       <div class="card">
         <div class="eyebrow">Your mood</div>
         <div class="mood-picker" id="mood-picker">
-          ${MOODS.map((m) => `<div class="mood-option" data-mood="${m}">${m}</div>`).join('')}
+          ${MOODS.map(
+            (m) => `<div class="mood-option" data-mood="${m.emoji}">
+              <div>${m.emoji}</div>
+              <div style="font-size:9.5px; color:var(--text-dim); margin-top:2px;">${m.label}</div>
+            </div>`
+          ).join('')}
         </div>
       </div>
       <div class="card" id="partner-mood-card">
@@ -1208,6 +1220,16 @@ function renderMore(slot) {
           <div class="shortcut-tile-label">Journal</div>
           <div class="shortcut-tile-caption">Longer thoughts, shared</div>
         </div>
+        <div class="shortcut-tile" id="tile-letters">
+          ${iconLetter()}
+          <div class="shortcut-tile-label">Letters</div>
+          <div class="shortcut-tile-caption">Written now, opened later</div>
+        </div>
+        <div class="shortcut-tile" id="tile-memories">
+          ${iconMemory()}
+          <div class="shortcut-tile-label">Memories</div>
+          <div class="shortcut-tile-caption">Pinned from Chat</div>
+        </div>
         <div class="shortcut-tile" id="tile-settings">
           ${iconSettings()}
           <div class="shortcut-tile-label">Settings</div>
@@ -1219,7 +1241,116 @@ function renderMore(slot) {
   document.getElementById('tile-expense').onclick = () => renderExpenseTracker();
   document.getElementById('tile-savings').onclick = () => renderSavingsTracker();
   document.getElementById('tile-journal').onclick = () => renderJournal();
+  document.getElementById('tile-letters').onclick = () => renderLetters();
+  document.getElementById('tile-memories').onclick = () => renderMemories();
   document.getElementById('tile-settings').onclick = () => renderSettings();
+}
+
+function renderLetters() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Written now, opened later</div>
+      <h2 style="margin-bottom:14px;">Letters</h2>
+      <div class="card">
+        <textarea id="letter-text" rows="4" placeholder="Write something for them to find later..." style="resize:vertical; margin-bottom:8px;"></textarea>
+        <div class="eyebrow">Unlocks on</div>
+        <input type="date" id="letter-unlock" style="margin-bottom:10px;" />
+        <button class="btn-primary" id="add-letter-btn">Seal it</button>
+        <p style="font-size:11.5px; color:var(--text-dim); margin-top:8px;">
+          The date is an honor-system reveal between just the two of you — the letter itself
+          stays properly encrypted either way, only the app's own screen won't show the words until then.
+        </p>
+      </div>
+      <div id="letter-list"></div>
+      <button class="btn-secondary" id="back-more-btn">Back</button>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+  document.getElementById('add-letter-btn').onclick = async () => {
+    const text = document.getElementById('letter-text').value.trim();
+    const unlockDate = document.getElementById('letter-unlock').value;
+    if (!text || !unlockDate) return;
+    await RoomData.addLetter(identity.roomId, sharedKey, {
+      text,
+      unlockAt: new Date(unlockDate).toISOString(),
+    });
+    document.getElementById('letter-text').value = '';
+    document.getElementById('letter-unlock').value = '';
+  };
+
+  const unsub = RoomData.listenLetters(identity.roomId, sharedKey, (letters) => {
+    const listEl = document.getElementById('letter-list');
+    if (letters.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">No letters yet</div>`;
+      return;
+    }
+    listEl.innerHTML = `<div class="card">${letters
+      .map((l, idx) => {
+        if (!l.unlocked) {
+          return `<div class="letter-row">
+            <div class="letter-locked">🔒 Sealed until ${new Date(l.unlockAt).toLocaleDateString()}</div>
+          </div>`;
+        }
+        return `<div class="letter-row" data-idx="${idx}">
+          <div>${escapeHTML(l.text)}</div>
+          <div class="journal-meta">
+            ${l.senderUid === lastKnownUid ? 'From you' : `From ${escapeHTML(identity.partnerName || 'them')}`} · opened
+            ${l.senderUid === lastKnownUid ? ' · <span class="letter-delete" data-idx="' + idx + '" style="cursor:pointer; text-decoration:underline;">delete</span>' : ''}
+          </div>
+        </div>`;
+      })
+      .join('')}</div>`;
+
+    listEl.querySelectorAll('.letter-delete').forEach((btn) => {
+      btn.onclick = () => {
+        const letter = letters[Number(btn.dataset.idx)];
+        if (confirm('Delete this letter?')) RoomData.deleteLetter(identity.roomId, letter.id);
+      };
+    });
+  });
+  unsubscribers.push(unsub);
+}
+
+function renderMemories() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="eyebrow">Pinned from Chat</div>
+      <h2 style="margin-bottom:14px;">Memories</h2>
+      <div id="memories-list"></div>
+      <button class="btn-secondary" id="back-more-btn">Back</button>
+    </div>
+  `;
+  document.getElementById('back-more-btn').onclick = () => renderMain();
+
+  const unsub = RoomData.listenMemories(identity.roomId, sharedKey, (memories) => {
+    const listEl = document.getElementById('memories-list');
+    if (memories.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">Nothing pinned yet — tap the pin icon on any message in Chat</div>`;
+      return;
+    }
+    listEl.innerHTML = memories
+      .map((m, idx) => {
+        let body = '';
+        if (m.type === 'photo') body = `<img src="${m.image}" style="width:100%; border-radius:13px;" />`;
+        else if (m.type === 'voice') body = `<div>Voice note · ${m.audioDuration || 0}s</div>`;
+        else body = `<div>${escapeHTML(m.text)}</div>`;
+        return `<div class="card" data-idx="${idx}">
+          ${body}
+          <div class="journal-meta">${m.createdAt.toLocaleDateString()} · <span class="memory-delete" data-idx="${idx}" style="cursor:pointer; text-decoration:underline;">unpin</span></div>
+        </div>`;
+      })
+      .join('');
+
+    listEl.querySelectorAll('.memory-delete').forEach((btn) => {
+      btn.onclick = () => {
+        const memory = memories[Number(btn.dataset.idx)];
+        RoomData.deleteMemory(identity.roomId, memory.id);
+      };
+    });
+  });
+  unsubscribers.push(unsub);
 }
 
 // ---------------- Expense tracker ----------------
@@ -1461,110 +1592,8 @@ function escapeHTML(str) {
   return div.innerHTML;
 }
 
-let mediaRecorder = null;
-let audioChunks = [];
-
-function renderVoiceRecorder() {
-  const slot = document.getElementById('screen-slot');
-  slot.innerHTML = `
-    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px); justify-content:center; align-items:center;">
-      <h2>Voice Note</h2>
-      <div id="recorder-status" style="margin:20px 0; font-size:14px; color:var(--text-dim);">Tap to start</div>
-      <button class="btn-primary" id="record-btn" style="width:80px; height:80px; border-radius:40px; margin-bottom:20px;">${iconMic()}</button>
-      <button class="btn-ghost" id="record-cancel">Cancel</button>
-    </div>
-  `;
-
-  const btn = document.getElementById('record-btn');
-  const status = document.getElementById('recorder-status');
-  let isRecording = false;
-
-  document.getElementById('record-cancel').onclick = () => {
-    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
-    renderTab('thread');
-  };
-
-  btn.onclick = async () => {
-    if (!isRecording) {
-      try {
-        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-        mediaRecorder = new MediaRecorder(stream);
-        audioChunks = [];
-        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
-        mediaRecorder.onstop = async () => {
-          stream.getTracks().forEach(track => track.stop());
-          if (audioChunks.length === 0) return;
-          const blob = new Blob(audioChunks, { type: 'audio/webm' });
-          const reader = new FileReader();
-          reader.readAsDataURL(blob);
-          reader.onloadend = async () => {
-            await RoomData.sendThreadAudio(identity.roomId, sharedKey, reader.result);
-            renderTab('thread');
-          };
-        };
-        mediaRecorder.start();
-        isRecording = true;
-        btn.style.background = 'red';
-        btn.innerHTML = 'Stop';
-        status.textContent = 'Recording...';
-      } catch (err) {
-        alert('Could not access microphone: ' + err.message);
-      }
-    } else {
-      mediaRecorder.stop();
-      isRecording = false;
-      status.textContent = 'Processing...';
-      btn.style.display = 'none';
-    }
-  };
-}
-
-function renderLetterComposer() {
-  const slot = document.getElementById('screen-slot');
-  slot.innerHTML = `
-    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
-      <div class="eyebrow">Write a Letter</div>
-      <textarea id="letter-input" class="card" style="flex:1; background:transparent; border:none; resize:none; font-family:'Playfair Display', serif; font-size:18px; line-height:1.6; padding:0; margin-top:20px; color:inherit; outline:none;" placeholder="Dear..."></textarea>
-      <div style="display:flex; gap:12px; margin-top:12px;">
-        <button class="btn-ghost" id="letter-cancel" style="flex:1;">Cancel</button>
-        <button class="btn-primary" id="letter-send" style="flex:1;">Seal & Send</button>
-      </div>
-    </div>
-  `;
-  document.getElementById('letter-cancel').onclick = () => renderTab('thread');
-  document.getElementById('letter-send').onclick = async () => {
-    const text = document.getElementById('letter-input').value.trim();
-    if (!text) return;
-    await RoomData.sendThreadLetter(identity.roomId, sharedKey, text);
-    renderTab('thread');
-  };
-}
-
-function renderReadLetter(text, dateStr) {
-  const slot = document.getElementById('screen-slot');
-  const d = new Date(dateStr);
-  slot.innerHTML = `
-    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
-      <div style="display:flex; justify-content:space-between; margin-bottom:20px; color:var(--text-dim); font-size:14px;">
-        <button id="letter-back" style="background:none; border:none; color:inherit; font:inherit; cursor:pointer; padding:0; text-decoration:underline;">Back</button>
-        <span>${d.toLocaleDateString()}</span>
-      </div>
-      <div class="card" style="flex:1; overflow-y:auto; padding:30px 20px; font-family:'Playfair Display', serif; font-size:18px; line-height:1.8; background:#f4f0e6; color:#2a2626; text-shadow:none;">
-        ${escapeHTML(text).replace(/\\n/g, '<br/>')}
-      </div>
-    </div>
-  `;
-  document.getElementById('letter-back').onclick = () => renderTab('thread');
-}
-
 function iconHome() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v9a1 1 0 001 1h4v-6h4v6h4a1 1 0 001-1v-9"/></svg>';
-}
-function iconMic() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><path d="M12 2a3 3 0 00-3 3v7a3 3 0 006 0V5a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/></svg>';
-}
-function iconLetter() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><path d="M22 6l-10 7L2 6"/></svg>';
 }
 function iconThread() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M21 11.5a8.5 8.5 0 01-8.5 8.5H4l1.6-3.7A8.5 8.5 0 1121 11.5z"/></svg>';
@@ -1595,6 +1624,21 @@ function iconSavings() {
 }
 function iconJournal() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M6 4h9a2 2 0 012 2v14l-4-2-4 2-4-2-2 2V6a2 2 0 012-2z"/><path d="M9 9h6M9 13h4"/></svg>';
+}
+function iconMic() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0014 0M12 18v3"/></svg>';
+}
+function iconPlay() {
+  return '<svg viewBox="0 0 24 24" fill="currentColor" width="14" height="14"><path d="M7 5l12 7-12 7z"/></svg>';
+}
+function iconPinSmall() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="11" height="11"><path d="M12 2v6M8 8h8l2 8H6z"/><path d="M9 16l-2 6M15 16l2 6"/></svg>';
+}
+function iconLetter() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="3" y="5" width="18" height="14" rx="2"/><path d="M3 7l9 6 9-6"/></svg>';
+}
+function iconMemory() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M12 21s-7-4.4-9.5-8.8C.7 8.4 2.6 5 6 5c2 0 3.3 1 4 2 0.7-1 2-2 4-2 3.4 0 5.3 3.4 3.5 7.2C19 16.6 12 21 12 21z"/></svg>';
 }
 
 // ---------------- Photo privacy: blur on background, auto-lock on return ----------------

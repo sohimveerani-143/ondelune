@@ -22,35 +22,6 @@ function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
 }
 
-// ---------- Presence ----------
-export async function updatePresence(roomId, sharedKey, payload) {
-  const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON(payload, sharedKey);
-  await setDoc(doc(db, 'rooms', roomId, 'presence', user.uid), {
-    ciphertext,
-    nonce,
-    updatedAt: serverTimestamp(),
-  }, { merge: true });
-}
-
-export function listenPresence(roomId, sharedKey, partnerUid, onPresence) {
-  if (!partnerUid) return () => {};
-  return onSnapshot(doc(db, 'rooms', roomId, 'presence', partnerUid), (snap) => {
-    const data = snap.data();
-    if (!data) return onPresence(null);
-    let parsed = {};
-    try {
-      parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
-    } catch (e) {
-      /* ignore */
-    }
-    onPresence({
-      ...parsed,
-      updatedAt: data.updatedAt?.toDate?.() || new Date(),
-    });
-  });
-}
-
 // ---------- Thread (shared messages) ----------
 export async function sendThreadMessage(roomId, sharedKey, text) {
   const user = await ensureSignedIn();
@@ -78,49 +49,81 @@ export async function sendThreadPhoto(roomId, sharedKey, base64Image, viewOnce) 
   await recordActivity(roomId);
 }
 
-export async function sendThreadAudio(roomId, sharedKey, base64Audio) {
-  const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ type: 'audio', audio: base64Audio }, sharedKey);
-  await addDoc(col(roomId, 'thread'), {
-    senderUid: user.uid,
-    ciphertext,
-    nonce,
-    createdAt: serverTimestamp(),
-  });
-  await recordActivity(roomId);
-}
-
-export async function sendThreadLetter(roomId, sharedKey, text) {
-  const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ type: 'letter', text }, sharedKey);
-  await addDoc(col(roomId, 'thread'), {
-    senderUid: user.uid,
-    ciphertext,
-    nonce,
-    createdAt: serverTimestamp(),
-  });
-  await recordActivity(roomId);
-}
-
 export async function deleteThreadMessage(roomId, messageId) {
   await deleteDoc(doc(db, 'rooms', roomId, 'thread', messageId));
 }
 
-export async function toggleThreadReaction(roomId, sharedKey, messageId, messageCurrentObj, myUid, reactionStr) {
-  const newReactions = { ...(messageCurrentObj.reactions || {}) };
-  if (newReactions[myUid] === reactionStr) {
-    delete newReactions[myUid];
-  } else {
-    newReactions[myUid] = reactionStr;
-  }
-  const newObj = { ...messageCurrentObj, reactions: newReactions };
-  const { ciphertext, nonce } = encryptJSON(newObj, sharedKey);
-  await updateDoc(doc(db, 'rooms', roomId, 'thread', messageId), { ciphertext, nonce });
+// Voice notes: same encrypt-then-store pattern as photos, capped client-side
+// to keep the encrypted doc comfortably under Firestore's 1MB limit.
+export async function sendThreadVoice(roomId, sharedKey, base64Audio, durationSeconds) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON(
+    { type: 'voice', audio: base64Audio, audioDuration: durationSeconds },
+    sharedKey
+  );
+  await addDoc(col(roomId, 'thread'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
+// Memory pinning: copies the message's content into its own collection so it
+// survives independently of the original (which may later be deleted).
+export async function pinMessageAsMemory(roomId, sharedKey, message) {
+  const { ciphertext, nonce } = encryptJSON(
+    {
+      type: message.type,
+      text: message.text,
+      image: message.image,
+      audio: message.audio,
+      audioDuration: message.audioDuration,
+      originalSenderUid: message.senderUid,
+    },
+    sharedKey
+  );
+  await addDoc(col(roomId, 'memories'), {
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function deleteMemory(roomId, memoryId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'memories', memoryId));
+}
+
+export function listenMemories(roomId, sharedKey, onMemories) {
+  const q = query(col(roomId, 'memories'), orderBy('createdAt', 'desc'));
+  return onSnapshot(q, (snap) => {
+    const memories = snap.docs.map((d) => {
+      const data = d.data();
+      let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
+      try {
+        parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+      } catch (e) {
+        /* skip */
+      }
+      return {
+        id: d.id,
+        type: parsed.type,
+        text: parsed.text,
+        image: parsed.image,
+        audio: parsed.audio,
+        audioDuration: parsed.audioDuration,
+        originalSenderUid: parsed.originalSenderUid,
+        createdAt: data.createdAt?.toDate?.() || new Date(),
+      };
+    });
+    onMemories(memories);
+  });
 }
 
 export function listenThread(roomId, sharedKey, onMessages) {
   const q = query(col(roomId, 'thread'), orderBy('createdAt', 'asc'));
-  return onSnapshot(q, (snap) => {
+  return onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
     const messages = snap.docs.map((d) => {
       const data = d.data();
       let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
@@ -136,9 +139,9 @@ export function listenThread(roomId, sharedKey, onMessages) {
         text: parsed.text,
         image: parsed.image,
         audio: parsed.audio,
+        audioDuration: parsed.audioDuration,
         viewOnce: parsed.viewOnce,
-        reactions: parsed.reactions || {},
-        originalObj: parsed, // keep plaintext obj around for easy updates
+        pending: d.metadata.hasPendingWrites,
         createdAt: data.createdAt?.toDate?.() || new Date(),
       };
     });
@@ -437,4 +440,78 @@ export function listenJournal(roomId, sharedKey, onEntries) {
     });
     onEntries(entries);
   });
+}
+
+// ---------- Letters (write now, unlocks on a future date) ----------
+// Note: the "locked until" gate is enforced by the client's own UI, not by
+// cryptographic time-lock (that's a genuinely different, much heavier
+// primitive). The content is always properly encrypted; the date is an
+// honor-system reveal between the two of you, same as the rest of the app.
+export async function addLetter(roomId, sharedKey, { text, unlockAt }) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ text }, sharedKey);
+  await addDoc(col(roomId, 'letters'), {
+    senderUid: user.uid,
+    unlockAt,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+}
+
+export async function deleteLetter(roomId, letterId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'letters', letterId));
+}
+
+export function listenLetters(roomId, sharedKey, onLetters) {
+  const q = query(col(roomId, 'letters'), orderBy('unlockAt', 'asc'));
+  return onSnapshot(q, (snap) => {
+    const letters = snap.docs.map((d) => {
+      const data = d.data();
+      const unlocked = new Date(data.unlockAt).getTime() <= Date.now();
+      let text = null;
+      if (unlocked) {
+        try {
+          text = decryptJSON(data.ciphertext, data.nonce, sharedKey).text;
+        } catch (e) {
+          text = '⚠️ Could not decrypt';
+        }
+      }
+      return {
+        id: d.id,
+        senderUid: data.senderUid,
+        unlockAt: data.unlockAt,
+        unlocked,
+        text,
+      };
+    });
+    onLetters(letters);
+  });
+}
+
+// ---------- Profile pictures ----------
+// Stored per-uid so each person only ever writes their own; both are readable
+// by both members under the same room rules as everything else.
+export async function setMyAvatar(roomId, sharedKey, base64Image) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ avatar: base64Image }, sharedKey);
+  await setDoc(doc(db, 'rooms', roomId, 'profiles', user.uid), { ciphertext, nonce });
+}
+
+export function listenProfiles(roomId, sharedKey, memberUids, onProfiles) {
+  const unsubs = memberUids.map((uid) =>
+    onSnapshot(doc(db, 'rooms', roomId, 'profiles', uid), (snap) => {
+      const data = snap.data();
+      let avatar = null;
+      if (data) {
+        try {
+          avatar = decryptJSON(data.ciphertext, data.nonce, sharedKey).avatar;
+        } catch (e) {
+          /* skip */
+        }
+      }
+      onProfiles(uid, avatar);
+    })
+  );
+  return () => unsubs.forEach((u) => u());
 }

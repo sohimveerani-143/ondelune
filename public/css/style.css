@@ -467,70 +467,117 @@ body.privacy-blur img {
 .journal-entry:last-child { border-bottom: none; }
 .journal-meta { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
 
-/* Navigation Badge */
-.nav-badge {
-  background: var(--horizon);
-  color: var(--night);
-  font-size: 10px;
-  font-weight: bold;
-  height: 16px;
-  min-width: 16px;
-  border-radius: 8px;
+/* Stacked profile picture frames — "one above another" as requested */
+.avatar-stack {
+  position: relative;
+  width: 46px;
+  height: 70px;
+  flex-shrink: 0;
+}
+
+.avatar-circle {
+  width: 44px;
+  height: 44px;
+  border-radius: 50%;
+  background-size: cover;
+  background-position: center;
   display: flex;
   align-items: center;
   justify-content: center;
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  font-size: 17px;
+  color: var(--text);
   position: absolute;
-  top: 4px;
-  right: 14px;
-  padding: 0 4px;
+  left: 0;
+  border: 2px solid var(--night);
 }
-.nav button { position: relative; }
 
-/* Thread additions */
-.bubble-wrapper {
-  display: flex;
-  flex-direction: column;
-  margin-bottom: 8px;
+.avatar-circle.mine {
+  top: 0;
+  background: linear-gradient(135deg, var(--horizon), #f0a878);
+  border-color: var(--horizon);
+  z-index: 2;
+  cursor: pointer;
 }
-.bubble-wrapper.me { align-items: flex-end; }
-.bubble-wrapper.them { align-items: flex-start; }
 
-.bubble-time {
-  font-size: 10px;
+.avatar-circle.theirs {
+  top: 26px;
+  background: linear-gradient(135deg, #4a3560, #2e2148);
+  border-color: var(--moonlight);
+  z-index: 1;
+}
+
+/* Message sending status */
+.sending-tag {
+  font-size: 10.5px;
   color: var(--text-dim);
-  margin-top: 4px;
-  padding: 0 4px;
+  margin-top: 3px;
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.bubble-reactions {
-  position: absolute;
-  bottom: -10px;
-  right: 10px;
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 12px;
-  padding: 2px 6px;
-  font-size: 12px;
-  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
-}
-.bubble.me .bubble-reactions {
-  right: auto;
-  left: 10px;
+.sending-dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--text-dim);
+  animation: pulse-dot 1.2s ease-in-out infinite;
 }
 
-.thread-audio {
-  height: 36px;
-  border-radius: 18px;
-  outline: none;
-  max-width: 200px;
+@keyframes pulse-dot {
+  0%, 100% { opacity: 0.3; }
+  50% { opacity: 1; }
 }
 
-.thread-letter {
+/* Voice notes */
+.voice-bubble {
   display: flex;
   align-items: center;
   gap: 8px;
-  font-family: 'Playfair Display', serif;
-  font-style: italic;
-  font-size: 16px;
+  min-width: 140px;
+}
+
+.voice-bubble button {
+  background: rgba(0, 0, 0, 0.15);
+  color: inherit;
+  padding: 6px 10px;
+  border-radius: 50%;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.mic-recording {
+  color: var(--horizon) !important;
+  animation: pulse-dot 1s ease-in-out infinite;
+}
+
+/* Pin / memory button on bubbles */
+.bubble-pin {
+  position: absolute;
+  top: -8px;
+  left: -8px;
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  color: var(--moonlight);
+  font-size: 11px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
   cursor: pointer;
 }
+
+/* Letters */
+.letter-row {
+  padding: 12px 0;
+  border-bottom: 1px solid var(--border);
+}
+.letter-row:last-child { border-bottom: none; }
+.letter-locked { color: var(--text-dim); font-style: italic; }
