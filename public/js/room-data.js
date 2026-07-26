@@ -22,6 +22,35 @@ function col(roomId, name) {
   return collection(db, 'rooms', roomId, name);
 }
 
+// ---------- Presence ----------
+export async function updatePresence(roomId, sharedKey, payload) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON(payload, sharedKey);
+  await setDoc(doc(db, 'rooms', roomId, 'presence', user.uid), {
+    ciphertext,
+    nonce,
+    updatedAt: serverTimestamp(),
+  }, { merge: true });
+}
+
+export function listenPresence(roomId, sharedKey, partnerUid, onPresence) {
+  if (!partnerUid) return () => {};
+  return onSnapshot(doc(db, 'rooms', roomId, 'presence', partnerUid), (snap) => {
+    const data = snap.data();
+    if (!data) return onPresence(null);
+    let parsed = {};
+    try {
+      parsed = decryptJSON(data.ciphertext, data.nonce, sharedKey);
+    } catch (e) {
+      /* ignore */
+    }
+    onPresence({
+      ...parsed,
+      updatedAt: data.updatedAt?.toDate?.() || new Date(),
+    });
+  });
+}
+
 // ---------- Thread (shared messages) ----------
 export async function sendThreadMessage(roomId, sharedKey, text) {
   const user = await ensureSignedIn();
@@ -49,8 +78,44 @@ export async function sendThreadPhoto(roomId, sharedKey, base64Image, viewOnce) 
   await recordActivity(roomId);
 }
 
+export async function sendThreadAudio(roomId, sharedKey, base64Audio) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ type: 'audio', audio: base64Audio }, sharedKey);
+  await addDoc(col(roomId, 'thread'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
+export async function sendThreadLetter(roomId, sharedKey, text) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ type: 'letter', text }, sharedKey);
+  await addDoc(col(roomId, 'thread'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
 export async function deleteThreadMessage(roomId, messageId) {
   await deleteDoc(doc(db, 'rooms', roomId, 'thread', messageId));
+}
+
+export async function toggleThreadReaction(roomId, sharedKey, messageId, messageCurrentObj, myUid, reactionStr) {
+  const newReactions = { ...(messageCurrentObj.reactions || {}) };
+  if (newReactions[myUid] === reactionStr) {
+    delete newReactions[myUid];
+  } else {
+    newReactions[myUid] = reactionStr;
+  }
+  const newObj = { ...messageCurrentObj, reactions: newReactions };
+  const { ciphertext, nonce } = encryptJSON(newObj, sharedKey);
+  await updateDoc(doc(db, 'rooms', roomId, 'thread', messageId), { ciphertext, nonce });
 }
 
 export function listenThread(roomId, sharedKey, onMessages) {
@@ -70,7 +135,10 @@ export function listenThread(roomId, sharedKey, onMessages) {
         type: parsed.type || 'text',
         text: parsed.text,
         image: parsed.image,
+        audio: parsed.audio,
         viewOnce: parsed.viewOnce,
+        reactions: parsed.reactions || {},
+        originalObj: parsed, // keep plaintext obj around for easy updates
         createdAt: data.createdAt?.toDate?.() || new Date(),
       };
     });

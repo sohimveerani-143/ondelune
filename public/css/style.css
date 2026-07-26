@@ -466,3 +466,71 @@ body.privacy-blur img {
 }
 .journal-entry:last-child { border-bottom: none; }
 .journal-meta { font-size: 11px; color: var(--text-dim); margin-top: 6px; }
+
+/* Navigation Badge */
+.nav-badge {
+  background: var(--horizon);
+  color: var(--night);
+  font-size: 10px;
+  font-weight: bold;
+  height: 16px;
+  min-width: 16px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  position: absolute;
+  top: 4px;
+  right: 14px;
+  padding: 0 4px;
+}
+.nav button { position: relative; }
+
+/* Thread additions */
+.bubble-wrapper {
+  display: flex;
+  flex-direction: column;
+  margin-bottom: 8px;
+}
+.bubble-wrapper.me { align-items: flex-end; }
+.bubble-wrapper.them { align-items: flex-start; }
+
+.bubble-time {
+  font-size: 10px;
+  color: var(--text-dim);
+  margin-top: 4px;
+  padding: 0 4px;
+}
+
+.bubble-reactions {
+  position: absolute;
+  bottom: -10px;
+  right: 10px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 2px 6px;
+  font-size: 12px;
+  box-shadow: 0 2px 4px rgba(0,0,0,0.2);
+}
+.bubble.me .bubble-reactions {
+  right: auto;
+  left: 10px;
+}
+
+.thread-audio {
+  height: 36px;
+  border-radius: 18px;
+  outline: none;
+  max-width: 200px;
+}
+
+.thread-letter {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-family: 'Playfair Display', serif;
+  font-style: italic;
+  font-size: 16px;
+  cursor: pointer;
+}

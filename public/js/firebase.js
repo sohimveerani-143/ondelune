@@ -4,6 +4,7 @@ import {
   getAuth,
   signInAnonymously,
   signOut as firebaseSignOut,
+  onAuthStateChanged,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
   getFirestore,
@@ -42,12 +43,36 @@ export async function tryEnableOfflinePersistence() {
   }
 }
 
-export async function ensureSignedIn() {
-  if (!auth.currentUser) {
-    await signInAnonymously(auth);
+// Wait for Firebase Auth to finish restoring the persisted session.
+// onAuthStateChanged fires exactly once with the restored user (or null)
+// before any other auth events. Without this, auth.currentUser is null
+// during the brief window between SDK init and session restoration,
+// which causes signInAnonymously() to mint a brand-new UID.
+let authReadyPromise = null;
+function waitForAuthReady() {
+  if (!authReadyPromise) {
+    authReadyPromise = new Promise((resolve) => {
+      const unsub = onAuthStateChanged(auth, (user) => {
+        unsub();
+        resolve(user);
+      });
+    });
   }
-  return auth.currentUser;
+  return authReadyPromise;
 }
+
+export async function ensureSignedIn() {
+  let user = auth.currentUser;
+  if (!user) {
+    user = await waitForAuthReady();
+  }
+  if (!user) {
+    await signInAnonymously(auth);
+    user = auth.currentUser;
+  }
+  return user;
+}
+
 
 export async function signOutOfAccount() {
   await firebaseSignOut(auth);

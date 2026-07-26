@@ -10,9 +10,9 @@ import {
 } from './pairing.js';
 import * as RoomData from './room-data.js';
 import { fileToCompressedBase64 } from './image-utils.js';
-import { ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
+import { auth, ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
-import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
+import { setUpRecovery, recoverFromEmail, refreshRecoveryBackup } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
 
 const root = document.getElementById('app');
@@ -22,6 +22,13 @@ let activeTab = 'home';
 let unsubscribers = [];
 let lastKnownUid = null;
 let lastHiddenAt = null;
+
+let globalUnsubscribers = [];
+let threadMessages = [];
+let unreadCount = 0;
+let partnerPresence = null;
+let lastReadTimeLocal = Number(localStorage.getItem('lastReadTime')) || 0;
+let typingTimeout = null;
 
 function clearListeners() {
   unsubscribers.forEach((u) => u());
@@ -131,6 +138,9 @@ function renderRecoverStep() {
     if (!email || !password) return;
     try {
       const recovered = await recoverFromEmail(email, password);
+      // signInWithEmailAndPassword (inside recoverFromEmail) restored the original UID.
+      // Update lastKnownUid so Firestore rule checks and senderUid comparisons work.
+      lastKnownUid = auth.currentUser.uid;
       identity = await saveIdentity({ ...recovered, recoveryEmail: email, pending: null });
       continueAfterUnlock();
     } catch (e) {
@@ -328,7 +338,7 @@ function renderWaitingScreen(pairingId) {
     const roomId = await finalizeRoomAsCreator({
       myPublicKey: identity.publicKey,
       partnerPublicKey: data.joinerPublicKey,
-      myUid: data.creatorUid,
+      myUid: lastKnownUid,
       partnerUid: data.joinerUid,
     });
     identity = await updateIdentity({
@@ -340,6 +350,9 @@ function renderWaitingScreen(pairingId) {
       pending: null,
     });
     sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
+    // Refresh the recovery backup so it includes the pairing data.
+    // Without this, recovering the account would lose the pairing.
+    refreshRecoveryBackup(identity).catch((e) => console.warn('Could not refresh recovery backup:', e));
     renderMain();
   });
   unsubscribers.push(unsub);
@@ -373,6 +386,8 @@ function renderJoinScreen(pairingId) {
         pending: null,
       });
       sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
+      // Refresh the recovery backup so it includes the pairing data.
+      refreshRecoveryBackup(identity).catch((e) => console.warn('Could not refresh recovery backup:', e));
       history.replaceState(null, '', window.location.pathname);
       renderMain();
     } catch (e) {
@@ -384,15 +399,59 @@ function renderJoinScreen(pairingId) {
 // ---------------- Main app shell ----------------
 function renderMain() {
   clearListeners();
+  if (globalUnsubscribers.length === 0) {
+    setupGlobalListeners();
+  }
   root.innerHTML = `<div id="screen-slot"></div>${navHTML()}`;
   bindNav();
   renderTab(activeTab);
 }
 
+function setupGlobalListeners() {
+  globalUnsubscribers.push(RoomData.listenPresence(identity.roomId, sharedKey, identity.partnerUid, (presence) => {
+    partnerPresence = presence;
+    const typingEl = document.getElementById('typing-indicator');
+    if (typingEl) {
+      if (presence?.isTyping) {
+        typingEl.textContent = `${identity.partnerName || 'They'} is typing...`;
+      } else if (presence && (Date.now() - new Date(presence.updatedAt).getTime() < 60000)) {
+        typingEl.textContent = 'Online';
+      } else {
+        typingEl.textContent = '';
+      }
+    }
+  }));
+
+  globalUnsubscribers.push(RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
+    threadMessages = messages;
+    unreadCount = messages.filter(m => m.senderUid !== lastKnownUid && new Date(m.createdAt).getTime() > lastReadTimeLocal).length;
+    
+    if (activeTab === 'thread') {
+      lastReadTimeLocal = Date.now();
+      localStorage.setItem('lastReadTime', lastReadTimeLocal);
+      unreadCount = 0;
+      renderThreadContent(document.getElementById('thread-list'), messages);
+    }
+    updateNavBadge();
+  }));
+}
+
+function updateNavBadge() {
+  const badgeEl = document.getElementById('chat-badge');
+  if (badgeEl) {
+    if (unreadCount > 0) {
+      badgeEl.textContent = unreadCount > 9 ? '9+' : unreadCount;
+      badgeEl.style.display = 'flex';
+    } else {
+      badgeEl.style.display = 'none';
+    }
+  }
+}
+
 function navHTML() {
   const tabs = [
     { id: 'home', label: 'Home', icon: iconHome() },
-    { id: 'thread', label: 'Chat', icon: iconThread() },
+    { id: 'thread', label: 'Chat', icon: iconThread() + '<div id="chat-badge" class="nav-badge" style="display:none;"></div>' },
     { id: 'today', label: 'Today', icon: iconToday() },
     { id: 'calendar', label: 'Calendar', icon: iconCalendar() },
     { id: 'list', label: 'List', icon: iconList() },
@@ -412,6 +471,12 @@ function bindNav() {
       activeTab = btn.dataset.tab;
       document.querySelectorAll('.nav button').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
+      if (activeTab === 'thread') {
+        lastReadTimeLocal = Date.now();
+        localStorage.setItem('lastReadTime', lastReadTimeLocal);
+        unreadCount = 0;
+        updateNavBadge();
+      }
       renderTab(activeTab);
     };
   });
@@ -776,74 +841,178 @@ function renderRecoverySetupFromSettings() {
 function renderThread(slot) {
   slot.innerHTML = `
     <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
-      <div class="eyebrow">Just the two of you</div>
+      <div class="eyebrow" style="display:flex; justify-content:space-between; align-items:center;">
+        <span>Just the two of you</span>
+        <span id="typing-indicator" style="color:var(--horizon); font-size:11px; text-transform:none; letter-spacing:normal;"></span>
+      </div>
       <h2 style="margin-bottom:12px;">Chat</h2>
       <div class="thread-list" id="thread-list" style="flex:1; overflow-y:auto;"></div>
       <div class="composer">
-        <label class="btn-icon" style="cursor:pointer;">
+        <label class="btn-icon" style="cursor:pointer;" title="Send Photo">
           ${iconPhoto()}
           <input type="file" accept="image/*" id="photo-attach" style="display:none;" />
         </label>
+        <button class="btn-icon" id="mic-btn" title="Voice Note">${iconMic()}</button>
+        <button class="btn-icon" id="letter-btn" title="Write a Letter">${iconLetter()}</button>
         <input type="text" id="thread-input" placeholder="Say something quiet..." />
         <button id="thread-send">Send</button>
       </div>
     </div>
   `;
   const listEl = document.getElementById('thread-list');
+  renderThreadContent(listEl, threadMessages); // render cached messages immediately
 
-  const unsub = RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
-    if (messages.length === 0) {
-      listEl.innerHTML = `<div class="empty-state">Nothing here yet. Say hello.</div>`;
-      return;
+  // presence update for typing indicator
+  if (partnerPresence) {
+    const typingEl = document.getElementById('typing-indicator');
+    if (typingEl) {
+      if (partnerPresence.isTyping) {
+        typingEl.textContent = `${identity.partnerName || 'They'} is typing...`;
+      } else if (Date.now() - new Date(partnerPresence.updatedAt).getTime() < 60000) {
+        typingEl.textContent = 'Online';
+      }
     }
-    listEl.innerHTML = messages
-      .map((m, idx) => {
-        const mine = m.senderUid === lastKnownUid;
-        const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
-        if (m.type === 'photo') {
-          return `<div class="bubble ${mine ? 'me' : 'them'} photo-bubble" data-idx="${idx}">
-            ${deleteBtn}
-            <img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
-            ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}
-          </div>`;
-        }
-        return `<div class="bubble ${mine ? 'me' : 'them'}">${deleteBtn}${escapeHTML(m.text)}</div>`;
-      })
-      .join('');
-    listEl.scrollTop = listEl.scrollHeight;
-
-    listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
-      img.onclick = () => {
-        const idx = Number(img.dataset.idx);
-        const message = messages[idx];
-        img.classList.remove('blurred');
-        img.parentElement.querySelector('.view-once-tag')?.remove();
-        setTimeout(() => {
-          RoomData.deleteThreadMessage(identity.roomId, message.id);
-        }, 6000);
-      };
-    });
-
-    listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
-      btn.onclick = (e) => {
-        e.stopPropagation();
-        const idx = Number(btn.dataset.deleteIdx);
-        const message = messages[idx];
-        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
-          RoomData.deleteThreadMessage(identity.roomId, message.id);
-        }
-      };
-    });
-  });
-  unsubscribers.push(unsub);
+  }
 
   const input = document.getElementById('thread-input');
+  
+  input.oninput = () => {
+    RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: true, lastReadTime: Date.now() });
+    clearTimeout(typingTimeout);
+    typingTimeout = setTimeout(() => {
+      RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: false, lastReadTime: Date.now() });
+    }, 2000);
+  };
+
   const send = async () => {
     const text = input.value.trim();
     if (!text) return;
+    const original = text;
     input.value = '';
-    await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
+    clearTimeout(typingTimeout);
+    RoomData.updatePresence(identity.roomId, sharedKey, { isTyping: false, lastReadTime: Date.now() });
+    try {
+      await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
+    } catch (err) {
+      console.error('Failed to send message:', err);
+      input.value = original; // restore so the user doesn't lose their text
+      const sendBtn = document.getElementById('thread-send');
+      if (sendBtn) {
+        sendBtn.textContent = 'Failed — retry';
+        setTimeout(() => { if (sendBtn) sendBtn.textContent = 'Send'; }, 3000);
+      }
+    }
   };
+  document.getElementById('thread-send').onclick = send;
+  input.onkeydown = (e) => {
+    if (e.key === 'Enter') send();
+  };
+
+  document.getElementById('photo-attach').onchange = async (e) => {
+    const file = e.target.files[0];
+    if (!file) return;
+    const viewOnce = confirm('Send as view-once? It will disappear once opened.\\n\\nOK = view-once, Cancel = normal photo');
+    const compressed = await fileToCompressedBase64(file);
+    await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
+    e.target.value = '';
+  };
+
+  document.getElementById('mic-btn').onclick = () => renderVoiceRecorder();
+  document.getElementById('letter-btn').onclick = () => renderLetterComposer();
+}
+
+function renderThreadContent(listEl, messages) {
+  if (!listEl) return;
+  if (messages.length === 0) {
+    listEl.innerHTML = `<div class="empty-state">Nothing here yet. Say hello.</div>`;
+    return;
+  }
+  
+  const formatter = new Intl.DateTimeFormat(undefined, { hour: 'numeric', minute: '2-digit' });
+  
+  listEl.innerHTML = messages
+    .map((m, idx) => {
+      const mine = m.senderUid === lastKnownUid;
+      const deleteBtn = `<span class="bubble-delete" data-delete-idx="${idx}" title="Delete for both of you">×</span>`;
+      const timeStr = formatter.format(new Date(m.createdAt));
+      const timeTag = `<div class="bubble-time">${timeStr}</div>`;
+      
+      const reactionBadge = Object.keys(m.reactions || {}).length > 0 ? 
+        `<div class="bubble-reactions" data-idx="${idx}">` + 
+        Object.values(m.reactions).join('') + 
+        `</div>` : '';
+
+      const content = m.type === 'photo' ? 
+        `<img src="${m.image}" class="thread-photo ${m.viewOnce && !mine ? 'blurred' : ''}" data-idx="${idx}" />
+         ${m.viewOnce ? '<div class="view-once-tag">View once</div>' : ''}` :
+        m.type === 'audio' ? 
+        `<audio controls src="${m.audio}" class="thread-audio"></audio>` :
+        m.type === 'letter' ?
+        `<div class="thread-letter" data-idx="${idx}">${iconLetter()} <span>Open Letter</span></div>` :
+        escapeHTML(m.text);
+
+      return `<div class="bubble-wrapper ${mine ? 'me' : 'them'}" data-idx="${idx}">
+        <div class="bubble ${mine ? 'me' : 'them'} ${m.type === 'photo' ? 'photo-bubble' : ''}" data-idx="${idx}">
+          ${deleteBtn}
+          ${content}
+          ${reactionBadge}
+        </div>
+        ${timeTag}
+      </div>`;
+    })
+    .join('');
+    
+  listEl.scrollTop = listEl.scrollHeight;
+
+  // View-once photo logic
+  listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
+    img.onclick = () => {
+      const idx = Number(img.dataset.idx);
+      const message = messages[idx];
+      img.classList.remove('blurred');
+      img.parentElement.querySelector('.view-once-tag')?.remove();
+      setTimeout(() => {
+        RoomData.deleteThreadMessage(identity.roomId, message.id);
+      }, 6000);
+    };
+  });
+
+  // Letter opening logic
+  listEl.querySelectorAll('.thread-letter').forEach((el) => {
+    el.onclick = () => {
+      const idx = Number(el.dataset.idx);
+      const message = messages[idx];
+      renderReadLetter(message.text, message.createdAt);
+    };
+  });
+
+  // Delete logic
+  listEl.querySelectorAll('.bubble-delete').forEach((btn) => {
+    btn.onclick = (e) => {
+      e.stopPropagation();
+      const idx = Number(btn.dataset.deleteIdx);
+      const message = messages[idx];
+      if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
+        RoomData.deleteThreadMessage(identity.roomId, message.id);
+      }
+    };
+  });
+
+  // Reaction logic (dblclick to like)
+  listEl.querySelectorAll('.bubble-wrapper').forEach((wrapper) => {
+    let lastTap = 0;
+    wrapper.addEventListener('click', (e) => {
+      const now = Date.now();
+      if (now - lastTap < 300) { // double tap
+        e.preventDefault();
+        const idx = Number(wrapper.dataset.idx);
+        const message = messages[idx];
+        RoomData.toggleThreadReaction(identity.roomId, sharedKey, message.id, message.originalObj, lastKnownUid, '❤️');
+      }
+      lastTap = now;
+    });
+  });
+}
   document.getElementById('thread-send').onclick = send;
   input.onkeydown = (e) => {
     if (e.key === 'Enter') send();
@@ -1292,8 +1461,110 @@ function escapeHTML(str) {
   return div.innerHTML;
 }
 
+let mediaRecorder = null;
+let audioChunks = [];
+
+function renderVoiceRecorder() {
+  const slot = document.getElementById('screen-slot');
+  slot.innerHTML = `
+    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px); justify-content:center; align-items:center;">
+      <h2>Voice Note</h2>
+      <div id="recorder-status" style="margin:20px 0; font-size:14px; color:var(--text-dim);">Tap to start</div>
+      <button class="btn-primary" id="record-btn" style="width:80px; height:80px; border-radius:40px; margin-bottom:20px;">${iconMic()}</button>
+      <button class="btn-ghost" id="record-cancel">Cancel</button>
+    </div>
+  `;
+
+  const btn = document.getElementById('record-btn');
+  const status = document.getElementById('recorder-status');
+  let isRecording = false;
+
+  document.getElementById('record-cancel').onclick = () => {
+    if (mediaRecorder && mediaRecorder.state !== 'inactive') mediaRecorder.stop();
+    renderTab('thread');
+  };
+
+  btn.onclick = async () => {
+    if (!isRecording) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        mediaRecorder = new MediaRecorder(stream);
+        audioChunks = [];
+        mediaRecorder.ondataavailable = e => audioChunks.push(e.data);
+        mediaRecorder.onstop = async () => {
+          stream.getTracks().forEach(track => track.stop());
+          if (audioChunks.length === 0) return;
+          const blob = new Blob(audioChunks, { type: 'audio/webm' });
+          const reader = new FileReader();
+          reader.readAsDataURL(blob);
+          reader.onloadend = async () => {
+            await RoomData.sendThreadAudio(identity.roomId, sharedKey, reader.result);
+            renderTab('thread');
+          };
+        };
+        mediaRecorder.start();
+        isRecording = true;
+        btn.style.background = 'red';
+        btn.innerHTML = 'Stop';
+        status.textContent = 'Recording...';
+      } catch (err) {
+        alert('Could not access microphone: ' + err.message);
+      }
+    } else {
+      mediaRecorder.stop();
+      isRecording = false;
+      status.textContent = 'Processing...';
+      btn.style.display = 'none';
+    }
+  };
+}
+
+function renderLetterComposer() {
+  const slot = document.getElementById('screen-slot');
+  slot.innerHTML = `
+    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
+      <div class="eyebrow">Write a Letter</div>
+      <textarea id="letter-input" class="card" style="flex:1; background:transparent; border:none; resize:none; font-family:'Playfair Display', serif; font-size:18px; line-height:1.6; padding:0; margin-top:20px; color:inherit; outline:none;" placeholder="Dear..."></textarea>
+      <div style="display:flex; gap:12px; margin-top:12px;">
+        <button class="btn-ghost" id="letter-cancel" style="flex:1;">Cancel</button>
+        <button class="btn-primary" id="letter-send" style="flex:1;">Seal & Send</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('letter-cancel').onclick = () => renderTab('thread');
+  document.getElementById('letter-send').onclick = async () => {
+    const text = document.getElementById('letter-input').value.trim();
+    if (!text) return;
+    await RoomData.sendThreadLetter(identity.roomId, sharedKey, text);
+    renderTab('thread');
+  };
+}
+
+function renderReadLetter(text, dateStr) {
+  const slot = document.getElementById('screen-slot');
+  const d = new Date(dateStr);
+  slot.innerHTML = `
+    <div class="screen" style="display:flex; flex-direction:column; min-height:calc(100vh - 96px);">
+      <div style="display:flex; justify-content:space-between; margin-bottom:20px; color:var(--text-dim); font-size:14px;">
+        <button id="letter-back" style="background:none; border:none; color:inherit; font:inherit; cursor:pointer; padding:0; text-decoration:underline;">Back</button>
+        <span>${d.toLocaleDateString()}</span>
+      </div>
+      <div class="card" style="flex:1; overflow-y:auto; padding:30px 20px; font-family:'Playfair Display', serif; font-size:18px; line-height:1.8; background:#f4f0e6; color:#2a2626; text-shadow:none;">
+        ${escapeHTML(text).replace(/\\n/g, '<br/>')}
+      </div>
+    </div>
+  `;
+  document.getElementById('letter-back').onclick = () => renderTab('thread');
+}
+
 function iconHome() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M3 11l9-7 9 7"/><path d="M5 10v9a1 1 0 001 1h4v-6h4v6h4a1 1 0 001-1v-9"/></svg>';
+}
+function iconMic() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><path d="M12 2a3 3 0 00-3 3v7a3 3 0 006 0V5a3 3 0 00-3-3z"/><path d="M19 10v2a7 7 0 01-14 0v-2M12 19v4M8 23h8"/></svg>';
+}
+function iconLetter() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" width="20" height="20"><path d="M4 4h16c1.1 0 2 .9 2 2v12c0 1.1-.9 2-2 2H4c-1.1 0-2-.9-2-2V6c0-1.1.9-2 2-2z"/><path d="M22 6l-10 7L2 6"/></svg>';
 }
 function iconThread() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><path d="M21 11.5a8.5 8.5 0 01-8.5 8.5H4l1.6-3.7A8.5 8.5 0 1121 11.5z"/></svg>';
