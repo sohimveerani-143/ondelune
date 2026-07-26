@@ -14,7 +14,16 @@ import { ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from '.
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
 import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
-import { renderLoading, toast, countdownParts, pad2, relativeTime } from './ui.js';
+import {
+  renderLoading,
+  toast,
+  countdownParts,
+  pad2,
+  relativeTime,
+  openLightbox,
+  nextMilestone,
+} from './ui.js';
+import { encryptWithPassphrase, decryptWithPassphrase } from './crypto.js';
 import {
   startHeartbeat,
   stopHeartbeat,
@@ -620,6 +629,45 @@ function setUpGlobalListeners() {
     }
   });
   globalUnsubscribers.push(unsub);
+
+  // Nudges get their own watcher so a wordless ping still lands as a
+  // notification, and blooms on screen if you're already looking.
+  let nudgePrimed = false;
+  let lastNudgeId = null;
+  const unsubNudge = RoomData.listenLatestNudge(identity.roomId, sharedKey, (nudge) => {
+    if (!nudge) {
+      nudgePrimed = true;
+      return;
+    }
+    if (!nudgePrimed) {
+      nudgePrimed = true;
+      lastNudgeId = nudge.id;
+      return;
+    }
+    if (nudge.id === lastNudgeId) return;
+    lastNudgeId = nudge.id;
+    if (nudge.senderUid === lastKnownUid) return;
+
+    const n = RoomData.nudgeById(nudge.nudgeId);
+    const who = identity.partnerName || 'They';
+    if (document.hidden) {
+      showNotification(who, `${n.emoji} ${n.label}`);
+    } else {
+      bloomNudge(n.emoji);
+      toast(`${n.emoji} <strong>${escapeHTML(who)}</strong> · ${escapeHTML(n.label)}`);
+    }
+  });
+  globalUnsubscribers.push(unsubNudge);
+}
+
+// A brief full-screen bloom when a nudge arrives — the whole point is that it
+// feels like being tapped on the shoulder, not like another notification row.
+function bloomNudge(emoji) {
+  const el = document.createElement('div');
+  el.className = 'nudge-bloom';
+  el.textContent = emoji;
+  document.body.appendChild(el);
+  setTimeout(() => el.remove(), 1800);
 }
 
 function navHTML() {
@@ -856,7 +904,14 @@ function renderHome(slot) {
           <div class="mood-face" id="home-partner-mood">–</div>
         </div>
 
-        <div class="bento-tile span-2">
+        <button class="bento-tile span-2 tile-center nudge-tile" id="nudge-btn">
+          <div class="nudge-emoji">💭</div>
+          <div class="stat-caption">Send a nudge</div>
+        </button>
+
+        <div class="bento-tile span-4 milestone-tile" id="milestone-tile" hidden></div>
+
+        <div class="bento-tile span-4">
           <div class="eyebrow">Together since</div>
           <input type="date" id="together-since-input" />
         </div>
@@ -929,6 +984,23 @@ function renderHome(slot) {
     toast('Saved');
   };
 
+  document.getElementById('nudge-btn').onclick = () => {
+    openSheet('Send a nudge', [
+      ...RoomData.NUDGES.map((n) => ({
+        label: `${n.emoji}  ${n.label}`,
+        onClick: async () => {
+          try {
+            await RoomData.sendNudge(identity.roomId, sharedKey, n.id);
+            bloomNudge(n.emoji);
+            toast('Sent');
+          } catch (e) {
+            toast("Couldn't send that nudge");
+          }
+        },
+      })),
+    ]);
+  };
+
   unsubscribers.push(
     RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
       if (!settings.togetherSince) return;
@@ -938,6 +1010,22 @@ function renderHome(slot) {
       el.value = settings.togetherSince;
       const days = Math.floor((Date.now() - new Date(settings.togetherSince)) / 86400000);
       daysEl.textContent = days >= 0 ? days.toLocaleString() : '–';
+
+      const ms = nextMilestone(settings.togetherSince);
+      const tile = document.getElementById('milestone-tile');
+      if (tile && ms) {
+        tile.hidden = false;
+        tile.innerHTML = `
+          <div class="eyebrow">Coming up</div>
+          <div class="milestone-row">
+            <span class="milestone-label">${escapeHTML(ms.label)}</span>
+            <span class="milestone-away">${
+              ms.daysAway <= 0 ? 'today' : ms.daysAway === 1 ? 'tomorrow' : `in ${ms.daysAway} days`
+            }</span>
+          </div>`;
+      } else if (tile) {
+        tile.hidden = true;
+      }
     })
   );
 
@@ -1102,8 +1190,14 @@ function renderThread(slot) {
           <div class="chat-name">${escapeHTML(identity.partnerName || 'Them')}</div>
           <div class="chat-status" id="chat-status">&nbsp;</div>
         </div>
+        <button class="btn-icon" id="search-btn" aria-label="Search messages">${iconSearch()}</button>
         <div class="chat-lock" title="End-to-end encrypted">${iconLock()}</div>
       </header>
+
+      <div class="search-bar" id="search-bar" hidden>
+        <input type="text" id="search-input" placeholder="Search messages…" autocomplete="off" />
+        <button class="btn-ghost" id="search-close">Cancel</button>
+      </div>
 
       <div class="thread-list" id="thread-list"></div>
 
@@ -1112,6 +1206,14 @@ function renderThread(slot) {
       </div>
 
       <button class="scroll-down" id="scroll-down" hidden aria-label="Jump to latest">${iconChevronDown()}</button>
+
+      <div class="reply-bar" id="reply-bar" hidden>
+        <div class="reply-bar-body">
+          <div class="reply-bar-who" id="reply-bar-who"></div>
+          <div class="reply-bar-text" id="reply-bar-text"></div>
+        </div>
+        <button class="btn-icon" id="reply-cancel" aria-label="Cancel reply">&times;</button>
+      </div>
 
       <div class="composer">
         <label class="composer-attach" aria-label="Send a photo">
@@ -1171,19 +1273,141 @@ function renderThread(slot) {
     );
   }
 
+  // --- pagination + search + reply state ---
+  const PAGE = 60;
+  let threadLimit = PAGE;
+  let threadUnsub = null;
+  let allMessages = [];
+  let reachedStart = false;
+  let searchTerm = '';
+  let replyingTo = null;
   let firstPaint = true;
-  unsubscribers.push(
-    RoomData.listenThread(identity.roomId, sharedKey, (messages) => {
-      if (messages.length === 0) {
-        listEl.innerHTML = `<div class="empty-state">
-          <div class="empty-emoji">🌙</div>
-          Nothing here yet. Say hello.
-        </div>`;
+  let pendingScrollAnchor = null;
+
+  const searchBar = document.getElementById('search-bar');
+  const searchInput = document.getElementById('search-input');
+  const replyBar = document.getElementById('reply-bar');
+
+  document.getElementById('search-btn').onclick = () => {
+    searchBar.hidden = !searchBar.hidden;
+    if (!searchBar.hidden) searchInput.focus();
+    else {
+      searchTerm = '';
+      searchInput.value = '';
+      paintThread();
+    }
+  };
+  document.getElementById('search-close').onclick = () => {
+    searchBar.hidden = true;
+    searchTerm = '';
+    searchInput.value = '';
+    paintThread();
+  };
+  searchInput.oninput = () => {
+    searchTerm = searchInput.value.trim().toLowerCase();
+    paintThread();
+  };
+
+  document.getElementById('reply-cancel').onclick = () => setReplyTarget(null);
+
+  function setReplyTarget(message) {
+    replyingTo = message;
+    if (!message) {
+      replyBar.hidden = true;
+      return;
+    }
+    replyBar.hidden = false;
+    document.getElementById('reply-bar-who').textContent =
+      message.senderUid === lastKnownUid ? 'Replying to yourself' : `Replying to ${identity.partnerName || 'them'}`;
+    document.getElementById('reply-bar-text').textContent = snippetOf(message);
+    document.getElementById('thread-input').focus();
+  }
+
+  function subscribeThread() {
+    if (threadUnsub) threadUnsub();
+    threadUnsub = RoomData.listenThread(
+      identity.roomId,
+      sharedKey,
+      (messages, meta) => {
+        allMessages = messages;
+        reachedStart = meta.reachedStart;
+        paintThread();
+      },
+      threadLimit
+    );
+    unsubscribers.push(() => threadUnsub && threadUnsub());
+  }
+
+  function paintThread() {
+    const messages = allMessages;
+    if (messages.length === 0) {
+      listEl.innerHTML = `<div class="empty-state">
+        <div class="empty-emoji">🌙</div>
+        Nothing here yet. Say hello.
+      </div>`;
+      return;
+    }
+
+    // Search mode renders a flat result list instead of the conversation.
+    if (searchTerm) {
+      const hits = messages
+        .map((m, idx) => ({ m, idx }))
+        .filter(({ m }) => m.type === 'text' && String(m.text || '').toLowerCase().includes(searchTerm));
+      if (hits.length === 0) {
+        listEl.innerHTML = `<div class="empty-state small">No messages match “${escapeHTML(searchTerm)}”</div>`;
         return;
       }
+      listEl.innerHTML =
+        `<div class="search-count">${hits.length} result${hits.length === 1 ? '' : 's'}</div>` +
+        hits
+          .map(
+            ({ m, idx }) => `
+        <button class="search-hit" data-jump="${idx}">
+          <div class="search-hit-who">${
+            m.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'Them')
+          } · ${escapeHTML(dayLabel(m.createdAt))}</div>
+          <div class="search-hit-text">${highlight(m.text, searchTerm)}</div>
+        </button>`
+          )
+          .join('');
+      listEl.querySelectorAll('.search-hit').forEach((btn) => {
+        btn.onclick = () => {
+          const idx = Number(btn.dataset.jump);
+          searchBar.hidden = true;
+          searchTerm = '';
+          searchInput.value = '';
+          paintThread();
+          // Done synchronously: innerHTML has already applied, and rAF is
+          // suspended whenever the page isn't compositing (hidden tab), which
+          // would make the jump silently do nothing.
+          const target = listEl.querySelector(`.msg-row[data-idx="${idx}"]`);
+          if (target) {
+            target.scrollIntoView({ block: 'center' });
+            target.classList.add('flash');
+            setTimeout(() => target.classList.remove('flash'), 1400);
+          }
+        };
+      });
+      return;
+    }
 
-      const wasAtBottom = atBottom || firstPaint;
-      listEl.innerHTML = messages.map((m, idx) => bubbleHTML(m, idx, messages)).join('');
+    const wasAtBottom = atBottom || firstPaint;
+    const olderBtn = reachedStart
+      ? ''
+      : `<button class="load-older" id="load-older">Load earlier messages</button>`;
+    listEl.innerHTML = olderBtn + messages.map((m, idx) => bubbleHTML(m, idx, messages)).join('');
+
+    const older = document.getElementById('load-older');
+    if (older)
+      older.onclick = () => {
+        const keepHeight = listEl.scrollHeight;
+        threadLimit += PAGE;
+        older.textContent = 'Loading…';
+        // Hold the reading position steady once the taller list paints. A
+        // timeout rather than rAF, which is suspended on non-compositing pages.
+        pendingScrollAnchor = keepHeight;
+        subscribeThread();
+      };
 
       // Gestures + media handlers, bound per paint.
       listEl.querySelectorAll('.bubble').forEach((el) => {
@@ -1196,37 +1420,56 @@ function renderThread(slot) {
         });
       });
 
-      listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
-        img.onclick = () => {
-          const message = messages[Number(img.dataset.idx)];
-          img.classList.remove('blurred');
-          img.closest('.bubble')?.querySelector('.view-once-tag')?.remove();
-          setTimeout(() => RoomData.deleteThreadMessage(identity.roomId, message.id), 6000);
-        };
-      });
+    listEl.querySelectorAll('.thread-photo.blurred').forEach((img) => {
+      img.onclick = () => {
+        const message = messages[Number(img.dataset.idx)];
+        img.classList.remove('blurred');
+        img.closest('.bubble')?.querySelector('.view-once-tag')?.remove();
+        setTimeout(() => RoomData.deleteThreadMessage(identity.roomId, message.id), 6000);
+      };
+    });
 
-      listEl.querySelectorAll('.voice-play-btn').forEach((btn) => {
-        btn.onclick = (e) => {
-          e.stopPropagation();
-          const message = messages[Number(btn.dataset.idx)];
-          const src = safeMediaSrc(message.audio, 'audio');
-          if (!src) return;
-          const audio = new Audio(src);
-          btn.classList.add('playing');
-          audio.onended = () => btn.classList.remove('playing');
-          audio.play().catch(() => btn.classList.remove('playing'));
-        };
-      });
+    // Normal photos open full-screen with pinch-zoom. View-once photos are
+    // excluded on purpose — their first tap is the reveal, and re-opening a
+    // photo that's mid-countdown would muddle what "view once" means.
+    listEl.querySelectorAll('.thread-photo:not(.blurred)').forEach((img) => {
+      img.onclick = () => {
+        const message = messages[Number(img.dataset.idx)];
+        if (message?.viewOnce) return;
+        const src = safeMediaSrc(message?.image, 'image');
+        if (src) openLightbox(src);
+      };
+    });
 
-      if (wasAtBottom) {
-        listEl.scrollTop = listEl.scrollHeight;
-        scrollBtn.hidden = true;
-      } else {
-        scrollBtn.hidden = false;
-      }
-      firstPaint = false;
-    })
-  );
+    listEl.querySelectorAll('.voice-play-btn').forEach((btn) => {
+      btn.onclick = (e) => {
+        e.stopPropagation();
+        const message = messages[Number(btn.dataset.idx)];
+        const src = safeMediaSrc(message.audio, 'audio');
+        if (!src) return;
+        const audio = new Audio(src);
+        btn.classList.add('playing');
+        audio.onended = () => btn.classList.remove('playing');
+        audio.play().catch(() => btn.classList.remove('playing'));
+      };
+    });
+
+    if (pendingScrollAnchor !== null) {
+      // Just loaded older messages — keep the same message under the user's
+      // thumb instead of yanking them to the top or bottom.
+      listEl.scrollTop = listEl.scrollHeight - pendingScrollAnchor;
+      pendingScrollAnchor = null;
+      scrollBtn.hidden = atBottom;
+    } else if (wasAtBottom) {
+      listEl.scrollTop = listEl.scrollHeight;
+      scrollBtn.hidden = true;
+    } else {
+      scrollBtn.hidden = false;
+    }
+    firstPaint = false;
+  }
+
+  subscribeThread();
 
   function quickReact(message) {
     const reactions = { ...(message.reactions || {}) };
@@ -1240,6 +1483,10 @@ function renderThread(slot) {
   function openMessageActions(message) {
     const mine = message.senderUid === lastKnownUid;
     const actions = [
+      {
+        label: 'Reply',
+        onClick: () => setReplyTarget(message),
+      },
       {
         label: 'React ❤️',
         onClick: () => quickReact(message),
@@ -1291,12 +1538,16 @@ function renderThread(slot) {
   const send = async () => {
     const text = input.value.trim();
     if (!text) return;
+    const replyPayload = replyingTo
+      ? { id: replyingTo.id, snippet: snippetOf(replyingTo), senderUid: replyingTo.senderUid }
+      : null;
     input.value = '';
     autoGrow();
     syncActionButton();
+    setReplyTarget(null);
     if (presenceEnabled()) clearTyping(identity.roomId);
     try {
-      await RoomData.sendThreadMessage(identity.roomId, sharedKey, text);
+      await RoomData.sendThreadMessage(identity.roomId, sharedKey, text, replyPayload);
     } catch (e) {
       toast("Message didn't send — check your connection");
       input.value = text;
@@ -1385,14 +1636,40 @@ function bubbleHTML(m, idx, messages) {
     inner = escapeHTML(m.text);
   }
 
+  const quote = m.replyTo
+    ? `<div class="reply-quote">
+         <div class="reply-quote-who">${
+           m.replyTo.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'Them')
+         }</div>
+         <div class="reply-quote-text">${escapeHTML(m.replyTo.snippet || '')}</div>
+       </div>`
+    : '';
+
   const typeClass = m.type === 'photo' ? 'photo-bubble' : m.type === 'voice' ? 'voice-bubble' : '';
   return `${divider}
-    <div class="msg-row ${mine ? 'mine' : 'theirs'} ${m.pending ? 'is-pending' : ''}">
-      <div class="bubble ${mine ? 'me' : 'them'} ${typeClass} ${pos}" data-idx="${idx}">
-        ${inner}${reactionChip}
+    <div class="msg-row ${mine ? 'mine' : 'theirs'} ${m.pending ? 'is-pending' : ''}" data-idx="${idx}">
+      <div class="bubble ${mine ? 'me' : 'them'} ${typeClass} ${pos} ${quote ? 'has-quote' : ''}" data-idx="${idx}">
+        ${quote}${inner}${reactionChip}
       </div>
       ${meta}
     </div>`;
+}
+
+// One-line description of a message, used for reply quotes.
+function snippetOf(m) {
+  if (!m) return '';
+  if (m.type === 'photo') return '📷 Photo';
+  if (m.type === 'voice') return '🎤 Voice note';
+  const t = String(m.text || '');
+  return t.length > 90 ? t.slice(0, 90) + '…' : t;
+}
+
+// Escapes first, then wraps matches — so the highlight can never inject markup.
+function highlight(text, term) {
+  const safe = escapeHTML(text);
+  if (!term) return safe;
+  const safeTerm = escapeHTML(term).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return safe.replace(new RegExp(`(${safeTerm})`, 'ig'), '<mark>$1</mark>');
 }
 
 async function toggleRecording(micBtn) {
@@ -2388,6 +2665,23 @@ function renderSettings() {
       </div>
 
       <div class="card">
+        <div class="eyebrow">Archive</div>
+        <p class="body-dim">
+          Save a copy of everything — messages, letters, journal, lists, money — as a single file you keep yourself.
+        </p>
+        <p class="fine-print">
+          The file is encrypted with a passphrase you choose, using the same PBKDF2 + AES-GCM as the rest of the app,
+          so it's safe to store in cloud backup or email it to yourself. Nobody without that passphrase can read it —
+          including you, so don't lose it. Open it again with "Open an archive" below.
+        </p>
+        <div class="btn-row" style="margin-top:10px;">
+          <button class="btn-secondary" id="export-btn">Export</button>
+          <button class="btn-secondary" id="open-archive-btn">Open</button>
+        </div>
+        <input type="file" accept=".json,.tidelight,application/json" id="archive-input" hidden />
+      </div>
+
+      <div class="card">
         <div class="eyebrow">Log out</div>
         <p class="body-dim">
           ${
@@ -2430,8 +2724,139 @@ function renderSettings() {
     renderSettings();
   };
 
+  document.getElementById('export-btn').onclick = () => handleExportArchive();
+  document.getElementById('open-archive-btn').onclick = () =>
+    document.getElementById('archive-input').click();
+  document.getElementById('archive-input').onchange = (e) => {
+    const file = e.target.files[0];
+    e.target.value = '';
+    if (file) handleOpenArchive(file);
+  };
+
   const recoveryBtn = document.getElementById('setup-recovery-later-btn');
   if (recoveryBtn) recoveryBtn.onclick = () => renderRecoverySetupFromSettings();
+}
+
+async function handleExportArchive() {
+  const passphrase = prompt(
+    'Choose a passphrase for this archive (at least 8 characters).\n\nThere is no way to recover it — if you lose it, the file is unreadable forever.'
+  );
+  if (passphrase === null) return;
+  if (passphrase.length < 8) {
+    toast('Passphrase must be at least 8 characters');
+    return;
+  }
+  const btn = document.getElementById('export-btn');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Packing…';
+  }
+  try {
+    const archive = await RoomData.buildRoomArchive(identity.roomId, sharedKey);
+    // Encrypted before it ever becomes a Blob — plaintext never reaches disk.
+    const sealed = await encryptWithPassphrase(archive, passphrase);
+    const payload = JSON.stringify({ format: 'tidelight-archive-encrypted', version: 1, ...sealed });
+    const blob = new Blob([payload], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = `tidelight-archive-${new Date().toISOString().slice(0, 10)}.json`;
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+    setTimeout(() => URL.revokeObjectURL(url), 4000);
+    const c = archive.counts;
+    toast(`Archived ${c.messages} messages, ${c.letters} letters, ${c.journal} journal entries`);
+  } catch (e) {
+    console.error('Export failed:', e);
+    toast("Couldn't build the archive");
+  }
+  if (btn) {
+    btn.disabled = false;
+    btn.textContent = 'Export';
+  }
+}
+
+async function handleOpenArchive(file) {
+  const passphrase = prompt('Passphrase for this archive:');
+  if (passphrase === null) return;
+  try {
+    const text = await file.text();
+    const parsed = JSON.parse(text);
+    if (parsed.format !== 'tidelight-archive-encrypted') {
+      throw new Error("That doesn't look like a Tidelight archive.");
+    }
+    const archive = await decryptWithPassphrase(parsed, passphrase);
+    renderArchiveViewer(archive);
+  } catch (e) {
+    const wrongPass = /operation-specific reason|decrypt|OperationError/i.test(e?.message || '') || e?.name === 'OperationError';
+    toast(wrongPass ? 'Wrong passphrase, or the file is damaged' : e.message || "Couldn't open that archive");
+  }
+}
+
+function renderArchiveViewer(archive) {
+  clearListeners();
+  const c = archive.counts || {};
+  const section = (title, items, render) =>
+    !items || items.length === 0
+      ? ''
+      : `<div class="eyebrow" style="margin-top:14px;">${title}</div>
+         <div class="card">${items.map(render).join('')}</div>`;
+
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="archive-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Archive</div>
+          <h2>${escapeHTML(new Date(archive.exportedAt).toLocaleDateString())}</h2>
+        </div>
+      </div>
+      <div class="card">
+        <p class="body-dim">
+          Read-only view of an exported archive. Nothing here is connected to your live room —
+          closing this screen discards it.
+        </p>
+        <div class="archive-counts">
+          ${Object.entries(c)
+            .filter(([, n]) => n > 0)
+            .map(([k, n]) => `<span><strong>${n}</strong> ${escapeHTML(k)}</span>`)
+            .join('')}
+        </div>
+      </div>
+
+      ${section('Messages', (archive.thread || []).filter((m) => m.type === 'text' || !m.type), (m) =>
+        `<div class="journal-entry"><div>${escapeHTML(m.text || '')}</div>
+         <div class="row-meta">${m.senderUid === lastKnownUid ? 'You' : escapeHTML(identity.partnerName || 'Them')}${
+          m.createdAt ? ' · ' + escapeHTML(new Date(m.createdAt).toLocaleString()) : ''
+        }</div></div>`
+      )}
+      ${section('Letters', archive.letters, (l) =>
+        `<div class="letter-row"><div>${escapeHTML(l.text || '')}</div></div>`
+      )}
+      ${section('Journal', archive.journal, (j) =>
+        `<div class="journal-entry"><div>${escapeHTML(j.text || '')}</div>
+         <div class="row-meta">${j.createdAt ? escapeHTML(new Date(j.createdAt).toLocaleDateString()) : ''}</div></div>`
+      )}
+      ${section('List', archive.bucketlist, (i) =>
+        `<div class="list-row"><div class="checkbox ${i.done ? 'done' : ''}">${i.done ? '✓' : ''}</div>
+         <div class="grow ${i.done ? 'done-text' : ''}">${escapeHTML(i.text || '')}</div></div>`
+      )}
+      ${section('Events', archive.calendar, (e) =>
+        `<div class="list-row"><div class="grow">${escapeHTML(e.title || '')}
+         <div class="row-meta">${e.dateTime ? escapeHTML(new Date(e.dateTime).toLocaleString()) : ''}</div></div></div>`
+      )}
+      ${section('Expenses', archive.expenses, (e) =>
+        `<div class="money-row"><div class="grow">${escapeHTML(e.description || '')}
+         <div class="row-meta">${escapeHTML(e.category || 'General')}</div></div>
+         <div class="money-amount">${Number(e.amount || 0).toFixed(2)}</div></div>`
+      )}
+      ${section('Savings', archive.savings, (s) =>
+        `<div class="money-row"><div class="grow">${escapeHTML(s.label || '')}</div>
+         <div class="money-amount">+${Number(s.amount || 0).toFixed(2)}</div></div>`
+      )}
+    </div>`;
+  document.getElementById('archive-back').onclick = () => renderSettings();
 }
 
 function renderDnsHelp() {
@@ -2656,6 +3081,9 @@ function iconLock() {
 }
 function iconChevronLeft() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="20" height="20"><path d="M15 5l-7 7 7 7"/></svg>';
+}
+function iconSearch() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="19" height="19"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>';
 }
 function iconChevronDown() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" width="18" height="18"><path d="M5 9l7 7 7-7"/></svg>';

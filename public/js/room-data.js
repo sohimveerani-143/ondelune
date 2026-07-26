@@ -5,6 +5,7 @@ import {
   ensureSignedIn,
   doc,
   getDoc,
+  getDocs,
   setDoc,
   updateDoc,
   deleteDoc,
@@ -24,9 +25,14 @@ function col(roomId, name) {
 }
 
 // ---------- Thread (shared messages) ----------
-export async function sendThreadMessage(roomId, sharedKey, text) {
+// `replyTo` is a small {id, snippet, senderUid} object stored INSIDE the
+// encrypted payload — the quote is content, so it gets the same protection as
+// the message itself. Firestore never sees the quoted words.
+export async function sendThreadMessage(roomId, sharedKey, text, replyTo) {
   const user = await ensureSignedIn();
-  const { ciphertext, nonce } = encryptJSON({ type: 'text', text }, sharedKey);
+  const payload = { type: 'text', text };
+  if (replyTo) payload.replyTo = replyTo;
+  const { ciphertext, nonce } = encryptJSON(payload, sharedKey);
   await addDoc(col(roomId, 'thread'), {
     senderUid: user.uid,
     ciphertext,
@@ -157,16 +163,22 @@ function decodeMessageDoc(d, sharedKey) {
     audio: parsed.audio,
     audioDuration: parsed.audioDuration,
     viewOnce: parsed.viewOnce,
+    replyTo: parsed.replyTo || null,
     reactions,
     pending: d.metadata?.hasPendingWrites,
     createdAt: data.createdAt?.toDate?.() || new Date(),
   };
 }
 
-export function listenThread(roomId, sharedKey, onMessages) {
-  const q = query(col(roomId, 'thread'), orderBy('createdAt', 'asc'));
+// Paginated: pulls only the newest `max` messages, so a long history never
+// drags a whole year of base64 photos onto an old phone. The query runs
+// descending (that's what `limit` anchors to) and is flipped back for display.
+// `reachedStart` tells the UI whether an "earlier messages" button is needed.
+export function listenThread(roomId, sharedKey, onMessages, max = 60) {
+  const q = query(col(roomId, 'thread'), orderBy('createdAt', 'desc'), fbLimit(max));
   return onSnapshot(q, { includeMetadataChanges: true }, (snap) => {
-    onMessages(snap.docs.map((d) => decodeMessageDoc(d, sharedKey)));
+    const messages = snap.docs.map((d) => decodeMessageDoc(d, sharedKey)).reverse();
+    onMessages(messages, { reachedStart: snap.docs.length < max });
   });
 }
 
@@ -568,6 +580,109 @@ export function listenLetters(roomId, sharedKey, onLetters) {
     });
     onLetters(letters);
   });
+}
+
+// ---------- Nudges ----------
+// A one-tap "I'm thinking about you" that needs no words. The nudge kind is
+// encrypted like everything else; only the timestamp and sender are plaintext.
+export const NUDGES = [
+  { id: 'thinking', emoji: '💭', label: 'Thinking of you' },
+  { id: 'miss', emoji: '🤍', label: 'Miss you' },
+  { id: 'call', emoji: '📞', label: 'Call me?' },
+  { id: 'goodnight', emoji: '🌙', label: 'Goodnight' },
+];
+
+export function nudgeById(id) {
+  return NUDGES.find((n) => n.id === id) || NUDGES[0];
+}
+
+export async function sendNudge(roomId, sharedKey, nudgeId) {
+  const user = await ensureSignedIn();
+  const { ciphertext, nonce } = encryptJSON({ nudgeId }, sharedKey);
+  await addDoc(col(roomId, 'nudges'), {
+    senderUid: user.uid,
+    ciphertext,
+    nonce,
+    createdAt: serverTimestamp(),
+  });
+  await recordActivity(roomId);
+}
+
+export function listenLatestNudge(roomId, sharedKey, onNudge) {
+  const q = query(col(roomId, 'nudges'), orderBy('createdAt', 'desc'), fbLimit(1));
+  return onSnapshot(q, (snap) => {
+    if (snap.empty) return onNudge(null);
+    const d = snap.docs[0];
+    const data = d.data();
+    let nudgeId = 'thinking';
+    try {
+      nudgeId = decryptJSON(data.ciphertext, data.nonce, sharedKey).nudgeId || 'thinking';
+    } catch (e) {
+      /* fall back to the default kind rather than dropping the nudge */
+    }
+    onNudge({
+      id: d.id,
+      senderUid: data.senderUid,
+      nudgeId,
+      createdAt: data.createdAt?.toDate?.() || new Date(),
+    });
+  });
+}
+
+// ---------- Archive export ----------
+// Reads every collection once and decrypts it in memory. The caller is
+// responsible for re-encrypting under a passphrase before anything is written
+// to disk — plaintext must never reach a file the user could sync somewhere.
+export async function buildRoomArchive(roomId, sharedKey) {
+  const plainOf = (d) => {
+    const data = d.data();
+    try {
+      return { id: d.id, ...decryptJSON(data.ciphertext, data.nonce, sharedKey) };
+    } catch (e) {
+      return { id: d.id, undecryptable: true };
+    }
+  };
+  const grab = async (name, extra = () => ({})) => {
+    try {
+      const snap = await getDocs(col(roomId, name));
+      return snap.docs.map((d) => ({ ...plainOf(d), ...extra(d) }));
+    } catch (e) {
+      return [];
+    }
+  };
+  const withMeta = (d) => {
+    const data = d.data();
+    return {
+      senderUid: data.senderUid || null,
+      createdAt: data.createdAt?.toDate?.().toISOString() || null,
+    };
+  };
+
+  const [thread, journal, letters, memories, bucketlist, calendar, expenses, savings, savingsGoals, mood] =
+    await Promise.all([
+      grab('thread', withMeta),
+      grab('journal', withMeta),
+      grab('letters', withMeta),
+      grab('memories', withMeta),
+      grab('bucketlist'),
+      grab('calendar'),
+      grab('expenses', withMeta),
+      grab('savings', withMeta),
+      grab('savingsGoals'),
+      grab('mood', withMeta),
+    ]);
+
+  return {
+    format: 'tidelight-archive',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    counts: {
+      messages: thread.length, journal: journal.length, letters: letters.length,
+      memories: memories.length, list: bucketlist.length, events: calendar.length,
+      expenses: expenses.length, savings: savings.length, goals: savingsGoals.length,
+    },
+    thread, journal, letters, memories, bucketlist, calendar, expenses, savings, savingsGoals, mood,
+  };
 }
 
 // ---------- Profile pictures ----------
