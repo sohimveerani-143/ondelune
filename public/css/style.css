@@ -45,6 +45,12 @@
 
 * { box-sizing: border-box; }
 
+/* A component rule like `.search-bar { display: flex }` outranks the browser's
+   built-in `[hidden] { display: none }`, which silently made the search bar,
+   reply bar and scroll-to-latest button permanently visible. This puts the
+   attribute back in charge everywhere. */
+[hidden] { display: none !important; }
+
 html, body {
   margin: 0;
   padding: 0;
@@ -390,6 +396,19 @@ button:disabled { opacity: 0.55; cursor: default; }
 }
 .home-greet { flex: 1; min-width: 0; }
 .home-greet h1 { margin-top: 2px; }
+.head-actions { display: flex; align-items: center; gap: 2px; flex-shrink: 0; }
+/* A filled dot on the note icon means you currently have a note up on theirs. */
+.btn-icon.has-note { color: var(--horizon); position: relative; }
+.btn-icon.has-note::after {
+  content: '';
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--horizon);
+}
 
 .bento {
   display: grid;
@@ -454,7 +473,6 @@ button:disabled { opacity: 0.55; cursor: default; }
 .tone-mood      { --tone: #93bfa8; }
 .tone-nudge     { --tone: #b79ad4; }
 .tone-milestone { --tone: #ecd6ad; }
-.tone-since     { --tone: #9aa7c4; }
 
 /* Home note */
 .note-body {
@@ -468,20 +486,6 @@ button:disabled { opacity: 0.55; cursor: default; }
 }
 .note-body.empty { font-style: normal; font-family: 'Manrope', sans-serif; font-size: 13px; color: var(--text-faint); }
 .note-tile.has-note { border-top-color: var(--tone); }
-.note-edit {
-  display: inline-flex;
-  align-items: center;
-  gap: 5px;
-  margin-top: 10px;
-  padding: 7px 11px;
-  font-size: 12px;
-  font-weight: 500;
-  color: var(--tone, var(--horizon));
-  background: var(--surface-2);
-  border: 1px solid var(--border);
-  border-radius: 20px;
-  width: auto;
-}
 
 .sheet-form { display: flex; flex-direction: column; gap: 8px; padding: 4px 4px 0; }
 .sheet-form textarea { font-size: 15px; }
@@ -1492,6 +1496,54 @@ button:disabled { opacity: 0.55; cursor: default; }
 .game-actions button { flex: 1; }
 
 .game-paused { border-color: rgba(224, 144, 111, 0.28); }
+
+/* ---------- Calendar events ---------- */
+.event-row {
+  display: flex;
+  align-items: center;
+  gap: 11px;
+  padding: 11px 0;
+  border-bottom: 1px solid var(--border);
+  animation: rise var(--dur) var(--ease) both;
+}
+.event-row:last-child { border-bottom: none; }
+.event-title { font-weight: 500; }
+.event-when {
+  font-size: 11px;
+  padding: 3px 9px;
+  border-radius: 20px;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* Upcoming reads as live: warm chip, full-strength text, accented date. */
+.event-row.is-upcoming .event-when { background: rgba(224, 144, 111, 0.16); color: var(--horizon); }
+.event-row.is-upcoming .date-chip { background: var(--surface-3); }
+.event-row.is-upcoming .date-chip-day { color: var(--moonlight); }
+
+/* Past reads as archive: desaturated, flat chip, no accent competing for the eye.
+   Note: dimming with `opacity` here would NOT work — the `rise` entry animation
+   ends at opacity:1, and animations outrank normal declarations, so the row
+   would snap back to full strength. Colour is set explicitly instead. */
+.past-card { background: var(--surface-2); }
+.event-row.is-past .event-title { font-weight: 400; color: var(--text-faint); }
+.event-row.is-past .date-chip { background: transparent; border: 1px dashed var(--border-strong); }
+.event-row.is-past .date-chip-day { color: var(--text-faint); }
+.event-row.is-past .event-when { background: transparent; color: var(--text-faint); border: 1px solid var(--border); }
+
+/* ---------- Missed-nudge summary ---------- */
+.nudge-summary { display: flex; flex-direction: column; gap: 4px; margin-bottom: 4px; }
+.nudge-row {
+  display: flex;
+  align-items: flex-start;
+  gap: 11px;
+  padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+.nudge-row:last-child { border-bottom: none; }
+.nudge-row-emoji { font-size: 22px; line-height: 1.2; flex-shrink: 0; }
+.nudge-row-label { font-weight: 600; font-size: 14.5px; }
+.nudge-times { font-size: 11px; color: var(--text-faint); margin-top: 3px; line-height: 1.5; }
 
 /* ---------- Modal errors & offline ---------- */
 .modal-error { color: var(--horizon); font-size: 12.5px; min-height: 16px; }

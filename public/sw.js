@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tidelight-v6';
+const CACHE_NAME = 'tidelight-v9';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -46,6 +46,10 @@ self.addEventListener('fetch', (event) => {
   const url = new URL(event.request.url);
   if (url.origin !== self.location.origin) return; // CDN/Firebase pass straight through
   if (event.request.method !== 'GET') return;
+
+  // Never touch the FCM worker — it must be fetched fresh by the browser so
+  // push registration and updates aren't served a cached or rewritten copy.
+  if (url.pathname.endsWith('firebase-messaging-sw.js')) return;
 
   const isAppCode = /\.(js|css|webmanifest)$/.test(url.pathname) || url.pathname.endsWith('/') || url.pathname.endsWith('index.html');
 

@@ -1,0 +1,13 @@
+{
+  "name": "tidelight-functions",
+  "description": "Cloud Functions for Tidelight closed-app push notifications",
+  "engines": {
+    "node": "20"
+  },
+  "main": "index.js",
+  "private": true,
+  "dependencies": {
+    "firebase-admin": "^12.6.0",
+    "firebase-functions": "^6.1.0"
+  }
+}

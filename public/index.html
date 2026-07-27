@@ -53,9 +53,33 @@
   <script type="module" src="js/app.js"></script>
 
   <script>
+    // Service worker registration, with an explicit update path.
+    // Mixed module versions (an old cached app.js against a new room-data.js)
+    // break the app in confusing ways — a changed function signature shows up as
+    // "my profile picture won't save" rather than as an error. So: check for an
+    // update on every load, and when a new worker takes over, reload once so the
+    // whole module set comes from the same version.
     if ('serviceWorker' in navigator) {
-      window.addEventListener('load', () => {
-        navigator.serviceWorker.register('sw.js').catch(() => {});
+      window.addEventListener('load', function () {
+        navigator.serviceWorker.register('sw.js').then(function (reg) {
+          reg.update().catch(function () {});
+          reg.addEventListener('updatefound', function () {
+            var incoming = reg.installing;
+            if (!incoming) return;
+            incoming.addEventListener('statechange', function () {
+              if (incoming.state === 'installed' && navigator.serviceWorker.controller) {
+                window.__tidelightUpdateReady = true;
+              }
+            });
+          });
+        }).catch(function () {});
+
+        var reloading = false;
+        navigator.serviceWorker.addEventListener('controllerchange', function () {
+          if (reloading) return;
+          reloading = true;
+          window.location.reload();
+        });
       });
     }
   </script>

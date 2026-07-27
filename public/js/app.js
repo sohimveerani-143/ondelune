@@ -19,7 +19,7 @@ import {
 } from './pairing.js';
 import * as RoomData from './room-data.js';
 import { fileToCompressedBase64 } from './image-utils.js';
-import { ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
+import { app as firebaseApp, ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
 import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
@@ -51,7 +51,10 @@ import {
   requestNotificationPermission,
   showNotification,
   previewFor,
+  initPush,
+  pushConfigured,
 } from './notify.js';
+import { vapidKey } from './firebase-config.js';
 
 const root = document.getElementById('app');
 let identity = null;
@@ -722,16 +725,26 @@ function renderJoinScreen(pairingId) {
 function renderMain() {
   clearListeners();
   clearGlobalListeners();
+  onSubScreen = false;
   root.innerHTML = `<div id="screen-slot"></div>${navHTML()}`;
   bindNav();
   setUpGlobalListeners();
   renderTab(activeTab);
 }
 
+// Registers this device for closed-app push and stores its token so the Cloud
+// Function can reach it. No-ops cleanly if push isn't configured or permitted.
+function registerForPush() {
+  if (!identity?.roomId) return;
+  if (notificationPermission() !== 'granted') return;
+  initPush(firebaseApp, vapidKey, (token) => RoomData.setPushToken(identity.roomId, token)).catch(() => {});
+}
+
 function setUpGlobalListeners() {
   if (!identity?.roomId || !sharedKey) return;
 
   if (presenceEnabled()) startHeartbeat(identity.roomId);
+  registerForPush();
 
   // Publish gender into the encrypted room profile once, so the partner's hero
   // scene can draw you. Guarded by a local flag to avoid a write per app open.
@@ -808,6 +821,7 @@ function setUpGlobalListeners() {
     }
   });
   globalUnsubscribers.push(unsubNudge);
+  showMissedNudges();
 
   // One listener over ~10 tiny counter docs powers every badge in the app.
   const unsubMarkers = RoomData.listenMarkers(identity.roomId, (m) => {
@@ -889,6 +903,91 @@ function openNoteEditor(current) {
     };
 }
 
+// Nudges that landed while the app was closed. Shown once, grouped by kind,
+// with how many and when — a nudge means nothing without its timing, and five
+// separate notifications would be worse than one honest summary.
+async function showMissedNudges() {
+  if (!identity?.partnerUid || !sharedKey) return;
+
+  // First run on this device: set a baseline and show nothing, so we don't dump
+  // the entire history at someone who just installed.
+  const since = seenCounts.__nudgeSeenAt;
+  if (!since) {
+    seenCounts = await setSeen('__nudgeSeenAt', Date.now());
+    return;
+  }
+
+  const missed = await RoomData.fetchNudgesSince(identity.roomId, sharedKey, since, identity.partnerUid);
+  if (missed.length === 0) {
+    // Deliberately does NOT advance the marker. A nudge written moments ago may
+    // still have an unresolved serverTimestamp and read as null here; moving the
+    // marker to "now" would silently swallow it before it ever surfaced.
+    return;
+  }
+  seenCounts = await setSeen('__nudgeSeenAt', missed[missed.length - 1].createdAt.getTime());
+
+  const groups = new Map();
+  for (const n of missed) {
+    const g = groups.get(n.nudgeId) || { kind: RoomData.nudgeById(n.nudgeId), times: [] };
+    g.times.push(n.createdAt);
+    groups.set(n.nudgeId, g);
+  }
+
+  const who = escapeHTML(identity.partnerName || 'They');
+  const rows = [...groups.values()]
+    .map((g) => {
+      const last = g.times[g.times.length - 1];
+      const when = last.toLocaleString([], {
+        weekday: 'short',
+        hour: '2-digit',
+        minute: '2-digit',
+      });
+      const times = g.times.length === 1 ? 'once' : `${g.times.length} times`;
+      const all =
+        g.times.length > 1
+          ? `<div class="nudge-times">${g.times
+              .map((t) => escapeHTML(t.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })))
+              .join(' · ')}</div>`
+          : '';
+      return `<div class="nudge-row">
+        <span class="nudge-row-emoji">${g.kind.emoji}</span>
+        <div class="grow">
+          <div class="nudge-row-label">${escapeHTML(g.kind.label)}</div>
+          <div class="row-meta">${times} · last ${escapeHTML(when)}</div>
+          ${all}
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  const wrap = document.createElement('div');
+  wrap.className = 'sheet-backdrop';
+  wrap.innerHTML = `
+    <div class="sheet">
+      <div class="sheet-grabber"></div>
+      <div class="sheet-title">${who} reached out while you were away</div>
+      <div class="sheet-form">
+        <div class="nudge-summary">${rows}</div>
+        <button class="btn-primary" id="nudge-reply">Open chat</button>
+        <button class="btn-ghost" data-cancel>Close</button>
+      </div>
+    </div>`;
+  document.body.appendChild(wrap);
+  setTimeout(() => wrap.classList.add('open'), 0);
+  const close = () => {
+    wrap.classList.remove('open');
+    setTimeout(() => wrap.remove(), 200);
+  };
+  wrap.onclick = (e) => {
+    if (e.target === wrap || e.target.hasAttribute('data-cancel')) close();
+  };
+  wrap.querySelector('#nudge-reply').onclick = () => {
+    close();
+    activeTab = 'thread';
+    renderMain();
+  };
+}
+
 // A brief full-screen bloom when a nudge arrives — the whole point is that it
 // feels like being tapped on the shoulder, not like another notification row.
 function bloomNudge(emoji) {
@@ -918,10 +1017,24 @@ function navHTML() {
     .join('')}</nav>`;
 }
 
+// Sub-screens (Expenses, Journal, the game…) replace the whole root, so they
+// need the nav re-attached or you'd be stranded until you found Back.
+let onSubScreen = false;
+
+// Called by a sub-screen right after it writes its own markup.
+function attachNav() {
+  onSubScreen = true;
+  root.insertAdjacentHTML('beforeend', navHTML());
+  bindNav();
+}
+
 function bindNav() {
   document.querySelectorAll('.nav button').forEach((btn) => {
     btn.onclick = () => {
-      if (activeTab === btn.dataset.tab) return;
+      // Re-render when tapping the current tab from a sub-screen — otherwise the
+      // early-return would make the nav look dead from inside Expenses etc.
+      if (activeTab === btn.dataset.tab && !onSubScreen) return;
+      onSubScreen = false;
       activeTab = btn.dataset.tab;
       document.querySelectorAll('.nav button').forEach((b) => b.classList.remove('active'));
       btn.classList.add('active');
@@ -937,7 +1050,9 @@ function renderTab(tab) {
   // section when actually opened, which is what keeps the per-tile badges useful.
   if (tab !== 'more') markSectionsSeen(TAB_SECTIONS[tab] || []);
   const slot = document.getElementById('screen-slot');
-  if (!slot) return;
+  // Coming from a sub-screen, which replaced the whole root: rebuild the shell
+  // first, otherwise the nav would appear to do nothing.
+  if (!slot) return renderMain();
   setTimeout(paintBadges, 0);
   if (tab === 'home') return renderHome(slot);
   if (tab === 'thread') return renderThread(slot);
@@ -976,11 +1091,11 @@ const STARS = (() => {
 // silhouette on the horizon, big enough to actually read as two people.
 function figureSVG({ cx, lean = 0, gender = 'unspecified' }) {
   const FILL = '#0d0a1a';
-  const cyBody = 194;
-  const cyHead = 168;
-  const bodyRx = gender === 'man' ? 13 : 11.5;
-  const bodyRy = 21;
-  const headR = 7.6;
+  const cyBody = 192;
+  const cyHead = 163;
+  const bodyRx = gender === 'man' ? 15.5 : 14;
+  const bodyRy = 25;
+  const headR = 9;
 
   // Long hair reads as a distinct silhouette without resorting to caricature.
   const hair =
@@ -1009,18 +1124,20 @@ function figuresGroupSVG(moodState, genders = {}) {
   const me = genders.mine || 'unspecified';
   const them = genders.theirs || 'unspecified';
 
+  // Sat right of centre so the pair reads against the lighter water beside the
+  // moon's reflection rather than getting lost in the dark middle of it.
   if (moodState === 'meLow') {
     // You lean into them; they stand steady and close.
-    return figureSVG({ cx: 186, lean: 13, gender: me }) + figureSVG({ cx: 212, lean: 0, gender: them });
+    return figureSVG({ cx: 206, lean: 13, gender: me }) + figureSVG({ cx: 236, lean: 0, gender: them });
   }
   if (moodState === 'themLow') {
-    return figureSVG({ cx: 186, lean: 0, gender: me }) + figureSVG({ cx: 212, lean: -13, gender: them });
+    return figureSVG({ cx: 206, lean: 0, gender: me }) + figureSVG({ cx: 236, lean: -13, gender: them });
   }
   if (moodState === 'bothLow') {
     // Both tip toward each other, shoulders nearly touching.
-    return figureSVG({ cx: 190, lean: 9, gender: me }) + figureSVG({ cx: 210, lean: -9, gender: them });
+    return figureSVG({ cx: 211, lean: 9, gender: me }) + figureSVG({ cx: 233, lean: -9, gender: them });
   }
-  return figureSVG({ cx: 178, lean: 0, gender: me }) + figureSVG({ cx: 222, lean: 0, gender: them });
+  return figureSVG({ cx: 198, lean: 0, gender: me }) + figureSVG({ cx: 246, lean: 0, gender: them });
 }
 
 function heroCaptionFor(moodState) {
@@ -1126,7 +1243,10 @@ function renderHome(slot) {
           <div class="eyebrow">Tidelight</div>
           <h1>${greetingFor(identity.displayName)}</h1>
         </div>
-        <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
+        <div class="head-actions">
+          <button class="btn-icon" id="note-edit-btn" aria-label="Leave a note on their Home screen" title="Leave a note for them">${iconPencil()}</button>
+          <button class="btn-icon" id="settings-btn" aria-label="Settings">${iconSettings()}</button>
+        </div>
       </header>
       <input type="file" accept="image/*" id="avatar-input" hidden />
 
@@ -1137,12 +1257,13 @@ function renderHome(slot) {
 
       <div class="bento">
         <div class="bento-tile span-4 tone-note" id="note-tile">
-          <div class="tile-head">${iconNote()}<span class="tile-name" id="note-tile-name">A note from ${escapeHTML(
+          <div class="tile-head">${iconNote()}<span class="tile-name">A note from ${escapeHTML(
             identity.partnerName || 'them'
           )}</span></div>
           <div class="note-body" id="note-body">–</div>
-          <button class="note-edit" id="note-edit-btn">${iconPencil()} Leave one for them</button>
         </div>
+
+        <div class="bento-tile span-4 tone-milestone milestone-tile" id="milestone-tile" hidden></div>
 
         <div class="bento-tile span-4 tone-countdown" id="countdown-tile">
           <div class="tile-head">${iconCalendar()}<span class="tile-name">Next shared moment</span></div>
@@ -1188,13 +1309,6 @@ function renderHome(slot) {
           <div class="nudge-emoji">💭</div>
           <div class="stat-caption">Tap to send</div>
         </button>
-
-        <div class="bento-tile span-4 tone-milestone milestone-tile" id="milestone-tile" hidden></div>
-
-        <div class="bento-tile span-4 tone-since">
-          <div class="tile-head">${iconAnchorSmall()}<span class="tile-name">Together since</span></div>
-          <input type="date" id="together-since-input" />
-        </div>
       </div>
     </div>
   `;
@@ -1284,12 +1398,6 @@ function renderHome(slot) {
   const clockInterval = setInterval(tick, 20000);
   unsubscribers.push(() => clearInterval(clockInterval));
 
-  const input = document.getElementById('together-since-input');
-  input.onchange = () => {
-    RoomData.setTogetherSince(identity.roomId, sharedKey, input.value);
-    toast('Saved');
-  };
-
   // --- Home note: theirs is shown, yours is editable ---
   if (identity.partnerUid) {
     unsubscribers.push(
@@ -1309,12 +1417,16 @@ function renderHome(slot) {
       })
     );
   }
+  // Your own note is written from the header icon; the tile shows only theirs.
   let myNote = '';
   unsubscribers.push(
     RoomData.listenNote(identity.roomId, sharedKey, lastKnownUid, (note) => {
       myNote = note?.text || '';
       const btn = document.getElementById('note-edit-btn');
-      if (btn) btn.innerHTML = `${iconPencil()} ${myNote ? 'Edit your note' : 'Leave one for them'}`;
+      if (btn) {
+        btn.classList.toggle('has-note', !!myNote);
+        btn.title = myNote ? 'Edit the note on their Home screen' : 'Leave a note for them';
+      }
     })
   );
   document.getElementById('note-edit-btn').onclick = () => openNoteEditor(myNote);
@@ -1323,14 +1435,13 @@ function renderHome(slot) {
     openSheet('Send a nudge', [
       ...RoomData.NUDGES.map((n) => ({
         label: `${n.emoji}  ${n.label}`,
-        onClick: async () => {
-          try {
-            await RoomData.sendNudge(identity.roomId, sharedKey, n.id);
-            bloomNudge(n.emoji);
-            toast('Sent');
-          } catch (e) {
-            toast("Couldn't send that nudge");
-          }
+        onClick: () => {
+          // Bloom immediately — this is the sender's own confirmation and
+          // shouldn't wait on a network round-trip. If the write fails, say so.
+          bloomNudge(n.emoji);
+          RoomData.sendNudge(identity.roomId, sharedKey, n.id)
+            .then(() => toast('Sent'))
+            .catch(() => toast("Couldn't send that nudge — check your connection"));
         },
       })),
     ]);
@@ -1338,11 +1449,12 @@ function renderHome(slot) {
 
   unsubscribers.push(
     RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
-      if (!settings.togetherSince) return;
-      const el = document.getElementById('together-since-input');
       const daysEl = document.getElementById('days-together');
-      if (!el || !daysEl) return;
-      el.value = settings.togetherSince;
+      if (!daysEl) return;
+      if (!settings.togetherSince) {
+        daysEl.textContent = '–';
+        return;
+      }
       const days = Math.floor((Date.now() - new Date(settings.togetherSince)) / 86400000);
       daysEl.textContent = days >= 0 ? days.toLocaleString() : '–';
 
@@ -1866,10 +1978,14 @@ function renderThread(slot) {
     actions.push({
       label: 'Delete for both of you',
       danger: true,
-      onClick: () => {
-        if (confirm('Delete this for both of you? This removes it completely — nothing stays behind.')) {
-          RoomData.deleteThreadMessage(identity.roomId, message.id).catch(() => toast("Couldn't delete"));
-        }
+      onClick: async () => {
+        const ok = await confirmModal({
+          title: 'Delete this message?',
+          body: 'It goes for both of you, permanently. Nothing stays behind on the server.',
+          confirmLabel: 'Delete',
+          danger: true,
+        });
+        if (ok) RoomData.deleteThreadMessage(identity.roomId, message.id).catch(() => toast("Couldn't delete"));
       },
     });
     openSheet(mine ? 'Your message' : escapeHTML(identity.partnerName || 'Their message'), actions);
@@ -1942,15 +2058,23 @@ function renderThread(slot) {
 
   document.getElementById('photo-attach').onchange = async (e) => {
     const file = e.target.files[0];
-    if (!file) return;
-    const viewOnce = confirm('Send as view-once? It will disappear once opened.\n\nOK = view-once, Cancel = normal photo');
-    try {
-      const compressed = await fileToCompressedBase64(file);
-      await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
-    } catch (err) {
-      toast("Couldn't send that photo");
-    }
     e.target.value = '';
+    if (!file) return;
+
+    // A yes/no dialog reading "OK = view-once, Cancel = normal photo" made the
+    // riskier option the default-looking one. Two named choices instead.
+    const send = async (viewOnce) => {
+      try {
+        const compressed = await fileToCompressedBase64(file);
+        await RoomData.sendThreadPhoto(identity.roomId, sharedKey, compressed, viewOnce);
+      } catch (err) {
+        toast("Couldn't send that photo");
+      }
+    };
+    openSheet('Send this photo', [
+      { label: 'Send normally', onClick: () => send(false) },
+      { label: 'Send as view-once', onClick: () => send(true) },
+    ]);
   };
 }
 
@@ -2247,28 +2371,41 @@ function renderCalendar(slot) {
       const now = Date.now();
       const upcoming = events.filter((e) => new Date(e.dateTime).getTime() >= now);
       const past = events.filter((e) => new Date(e.dateTime).getTime() < now).reverse();
-      const rowsFor = (arr, dim) =>
+      const rowsFor = (arr, isPast) =>
         arr
-          .map(
-            (e, i) => `
-        <div class="list-row ${dim ? 'dim' : ''}" style="animation-delay:${i * 30}ms">
+          .map((e, i) => {
+            const when = new Date(e.dateTime);
+            const away = Math.ceil((when - now) / 86400000);
+            const relative = isPast
+              ? relativeTime(when)
+              : away <= 0
+              ? 'today'
+              : away === 1
+              ? 'tomorrow'
+              : `in ${away} days`;
+            return `
+        <div class="event-row ${isPast ? 'is-past' : 'is-upcoming'}" style="animation-delay:${i * 30}ms">
           <div class="date-chip">
-            <span class="date-chip-day">${new Date(e.dateTime).getDate()}</span>
-            <span class="date-chip-mon">${new Date(e.dateTime).toLocaleDateString([], { month: 'short' })}</span>
+            <span class="date-chip-day">${when.getDate()}</span>
+            <span class="date-chip-mon">${when.toLocaleDateString([], { month: 'short' })}</span>
           </div>
           <div class="grow">
-            <div>${escapeHTML(e.title)}</div>
-            <div class="row-meta">${new Date(e.dateTime).toLocaleString([], {
-              weekday: 'short', hour: '2-digit', minute: '2-digit',
-            })}</div>
+            <div class="event-title">${escapeHTML(e.title)}</div>
+            <div class="row-meta">${escapeHTML(
+              when.toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' })
+            )}</div>
           </div>
-        </div>`
-          )
+          <span class="event-when">${escapeHTML(relative)}</span>
+        </div>`;
+          })
           .join('');
       listEl.innerHTML =
-        (upcoming.length ? `<div class="card">${rowsFor(upcoming, false)}</div>` : '') +
+        (upcoming.length
+          ? `<div class="eyebrow">Coming up</div><div class="card">${rowsFor(upcoming, false)}</div>`
+          : '') +
         (past.length
-          ? `<div class="eyebrow" style="margin-top:4px;">Past</div><div class="card">${rowsFor(past, true)}</div>`
+          ? `<div class="eyebrow" style="margin-top:4px;">Already happened</div>
+             <div class="card past-card">${rowsFor(past, true)}</div>`
           : '');
     })
   );
@@ -2408,6 +2545,7 @@ function renderGame() {
       </p>
     </div>
   `;
+  attachNav();
 
   let state = null;
   let partnerAway = false;
@@ -2589,8 +2727,16 @@ function renderGame() {
       <span class="game-round">Round ${state.round || 1}</span>`;
   }
 
-  function confirmLeave() {
-    if (!confirm('Leave the game? It ends for both of you, and they\'ll be told you left.')) return;
+  async function confirmLeave() {
+    const ok = await confirmModal({
+      title: 'Leave the game?',
+      body: `It ends for both of you, and ${escapeHTML(
+        identity.partnerName || 'they'
+      )} will be told you left. You can start a new one any time.`,
+      confirmLabel: 'Leave',
+      danger: true,
+    });
+    if (!ok) return;
     Game.leaveGame(identity.roomId, sharedKey, state)
       .then(() => toast('Game ended'))
       .catch(() => toast("Couldn't leave cleanly"));
@@ -2653,6 +2799,7 @@ function renderExpenseTracker() {
       <div id="expense-list"></div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-more-btn').onclick = () => renderMain();
 
   const atInput = document.getElementById('expense-at');
@@ -2820,7 +2967,9 @@ function renderSavingsTracker() {
 
       <details class="card details-card">
         <summary>New goal</summary>
-        <input type="text" id="goal-label" placeholder="e.g. Flight to see her" style="margin-top:10px;" />
+        <input type="text" id="goal-label" placeholder="e.g. Flight to see ${escapeHTML(
+          identity.partnerName || 'them'
+        )}" style="margin-top:10px;" />
         <input type="number" id="goal-amount" inputmode="decimal" placeholder="Target amount" style="margin-top:8px;" />
         <button class="btn-primary" id="save-goal-btn" style="margin-top:10px;">Add goal</button>
       </details>
@@ -2839,6 +2988,7 @@ function renderSavingsTracker() {
       <div id="savings-list"></div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-more-btn').onclick = () => renderMain();
 
   let goals = [];
@@ -3046,6 +3196,7 @@ function renderJournal() {
       <div id="journal-list"></div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-more-btn').onclick = () => renderMain();
   document.getElementById('add-journal-btn').onclick = async () => {
     const el = document.getElementById('journal-input');
@@ -3122,6 +3273,7 @@ function renderLetters() {
       <div id="letter-list"></div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-more-btn').onclick = () => renderMain();
   document.getElementById('add-letter-btn').onclick = async () => {
     const text = document.getElementById('letter-text').value.trim();
@@ -3196,6 +3348,7 @@ function renderMemories() {
       <div id="memories-list"></div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-more-btn').onclick = () => renderMain();
 
   const listEl = document.getElementById('memories-list');
@@ -3269,16 +3422,27 @@ function renderSettings() {
         <div class="eyebrow">Notifications</div>
         <p class="body-dim">${notifyLabel}.</p>
         <p class="fine-print">
-          Honest limit: these are local notifications. They arrive while Tidelight is open or still running in
-          the background — but if the app is fully closed or your phone clears it from memory, nothing will
-          come through until you open it again. Delivery to a closed app needs a server to send the push, which
-          this app deliberately doesn't have.
+          ${
+            pushConfigured(vapidKey)
+              ? 'These reach you even when Tidelight is completely closed. The push only ever says that your ' +
+                'person reached out — never the message itself. The words stay encrypted on your two devices; ' +
+                'the server that sends the push can\'t read them.'
+              : 'Right now these are local only: they arrive while Tidelight is open or still running in the ' +
+                'background, but not once it\'s fully closed. Closed-app delivery is built and ready — it just ' +
+                'needs the one-time push setup finished (see PUSH-SETUP.md).'
+          }
         </p>
         ${
           perm === 'default'
             ? '<button class="btn-secondary" id="enable-notify-btn" style="margin-top:10px;">Turn on notifications</button>'
             : ''
         }
+      </div>
+
+      <div class="card">
+        <div class="eyebrow">Together since</div>
+        <p class="body-dim">Sets the day counter and the milestones on your Home screen.</p>
+        <input type="date" id="together-since-input" style="margin-top:10px;" />
       </div>
 
       <div class="card">
@@ -3373,6 +3537,19 @@ function renderSettings() {
       </div>
 
       <div class="card">
+        <div class="eyebrow">Trouble loading?</div>
+        <p class="body-dim">
+          If screens sit blank, a photo won't save, or something looks half-broken, this device is probably
+          holding an old copy of the app.
+        </p>
+        <p class="fine-print">
+          This clears that cached copy and reloads. It touches nothing else — your messages, keys and
+          history are untouched, and you stay signed in.
+        </p>
+        <button class="btn-secondary" id="refresh-app-btn" style="margin-top:10px;">Reload a fresh copy</button>
+      </div>
+
+      <div class="card">
         <div class="eyebrow">Log out</div>
         <p class="body-dim">
           ${
@@ -3385,6 +3562,7 @@ function renderSettings() {
       </div>
     </div>
   `;
+  attachNav();
 
   document.getElementById('back-home-btn').onclick = () => renderMain();
   document.getElementById('toggle-pin-btn').onclick = () => renderPinChoiceFromSettings();
@@ -3398,6 +3576,8 @@ function renderSettings() {
       if (result === 'granted') {
         showNotification('Tidelight', 'Notifications are on. This is what they’ll look like.');
         toast('Notifications enabled');
+        // Now that permission exists, register this device for closed-app push.
+        registerForPush();
       } else if (result === 'denied') {
         toast('Blocked — you can re-enable them in browser settings');
       }
@@ -3415,6 +3595,24 @@ function renderSettings() {
     renderSettings();
   };
 
+  const sinceInput = document.getElementById('together-since-input');
+  unsubscribers.push(
+    RoomData.listenRoomSettings(identity.roomId, sharedKey, (settings) => {
+      if (settings.togetherSince && document.activeElement !== sinceInput) {
+        sinceInput.value = settings.togetherSince;
+      }
+    })
+  );
+  sinceInput.onchange = async () => {
+    if (!sinceInput.value) return;
+    try {
+      await RoomData.setTogetherSince(identity.roomId, sharedKey, sinceInput.value);
+      toast('Saved');
+    } catch (e) {
+      toast("Couldn't save that date");
+    }
+  };
+
   document.querySelectorAll('#gender-settings .choice').forEach((btn) => {
     btn.onclick = async () => {
       const gender = btn.dataset.gender;
@@ -3429,6 +3627,26 @@ function renderSettings() {
       renderSettings();
     };
   });
+
+  document.getElementById('refresh-app-btn').onclick = async () => {
+    const btn = document.getElementById('refresh-app-btn');
+    btn.disabled = true;
+    btn.textContent = 'Clearing…';
+    try {
+      if ('serviceWorker' in navigator) {
+        const regs = await navigator.serviceWorker.getRegistrations();
+        await Promise.all(regs.map((r) => r.unregister()));
+      }
+      if (window.caches) {
+        const keys = await caches.keys();
+        await Promise.all(keys.map((k) => caches.delete(k)));
+      }
+    } catch (e) {
+      /* reload anyway — a failed clear is still worth a fresh load */
+    }
+    // Cache-busted so the reload can't be answered from memory cache either.
+    window.location.replace(window.location.pathname + '?fresh=' + Date.now());
+  };
 
   document.getElementById('export-btn').onclick = () => handleExportArchive();
   document.getElementById('open-archive-btn').onclick = () =>
@@ -3577,6 +3795,7 @@ function renderArchiveViewer(archive) {
          <div class="money-amount">+${Number(s.amount || 0).toFixed(2)}</div></div>`
       )}
     </div>`;
+  attachNav();
   document.getElementById('archive-back').onclick = () => renderSettings();
 }
 
@@ -3615,6 +3834,7 @@ function renderDnsHelp() {
       </div>
     </div>
   `;
+  attachNav();
   document.getElementById('back-settings-btn').onclick = () => renderSettings();
 }
 
@@ -3625,6 +3845,10 @@ async function handleLogout() {
         "You haven't set up recovery. Logging out now will PERMANENTLY delete access to your account and paired room on this device — there is no way to undo this.\n\nAre you absolutely sure you want to log out?"
       );
   if (!confirmed) return;
+
+  // Stop pushing to a device that's signing out. Best-effort and before the
+  // room id is gone from local identity.
+  if (identity?.roomId) await RoomData.clearPushToken(identity.roomId);
 
   clearListeners();
   clearGlobalListeners();
@@ -3828,9 +4052,6 @@ function iconFlameSmall() {
 function iconClockSmall() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"><circle cx="12" cy="12" r="8.5"/><path d="M12 7.5V12l3 2"/></svg>';
 }
-function iconAnchorSmall() {
-  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><circle cx="12" cy="5" r="2.4"/><path d="M12 7.5V21M6 13H4a8 8 0 0016 0h-2"/></svg>';
-}
 function iconNudge() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round"><path d="M18 8a6 6 0 10-12 0c0 4-2 5-2 5h16s-2-1-2-5z"/><path d="M10.5 21a2 2 0 003 0"/></svg>';
 }
@@ -3903,6 +4124,27 @@ window.addEventListener('unhandledrejection', (e) => {
   if (root.innerHTML.trim() === '') {
     renderFatalError(e.reason instanceof Error ? e.reason : new Error(String(e.reason)));
   }
+});
+
+// A data listener dying used to leave a screen stuck on its skeleton with no
+// explanation. Now it says so and offers the one action that actually helps.
+let dataErrorToastAt = 0;
+RoomData.setDataErrorHandler(({ label }) => {
+  // Offline is already explained by the banner; don't pile on.
+  if (!navigator.onLine) return;
+  const now = Date.now();
+  if (now - dataErrorToastAt < 6000) return; // one message, not one per listener
+  dataErrorToastAt = now;
+  toast(`Couldn't load ${escapeHTML(label)}.`, {
+    duration: 8000,
+    action: {
+      label: 'Retry',
+      onClick: () => {
+        if (isPaired(identity) && sharedKey) renderMain();
+        else window.location.reload();
+      },
+    },
+  });
 });
 
 paintOfflineBanner();

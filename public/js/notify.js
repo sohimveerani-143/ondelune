@@ -1,18 +1,59 @@
 // notify.js — new-message notifications.
 //
-// READ THIS BEFORE "IMPROVING" IT:
-// These are LOCAL notifications, fired by this device while Tidelight is still
-// running (foreground, or backgrounded but not killed). They are real and they
-// work — but they are NOT server push. If the app is fully closed or the phone
-// evicts it from memory, nothing arrives until it's opened again.
+// TWO PATHS, one job:
+//  1. APP OPEN (foreground, or a hidden-but-alive tab): the page's own Firestore
+//     listener sees the new message, decrypts it on-device, and shows the
+//     notification with a real preview. FCM delivers those to the page's
+//     onMessage (a no-op here) and does not double up.
+//  2. APP FULLY CLOSED: nothing on-device is running, so Firebase Cloud
+//     Messaging delivers a server push that firebase-messaging-sw.js displays.
+//     The server cannot decrypt anything, so that push says only that your
+//     person reached out — never the message itself. E2EE is fully preserved.
 //
-// True push (delivery to a closed app) needs Firebase Cloud Messaging, and FCM
-// can only be *sent* from a trusted server — the send API requires a service
-// account key, which must never sit in client code. So it would mean a Cloud
-// Function (Blaze plan) and, to keep E2EE intact, an encrypted payload that the
-// service worker decrypts locally. That's a real, buildable path; it's just not
-// something the client can fake on its own. The UI says exactly this, rather
-// than implying notifications are more reliable than they are.
+// Path 2 requires: a VAPID key in firebase-config.js, and the Cloud Function in
+// /functions deployed (Blaze plan). Until both are in place, initPush() no-ops
+// cleanly and the app just uses path 1, exactly as before.
+import { getMessaging, getToken, onMessage, isSupported } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-messaging.js';
+
+let pushToken = null;
+export function currentPushToken() {
+  return pushToken;
+}
+
+export function pushConfigured(vapidKey) {
+  return !!vapidKey;
+}
+
+// Registers this device to receive server push. Safe to call repeatedly.
+// Returns { ok, reason?, token? }; never throws.
+export async function initPush(app, vapidKey, onToken) {
+  if (!vapidKey) return { ok: false, reason: 'unconfigured' };
+  if (typeof Notification === 'undefined' || Notification.permission !== 'granted') {
+    return { ok: false, reason: 'permission' };
+  }
+  let supported = false;
+  try {
+    supported = await isSupported();
+  } catch (e) {
+    supported = false;
+  }
+  if (!supported) return { ok: false, reason: 'unsupported' };
+
+  try {
+    const messaging = getMessaging(app);
+    const token = await getToken(messaging, { vapidKey });
+    if (!token) return { ok: false, reason: 'no-token' };
+    pushToken = token;
+    // Foreground receipts are already handled by the app's live listener, so
+    // this stays a no-op — it exists only to keep FCM wired up while open.
+    onMessage(messaging, () => {});
+    if (onToken) await onToken(token);
+    return { ok: true, token };
+  } catch (e) {
+    console.warn('Push init failed:', e?.message || e);
+    return { ok: false, reason: 'error', error: e };
+  }
+}
 
 export function notificationsSupported() {
   return typeof Notification !== 'undefined';
