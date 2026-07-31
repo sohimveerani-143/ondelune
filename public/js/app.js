@@ -293,7 +293,18 @@ function renderRecoverStep() {
     btn.textContent = 'Recovering…';
     try {
       const recovered = await recoverFromEmail(email, password);
-      identity = await saveIdentity({ ...recovered, recoveryEmail: email, pending: null });
+      // Merge over whatever is already here rather than replacing wholesale —
+      // a backup written by an older version may be missing newer fields, and
+      // a blind overwrite would drop anything this device already knew.
+      const existing = (await loadIdentity()) || {};
+      const merged = { ...existing, ...recovered, recoveryEmail: email, pending: null };
+      // Never let a null from an old backup overwrite a real local value.
+      for (const k of Object.keys(recovered)) {
+        if (recovered[k] == null && existing[k] != null) merged[k] = existing[k];
+      }
+      identity = await saveIdentity(merged);
+      lastKnownUid = (await ensureSignedIn()).uid;
+      await healPartnerUid();
       continueAfterUnlock();
     } catch (e) {
       document.getElementById('recover-error').textContent = e.message;
@@ -748,8 +759,30 @@ function registerForPush() {
 // so plainly, once, than to let them discover it one failure at a time.
 let membershipBroken = false;
 
+// The room already knows both accounts, so a missing partnerUid can simply be
+// read back off it — no re-pairing, no data loss. This matters because early
+// recovery backups omitted partnerUid entirely, leaving otherwise-healthy
+// devices half-broken: history visible, but presence, badges, streak, avatars
+// and the game all silently dead.
+async function healPartnerUid() {
+  if (!identity?.roomId || !lastKnownUid || identity.partnerUid) return false;
+  try {
+    const { doc: fbDoc, getDoc: fbGetDoc, db: fbDb } = await import('./firebase.js');
+    const snap = await fbGetDoc(fbDoc(fbDb, 'rooms', identity.roomId));
+    if (!snap.exists()) return false;
+    const members = snap.data().memberUids || [];
+    const partner = members.find((u) => u && u !== lastKnownUid);
+    if (!partner) return false;
+    identity = await updateIdentity({ partnerUid: partner });
+    return true;
+  } catch (e) {
+    return false;
+  }
+}
+
 async function verifyRoomMembership() {
   if (!identity?.roomId || !lastKnownUid) return;
+  await healPartnerUid();
   const warn = () => {
     membershipBroken = true;
     toast('This device is signed in to a different account than the one you paired with, so nothing it sends can save.', {
@@ -1158,64 +1191,61 @@ function rainLayerSVG() {
 // instead of bending. Here the feet stay planted and `lean` displaces only the
 // hips, shoulders and head, which is what leaning on someone actually looks
 // like. `lean` is roughly -1..1; positive leans right.
-function figureSVG({ cx, ground = 214, lean = 0, gender = 'unspecified' }) {
+// Two people sitting on the sand, seen from behind, watching the water.
+//
+// Deliberately NOT anatomical. Realistic proportions read as stiff and clinical
+// at this size; cute reads as warm, which is the whole point of the app. So the
+// head is oversized (~35% of the seated height), every form is rounded, and
+// there isn't a straight line anywhere. Cross-legged knees poke out at the base.
+function figureSVG({ cx, ground = 206, lean = 0, gender = 'unspecified' }) {
   const FILL = '#080610';
-  const RIM = 'rgba(243,217,168,0.42)';
+  const RIM = 'rgba(243,217,168,0.40)';
 
-  const shoulderW = gender === 'man' ? 9.4 : 7.9;
-  const hipW = gender === 'woman' ? 7.4 : 6.2;
-  const footW = 4.2;
-  const headR = 5.7;
+  const baseW = gender === 'man' ? 13.6 : 12.4; // half-width where they meet the sand
+  const shoulderW = baseW * 0.64;
+  const bodyH = 24;
+  const headR = 7.4;
 
-  // Leaning displaces the upper body progressively — barely at the hips, most
-  // at the head — and drops the head a touch, the way a head settling onto a
-  // shoulder actually falls rather than just sliding sideways.
-  const hx = lean * 1.6;
-  const sx = lean * 4.6;
-  const hdx = lean * 6.2;
-  const headDrop = Math.abs(lean) * 2.6;
+  // Leaning tips the head most, shoulders a little, and lets the head settle
+  // downward — a head coming to rest on a shoulder, not sliding sideways.
+  const hx = lean * 5.4;
+  const sx = lean * 1.9;
+  const headDrop = Math.abs(lean) * 2.4;
 
-  const y = (up) => ground - up;
-  const headY = y(52.5) + headDrop;
+  const shoulderY = ground - bodyH;
+  const headY = shoulderY - headR + 2.6 + headDrop;
 
+  // One soft bell shape: hips wide on the sand, narrowing to rounded shoulders.
   const body = [
-    `M${cx - footW},${ground}`,
-    // outer left leg up into the hip
-    `C${cx - footW - 0.6},${y(15)} ${cx - hipW - 0.6 + hx},${y(21)} ${cx - hipW + hx},${y(28)}`,
-    // waist taper up to the shoulder
-    `L${cx - shoulderW * 0.82 + sx},${y(39)}`,
-    `Q${cx - shoulderW + sx},${y(43.5)} ${cx - shoulderW * 0.5 + sx},${y(45.8)}`,
-    // neck
-    `L${cx - 2.1 + hdx * 0.72},${y(46.6)}`,
-    `L${cx + 2.1 + hdx * 0.72},${y(46.6)}`,
-    // mirrored right side back down
-    `L${cx + shoulderW * 0.5 + sx},${y(45.8)}`,
-    `Q${cx + shoulderW + sx},${y(43.5)} ${cx + shoulderW * 0.82 + sx},${y(39)}`,
-    `L${cx + hipW + hx},${y(28)}`,
-    `C${cx + hipW + 0.6 + hx},${y(21)} ${cx + footW + 0.6},${y(15)} ${cx + footW},${ground}`,
-    // inner right leg up to the crotch, then back down the inner left leg —
-    // this notch is what stops it reading as a single blob
-    `L${cx + 1.15},${ground}`,
-    `L${cx + 1.5 + hx * 0.4},${y(14)}`,
-    `L${cx + hx * 0.8},${y(25)}`,
-    `L${cx - 1.5 + hx * 0.4},${y(14)}`,
-    `L${cx - 1.15},${ground}`,
+    `M${cx - baseW},${ground}`,
+    `C${cx - baseW - 0.6},${ground - bodyH * 0.48} ${cx - shoulderW - 1.6 + sx},${ground - bodyH * 0.83} ${
+      cx - shoulderW + sx
+    },${shoulderY}`,
+    `Q${cx + sx},${shoulderY - 3.4} ${cx + shoulderW + sx},${shoulderY}`,
+    `C${cx + shoulderW + 1.6 + sx},${ground - bodyH * 0.83} ${cx + baseW + 0.6},${ground - bodyH * 0.48} ${
+      cx + baseW
+    },${ground}`,
     'Z',
   ].join(' ');
 
-  // Long hair falls behind the head and follows the lean.
+  // Long hair: a rounded fall behind the head, following the lean.
   const hair =
     gender === 'woman'
-      ? `<path d="M${cx + hdx - headR - 0.8},${headY - 1}
-           q-1.6,7.2 1.4,10.4 q3.2,1.6 6.6,0 q3,-3.2 1.4,-10.4 z" fill="${FILL}"/>`
+      ? `<path d="M${cx + hx - headR - 1.2},${headY + 0.5}
+           q-1.4,8 1.8,10.8 q3.4,1.6 6.8,0 q3.2,-2.8 1.8,-10.8 z" fill="${FILL}"/>`
       : '';
+
+  const knees = `
+    <ellipse cx="${cx - baseW + 2.2}" cy="${ground - 2.6}" rx="4.2" ry="3.1" fill="${FILL}"/>
+    <ellipse cx="${cx + baseW - 2.2}" cy="${ground - 2.6}" rx="4.2" ry="3.1" fill="${FILL}"/>`;
 
   return `<g class="hero-figure">
     ${hair}
+    ${knees}
     <path d="${body}" fill="${FILL}"/>
-    <circle cx="${cx + hdx}" cy="${headY}" r="${headR}" fill="${FILL}"/>
-    <path d="${body}" fill="none" stroke="${RIM}" stroke-width="0.7" stroke-linejoin="round"/>
-    <circle cx="${cx + hdx}" cy="${headY}" r="${headR}" fill="none" stroke="${RIM}" stroke-width="0.7"/>
+    <circle cx="${cx + hx}" cy="${headY}" r="${headR}" fill="${FILL}"/>
+    <path d="${body}" fill="none" stroke="${RIM}" stroke-width="0.65" stroke-linejoin="round"/>
+    <circle cx="${cx + hx}" cy="${headY}" r="${headR}" fill="none" stroke="${RIM}" stroke-width="0.65"/>
   </g>`;
 }
 
@@ -1229,17 +1259,17 @@ function figuresGroupSVG(moodState, genders = {}) {
   // right of centre so they read against the lighter water beside the moon's
   // reflection rather than getting lost in the dark middle of it.
   if (moodState === 'meLow') {
-    // You lean in; they stand steady and let you.
-    return figureSVG({ cx: 213, lean: 0.86, gender: me }) + figureSVG({ cx: 231, lean: 0, gender: them });
+    // You tip your head onto them; they sit steady and let you.
+    return figureSVG({ cx: 206, lean: 0.9, gender: me }) + figureSVG({ cx: 234, lean: 0, gender: them });
   }
   if (moodState === 'themLow') {
-    return figureSVG({ cx: 213, lean: 0, gender: me }) + figureSVG({ cx: 231, lean: -0.86, gender: them });
+    return figureSVG({ cx: 206, lean: 0, gender: me }) + figureSVG({ cx: 234, lean: -0.9, gender: them });
   }
   if (moodState === 'bothLow') {
-    // Both tip inward, heads almost touching.
-    return figureSVG({ cx: 214, lean: 0.6, gender: me }) + figureSVG({ cx: 230, lean: -0.6, gender: them });
+    // Both tip inward until their heads meet.
+    return figureSVG({ cx: 208, lean: 0.62, gender: me }) + figureSVG({ cx: 232, lean: -0.62, gender: them });
   }
-  return figureSVG({ cx: 200, lean: 0, gender: me }) + figureSVG({ cx: 244, lean: 0, gender: them });
+  return figureSVG({ cx: 198, lean: 0, gender: me }) + figureSVG({ cx: 242, lean: 0, gender: them });
 }
 
 function heroCaptionFor(moodState) {
@@ -1351,6 +1381,13 @@ function heroSceneSVG(moodState = 'calm', genders = {}) {
     </g>
 
     <path d="M0,150 Q40,146 80,150 T160,150 T240,150 T320,150 T400,150 V156 Q360,152 320,156 T240,156 T160,156 T80,156 T0,156 Z" fill="${p.top}" opacity="0.55"/>
+
+    <!-- Foreground shore. They're sitting on something now, which the standing
+         version never needed and the seated one very much does. -->
+    <path d="M-10,212 Q60,203 140,207 T290,205 T410,209 V222 H-10 Z" fill="#0a0714"/>
+    <path d="M-10,212 Q60,203 140,207 T290,205 T410,209" fill="none"
+          stroke="rgba(243,217,168,0.13)" stroke-width="0.9"/>
+
     <g class="hero-figures">${figuresGroupSVG(moodState, genders)}</g>
     ${isLow ? rainLayerSVG() : ''}
   </svg>`;
@@ -3750,6 +3787,12 @@ function renderSettings() {
           <button class="btn-secondary" id="refresh-app-btn">Reload a fresh copy</button>
           <button class="btn-secondary" id="connection-check-btn">Connection check</button>
         </div>
+        <button class="btn-secondary" id="repair-pair-btn" style="margin-top:10px;">Reconnect to your partner</button>
+        <p class="fine-print">
+          Reconnecting keeps your keys, so it lands you back in the <strong>same room with all your history</strong> —
+          it only re-links the two accounts. Whoever's app still works should be the one to <strong>open</strong> the
+          link; the person having trouble should be the one to create it.
+        </p>
       </div>
 
       <div class="card">
@@ -3832,6 +3875,24 @@ function renderSettings() {
   });
 
   document.getElementById('connection-check-btn').onclick = () => renderConnectionCheck();
+
+  document.getElementById('repair-pair-btn').onclick = async () => {
+    const ok = await confirmModal({
+      title: 'Reconnect to your partner?',
+      body:
+        'Your keys stay exactly as they are, so this puts you back in the same room with all your messages, ' +
+        'letters and photos intact. Nothing is deleted. Whoever can still use the app normally should be the ' +
+        'one to open the link.',
+      confirmLabel: 'Reconnect',
+    });
+    if (!ok) return;
+    clearListeners();
+    clearGlobalListeners();
+    // Keep the keypair — that's what preserves the room id and the history.
+    // Only the pending-link slot is cleared so a fresh link can be made.
+    identity = await updateIdentity({ pending: null });
+    renderPairingHub();
+  };
 
   document.getElementById('refresh-app-btn').onclick = async () => {
     const btn = document.getElementById('refresh-app-btn');
@@ -4119,19 +4180,26 @@ function renderConnectionCheck() {
     }
     paint();
 
-    // 2. local pairing data
+    // 2. local pairing data — try to repair a missing partnerUid before judging
     const rLocal = add('Paired on this device');
+    if (identity?.roomId && !identity?.partnerUid) await healPartnerUid();
     if (identity?.roomId && identity?.partnerUid && identity?.secretKey) {
       rLocal.state = 'pass';
       rLocal.detail = `Room ${identity.roomId.slice(0, 8)}… · partner ${identity.partnerUid.slice(0, 8)}…`;
     } else {
       rLocal.state = 'fail';
-      rLocal.detail = !identity?.roomId
-        ? 'no room stored'
-        : !identity?.secretKey
-        ? 'private key locked — unlock with your PIN'
-        : 'no partner stored';
-      verdict = verdict || 'This device is not fully paired. Pair again from a fresh start.';
+      if (!identity?.roomId) {
+        rLocal.detail = 'no room stored';
+        verdict = verdict || 'This device has never completed pairing. Use “Pair again” in Settings.';
+      } else if (!identity?.secretKey) {
+        rLocal.detail = 'private key locked — unlock with your PIN';
+        verdict = verdict || 'Your private key is locked. Reopen the app and enter your PIN.';
+      } else {
+        // Room is known but the partner's account id isn't, and it couldn't be
+        // read back off the room — which means the room isn't readable either.
+        rLocal.detail = "partner's account id unknown on this device";
+        verdict = verdict || WRONG_ACCOUNT_VERDICT;
+      }
     }
     paint();
 

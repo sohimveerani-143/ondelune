@@ -17,15 +17,22 @@ export async function setUpRecovery(email, password, identity) {
   const credential = EmailAuthProvider.credential(email, password);
   await linkWithCredential(auth.currentUser, credential);
 
+  // Everything needed to be fully functional again on a new device.
+  // `partnerUid` in particular MUST be here: it was missing originally, and
+  // without it a recovered device still opens and shows history but has no idea
+  // who its partner is — presence, unread badges, the streak, profile pictures,
+  // expense attribution and the game all quietly stop working.
   const backup = await encryptWithPassphrase(
     {
       displayName: identity.displayName,
       timezone: identity.timezone,
+      gender: identity.gender || null,
       publicKey: identity.publicKey,
       secretKey: identity.secretKey,
       partnerPublicKey: identity.partnerPublicKey || null,
       partnerName: identity.partnerName || null,
       partnerTimezone: identity.partnerTimezone || null,
+      partnerUid: identity.partnerUid || null,
       roomId: identity.roomId || null,
     },
     password
