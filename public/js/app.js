@@ -1121,37 +1121,101 @@ const STARS = (() => {
   }));
 })();
 
+// Rain, shown only when one of you is low. Fixed set so it doesn't reshuffle on
+// every repaint; staggered delays and varied lengths keep it from looking like
+// a marching grid.
+const RAINDROPS = (() => {
+  let seed = 31;
+  const rand = () => ((seed = (seed * 9301 + 49297) % 233280) / 233280);
+  return Array.from({ length: 34 }, () => ({
+    x: Math.round(rand() * 430) - 15,
+    len: (rand() * 7 + 5).toFixed(1),
+    d: (rand() * 1.1).toFixed(2),
+    dur: (rand() * 0.5 + 0.85).toFixed(2),
+    o: (rand() * 0.28 + 0.16).toFixed(2),
+  }));
+})();
+
+function rainLayerSVG() {
+  return `<g class="hero-rain">${RAINDROPS.map(
+    (r) =>
+      `<line x1="${r.x}" y1="-12" x2="${r.x - 3}" y2="${-12 + Number(r.len)}"
+         stroke="#cdd6e8" stroke-width="0.8" stroke-linecap="round" opacity="${r.o}"
+         style="animation-delay:${r.d}s; animation-duration:${r.dur}s"/>`
+  ).join('')}</g>`;
+}
+
 // A single silhouette. Rotating the whole group (rather than the body alone)
 // keeps the head attached when someone leans, which the old version didn't.
 // Sizes are deliberately larger than the first pass — small enough to stay a
 // silhouette on the horizon, big enough to actually read as two people.
-function figureSVG({ cx, lean = 0, gender = 'unspecified' }) {
-  const FILL = '#0d0a1a';
-  const cyBody = 192;
-  const cyHead = 163;
-  const bodyRx = gender === 'man' ? 15.5 : 14;
-  const bodyRy = 25;
-  const headR = 9;
+// A standing person drawn as one continuous silhouette path: shoulders, a torso
+// that tapers to the waist, hips, and two legs with a gap between them.
+//
+// The previous version was an ellipse with a circle balanced on it, which read
+// exactly like an egg — and it "leaned" by rotating the entire shape about a
+// point below the feet, so the whole body swung sideways like a metronome
+// instead of bending. Here the feet stay planted and `lean` displaces only the
+// hips, shoulders and head, which is what leaning on someone actually looks
+// like. `lean` is roughly -1..1; positive leans right.
+function figureSVG({ cx, ground = 214, lean = 0, gender = 'unspecified' }) {
+  const FILL = '#080610';
+  const RIM = 'rgba(243,217,168,0.42)';
 
-  // Long hair reads as a distinct silhouette without resorting to caricature.
+  const shoulderW = gender === 'man' ? 9.4 : 7.9;
+  const hipW = gender === 'woman' ? 7.4 : 6.2;
+  const footW = 4.2;
+  const headR = 5.7;
+
+  // Leaning displaces the upper body progressively — barely at the hips, most
+  // at the head — and drops the head a touch, the way a head settling onto a
+  // shoulder actually falls rather than just sliding sideways.
+  const hx = lean * 1.6;
+  const sx = lean * 4.6;
+  const hdx = lean * 6.2;
+  const headDrop = Math.abs(lean) * 2.6;
+
+  const y = (up) => ground - up;
+  const headY = y(52.5) + headDrop;
+
+  const body = [
+    `M${cx - footW},${ground}`,
+    // outer left leg up into the hip
+    `C${cx - footW - 0.6},${y(15)} ${cx - hipW - 0.6 + hx},${y(21)} ${cx - hipW + hx},${y(28)}`,
+    // waist taper up to the shoulder
+    `L${cx - shoulderW * 0.82 + sx},${y(39)}`,
+    `Q${cx - shoulderW + sx},${y(43.5)} ${cx - shoulderW * 0.5 + sx},${y(45.8)}`,
+    // neck
+    `L${cx - 2.1 + hdx * 0.72},${y(46.6)}`,
+    `L${cx + 2.1 + hdx * 0.72},${y(46.6)}`,
+    // mirrored right side back down
+    `L${cx + shoulderW * 0.5 + sx},${y(45.8)}`,
+    `Q${cx + shoulderW + sx},${y(43.5)} ${cx + shoulderW * 0.82 + sx},${y(39)}`,
+    `L${cx + hipW + hx},${y(28)}`,
+    `C${cx + hipW + 0.6 + hx},${y(21)} ${cx + footW + 0.6},${y(15)} ${cx + footW},${ground}`,
+    // inner right leg up to the crotch, then back down the inner left leg —
+    // this notch is what stops it reading as a single blob
+    `L${cx + 1.15},${ground}`,
+    `L${cx + 1.5 + hx * 0.4},${y(14)}`,
+    `L${cx + hx * 0.8},${y(25)}`,
+    `L${cx - 1.5 + hx * 0.4},${y(14)}`,
+    `L${cx - 1.15},${ground}`,
+    'Z',
+  ].join(' ');
+
+  // Long hair falls behind the head and follows the lean.
   const hair =
     gender === 'woman'
-      ? `<ellipse cx="${cx}" cy="${cyHead + 5}" rx="${headR + 2.4}" ry="${headR + 2}" fill="${FILL}"/>`
-      : '';
-  // A slight flare at the hem, again silhouette-only.
-  const skirt =
-    gender === 'woman'
-      ? `<path d="M${cx - bodyRx - 2},${cyBody + 20} Q${cx},${cyBody + 8} ${cx + bodyRx + 2},${
-          cyBody + 20
-        } Z" fill="${FILL}"/>`
+      ? `<path d="M${cx + hdx - headR - 0.8},${headY - 1}
+           q-1.6,7.2 1.4,10.4 q3.2,1.6 6.6,0 q3,-3.2 1.4,-10.4 z" fill="${FILL}"/>`
       : '';
 
-  const rot = lean ? ` transform="rotate(${lean} ${cx} ${cyBody + 20})"` : '';
-  return `<g${rot}>
-    ${skirt}
-    <ellipse cx="${cx}" cy="${cyBody}" rx="${bodyRx}" ry="${bodyRy}" fill="${FILL}"/>
+  return `<g class="hero-figure">
     ${hair}
-    <circle cx="${cx}" cy="${cyHead}" r="${headR}" fill="${FILL}"/>
+    <path d="${body}" fill="${FILL}"/>
+    <circle cx="${cx + hdx}" cy="${headY}" r="${headR}" fill="${FILL}"/>
+    <path d="${body}" fill="none" stroke="${RIM}" stroke-width="0.7" stroke-linejoin="round"/>
+    <circle cx="${cx + hdx}" cy="${headY}" r="${headR}" fill="none" stroke="${RIM}" stroke-width="0.7"/>
   </g>`;
 }
 
@@ -1160,20 +1224,22 @@ function figuresGroupSVG(moodState, genders = {}) {
   const me = genders.mine || 'unspecified';
   const them = genders.theirs || 'unspecified';
 
-  // Sat right of centre so the pair reads against the lighter water beside the
-  // moon's reflection rather than getting lost in the dark middle of it.
+  // Distance carries as much meaning as posture here: the pair stand apart when
+  // things are steady and close the gap when one of you needs the other. Sat
+  // right of centre so they read against the lighter water beside the moon's
+  // reflection rather than getting lost in the dark middle of it.
   if (moodState === 'meLow') {
-    // You lean into them; they stand steady and close.
-    return figureSVG({ cx: 206, lean: 13, gender: me }) + figureSVG({ cx: 236, lean: 0, gender: them });
+    // You lean in; they stand steady and let you.
+    return figureSVG({ cx: 213, lean: 0.86, gender: me }) + figureSVG({ cx: 231, lean: 0, gender: them });
   }
   if (moodState === 'themLow') {
-    return figureSVG({ cx: 206, lean: 0, gender: me }) + figureSVG({ cx: 236, lean: -13, gender: them });
+    return figureSVG({ cx: 213, lean: 0, gender: me }) + figureSVG({ cx: 231, lean: -0.86, gender: them });
   }
   if (moodState === 'bothLow') {
-    // Both tip toward each other, shoulders nearly touching.
-    return figureSVG({ cx: 211, lean: 9, gender: me }) + figureSVG({ cx: 233, lean: -9, gender: them });
+    // Both tip inward, heads almost touching.
+    return figureSVG({ cx: 214, lean: 0.6, gender: me }) + figureSVG({ cx: 230, lean: -0.6, gender: them });
   }
-  return figureSVG({ cx: 198, lean: 0, gender: me }) + figureSVG({ cx: 246, lean: 0, gender: them });
+  return figureSVG({ cx: 200, lean: 0, gender: me }) + figureSVG({ cx: 244, lean: 0, gender: them });
 }
 
 function heroCaptionFor(moodState) {
@@ -1183,15 +1249,47 @@ function heroCaptionFor(moodState) {
   return 'Two shores, one sky.';
 }
 
+// Pulls a palette toward overcast: cooler, flatter, less light in it. Used so a
+// low day actually *feels* different at a glance, before you read a word.
+function cooled(hex, amount) {
+  const n = parseInt(hex.slice(1), 16);
+  let r = (n >> 16) & 255,
+    g = (n >> 8) & 255,
+    b = n & 255;
+  const grey = (r + g + b) / 3;
+  r = Math.round(r + (grey - r) * amount) - Math.round(6 * amount);
+  g = Math.round(g + (grey - g) * amount);
+  b = Math.round(b + (grey - b) * amount) + Math.round(10 * amount);
+  const cl = (v) => Math.max(0, Math.min(255, v));
+  return `#${((1 << 24) + (cl(r) << 16) + (cl(g) << 8) + cl(b)).toString(16).slice(1)}`;
+}
+
 function heroSceneSVG(moodState = 'calm', genders = {}) {
-  const p = skyPaletteFor(new Date().getHours());
+  const base = skyPaletteFor(new Date().getHours());
+  const isLow = moodState !== 'calm';
+  const heavy = moodState === 'bothLow';
+
+  // When one of you is low the sky clouds over; when both are, it rains harder
+  // and the moon all but disappears behind the weather.
+  const p = isLow
+    ? {
+        ...base,
+        top: cooled(base.top, heavy ? 0.6 : 0.4),
+        mid: cooled(base.mid, heavy ? 0.6 : 0.4),
+        bot: cooled(base.bot, heavy ? 0.72 : 0.5),
+        star: base.star * (heavy ? 0.12 : 0.35),
+      }
+    : base;
+
   const stars = STARS.map(
     (s) =>
       `<circle class="hero-star" cx="${s.x}" cy="${s.y}" r="${s.r}" fill="#fdf3dd" style="animation-delay:${s.d}s"/>`
   ).join('');
 
   return `
-  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="${moodState}" data-sky="${p.name}">
+  <svg viewBox="0 0 400 220" preserveAspectRatio="xMidYMid slice" data-mood="${moodState}" data-sky="${
+    p.name
+  }" class="${isLow ? 'is-overcast' : ''} ${heavy ? 'is-downpour' : ''}">
     <defs>
       <linearGradient id="sky" x1="0" y1="0" x2="0" y2="1">
         <stop offset="0%" stop-color="${p.top}"/>
@@ -1217,21 +1315,32 @@ function heroSceneSVG(moodState = 'calm', genders = {}) {
     <g style="opacity:${p.star}">${stars}</g>
     <g class="hero-shooting"><circle cx="0" cy="0" r="1.5" fill="#fff6e2"/><rect x="-16" y="-0.4" width="16" height="0.8" fill="#fff6e2" opacity="0.5"/></g>
 
-    <g class="hero-cloud hero-cloud-a" opacity="0.16">
+    <g class="hero-cloud hero-cloud-a" opacity="${isLow ? 0.3 : 0.16}">
       <ellipse cx="90" cy="52" rx="42" ry="9" fill="#f7ede0"/>
       <ellipse cx="120" cy="49" rx="28" ry="7" fill="#f7ede0"/>
     </g>
-    <g class="hero-cloud hero-cloud-b" opacity="0.11">
+    <g class="hero-cloud hero-cloud-b" opacity="${isLow ? 0.22 : 0.11}">
       <ellipse cx="300" cy="86" rx="52" ry="8" fill="#f7ede0"/>
     </g>
 
-    <circle cx="200" cy="58" r="52" fill="url(#moonGlow)" class="hero-halo"/>
-    <g class="hero-moon">
+    <circle cx="200" cy="58" r="52" fill="url(#moonGlow)" class="hero-halo" opacity="${
+      heavy ? 0.22 : isLow ? 0.5 : 1
+    }"/>
+    <g class="hero-moon" opacity="${heavy ? 0.4 : isLow ? 0.72 : 1}">
       <circle cx="200" cy="58" r="22" fill="#f5e0b8"/>
       <circle cx="192" cy="52" r="3.4" fill="#e6cda1" opacity="0.55"/>
       <circle cx="206" cy="64" r="2.6" fill="#e6cda1" opacity="0.45"/>
       <circle cx="203" cy="49" r="1.8" fill="#e6cda1" opacity="0.4"/>
     </g>
+    ${
+      isLow
+        ? `<g class="hero-stormcloud" opacity="${heavy ? 0.5 : 0.34}">
+             <ellipse cx="196" cy="50" rx="58" ry="13" fill="#b9c2d6"/>
+             <ellipse cx="232" cy="45" rx="34" ry="10" fill="#b9c2d6"/>
+             <ellipse cx="166" cy="46" rx="28" ry="9" fill="#b9c2d6"/>
+           </g>`
+        : ''
+    }
 
     <rect x="0" y="150" width="400" height="70" fill="url(#sea)"/>
     <g clip-path="url(#seaClip)">
@@ -1243,6 +1352,7 @@ function heroSceneSVG(moodState = 'calm', genders = {}) {
 
     <path d="M0,150 Q40,146 80,150 T160,150 T240,150 T320,150 T400,150 V156 Q360,152 320,156 T240,156 T160,156 T80,156 T0,156 Z" fill="${p.top}" opacity="0.55"/>
     <g class="hero-figures">${figuresGroupSVG(moodState, genders)}</g>
+    ${isLow ? rainLayerSVG() : ''}
   </svg>`;
 }
 
@@ -1339,6 +1449,7 @@ function renderHome(slot) {
         <div class="bento-tile span-2 tone-mood" id="home-mood-tile">
           <div class="tile-head">${iconToday()}<span class="tile-name">Their mood</span></div>
           <div class="mood-face" id="home-partner-mood">–</div>
+          <div class="mood-nudge-line" id="home-mood-note"></div>
         </div>
 
         <button class="bento-tile span-2 tone-nudge nudge-tile" id="nudge-btn">
@@ -1596,8 +1707,17 @@ function renderHome(slot) {
 
       const tile = document.getElementById('home-mood-tile');
       const moodEl = document.getElementById('home-partner-mood');
+      const noteEl = document.getElementById('home-mood-note');
       if (moodEl) moodEl.textContent = theirs ? theirs.mood : '–';
       if (tile) applyMoodTint(tile, theirs ? theirs.mood : null);
+
+      // If they're having a hard day, this tile should catch you the moment you
+      // open Home — that's the whole point of them sharing it. Warm and quiet,
+      // not an alarm: a soft halo and one line telling you what would help.
+      if (tile && noteEl) {
+        tile.classList.toggle('needs-you', !!theirLow);
+        noteEl.textContent = theirLow ? 'Reach out.' : '';
+      }
 
       if (moodState === heroMoodState) return;
       heroMoodState = moodState;

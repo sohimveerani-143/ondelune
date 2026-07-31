@@ -358,6 +358,31 @@ button:disabled { opacity: 0.55; cursor: default; }
   opacity: 0;
 }
 
+/* Weather. Rain only appears when someone has logged a low mood, so the scene
+   reads as "today is heavy" before a single word is read. */
+.hero-rain line {
+  animation-name: rainfall;
+  animation-timing-function: linear;
+  animation-iteration-count: infinite;
+}
+@keyframes rainfall {
+  from { transform: translate(0, 0); }
+  to { transform: translate(-14px, 235px); }
+}
+.hero-stormcloud { animation: drift-slow 48s ease-in-out infinite alternate; }
+@keyframes drift-slow {
+  from { transform: translateX(-10px); }
+  to { transform: translateX(14px); }
+}
+/* A downpour falls faster and denser. */
+.is-downpour .hero-rain line { animation-duration: 0.62s !important; }
+.is-overcast .hero-reflection { opacity: 0.25; }
+.is-overcast .hero-wave { opacity: 0.5; }
+
+/* The figures get a faint moonlit edge so they read against the water instead
+   of dissolving into it — near-black on near-black was the problem. */
+.hero-figure { animation: rise-soft 0.9s var(--ease) both; }
+
 @keyframes breathe { 0%, 100% { transform: scale(1); } 50% { transform: scale(1.03); } }
 @keyframes halo { 0%, 100% { opacity: 0.5; transform: scale(1); } 50% { opacity: 0.75; transform: scale(1.07); } }
 @keyframes twinkle { 0%, 100% { opacity: 0.25; } 50% { opacity: 0.95; } }
@@ -603,6 +628,32 @@ button:disabled { opacity: 0.55; cursor: default; }
 .clock-divider { width: 1px; align-self: stretch; background: var(--border); }
 
 .mood-face { font-size: 26px; line-height: 1.2; }
+
+/* When they've logged a low mood, this tile should be the thing your eye lands
+   on. Deliberately warm rather than alarming — a slow breathing halo, not a
+   red badge. Someone having a hard day is not an error state. */
+.mood-nudge-line {
+  font-size: 10.5px;
+  color: var(--horizon);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  margin-top: 3px;
+  min-height: 13px;
+}
+.bento-tile.needs-you {
+  border-color: rgba(224, 144, 111, 0.45);
+  animation: needs-you-glow 3.4s ease-in-out infinite;
+}
+.bento-tile.needs-you .mood-face { animation: needs-you-lift 3.4s ease-in-out infinite; }
+
+@keyframes needs-you-glow {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(224, 144, 111, 0); }
+  50% { box-shadow: 0 0 0 4px rgba(224, 144, 111, 0.14); }
+}
+@keyframes needs-you-lift {
+  0%, 100% { transform: translateY(0); }
+  50% { transform: translateY(-2px); }
+}
 
 /* ---------- Avatars ---------- */
 .avatar-stack { position: relative; width: 44px; height: 64px; flex-shrink: 0; }
