@@ -43,6 +43,27 @@ export function stopHeartbeat() {
   heartbeatTimer = null;
 }
 
+// Stamps "I was here just now" immediately, independent of the heartbeat.
+//
+// Without this, lastSeen was only ever as fresh as the last 45s tick, so the
+// moment someone actually closed the app was never recorded — their partner
+// would see a time up to a minute stale, or nothing useful at all. This is
+// called when the app is being hidden or closed, which is exactly the instant
+// worth recording, and it's the value shown as "last seen".
+export async function markSeenNow(roomId) {
+  if (!roomId) return;
+  try {
+    const user = await ensureSignedIn();
+    await setDoc(
+      doc(db, 'rooms', roomId, 'presence', user.uid),
+      { uid: user.uid, lastSeen: Date.now(), typingUntil: 0 },
+      { merge: true }
+    );
+  } catch (e) {
+    /* best effort — the page may be going away */
+  }
+}
+
 // Throttled so a fast typist doesn't generate a write per keystroke.
 export async function signalTyping(roomId) {
   const now = Date.now();

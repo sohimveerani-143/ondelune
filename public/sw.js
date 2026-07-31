@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tidelight-v9';
+const CACHE_NAME = 'tidelight-v10';
 const SHELL_FILES = [
   './',
   './index.html',

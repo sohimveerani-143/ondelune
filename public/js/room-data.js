@@ -37,13 +37,16 @@ export function setDataErrorHandler(fn) {
   onDataError = fn;
 }
 
-function watch(ref, handlerOrOptions, maybeHandler, label) {
+// `label` comes first so every call site is forced to name what it's loading —
+// an error that says "couldn't load journal" is actionable; "couldn't load
+// data" is not.
+function watch(label, ref, handlerOrOptions, maybeHandler) {
   const hasOptions = typeof handlerOrOptions === 'object';
   const options = hasOptions ? handlerOrOptions : null;
   const handler = hasOptions ? maybeHandler : handlerOrOptions;
   const fail = (err) => {
-    console.error(`Listener failed (${label || 'data'}):`, err);
-    if (onDataError) onDataError({ label: label || 'data', error: err });
+    console.error(`Listener failed (${label}):`, err);
+    if (onDataError) onDataError({ label, error: err });
   };
   return options ? onSnapshot(ref, options, handler, fail) : onSnapshot(ref, handler, fail);
 }
@@ -170,7 +173,7 @@ export async function deleteMemory(roomId, memoryId) {
 
 export function listenMemories(roomId, sharedKey, onMemories) {
   const q = query(col(roomId, 'memories'), orderBy('createdAt', 'desc'));
-  return watch(q, (snap) => {
+  return watch('memories', q, (snap) => {
     const memories = snap.docs.map((d) => {
       const data = d.data();
       let parsed = { type: 'text', text: '⚠️ Could not decrypt' };
@@ -242,7 +245,7 @@ function decodeMessageDoc(d, sharedKey) {
 // `reachedStart` tells the UI whether an "earlier messages" button is needed.
 export function listenThread(roomId, sharedKey, onMessages, max = 60) {
   const q = query(col(roomId, 'thread'), orderBy('createdAt', 'desc'), fbLimit(max));
-  return watch(q, { includeMetadataChanges: true }, (snap) => {
+  return watch('chat', q, { includeMetadataChanges: true }, (snap) => {
     const messages = snap.docs.map((d) => decodeMessageDoc(d, sharedKey)).reverse();
     onMessages(messages, { reachedStart: snap.docs.length < max });
   });
@@ -252,7 +255,7 @@ export function listenThread(roomId, sharedKey, onMessages, max = 60) {
 // so it can stay subscribed app-wide without dragging the whole history around.
 export function listenLatestMessage(roomId, sharedKey, onMessage) {
   const q = query(col(roomId, 'thread'), orderBy('createdAt', 'desc'), fbLimit(1));
-  return watch(q, (snap) => {
+  return watch('chat', q, (snap) => {
     if (snap.empty) return onMessage(null);
     onMessage(decodeMessageDoc(snap.docs[0], sharedKey));
   });
@@ -277,7 +280,7 @@ export async function setTodayMood(roomId, sharedKey, mood) {
 
 export function listenMood(roomId, sharedKey, onEntries) {
   const q = query(col(roomId, 'mood'), orderBy('createdAt', 'desc'));
-  return watch(q, (snap) => {
+  return watch('moods', q, (snap) => {
     const entries = snap.docs.map((d) => {
       const data = d.data();
       let mood = null;
@@ -307,7 +310,7 @@ export async function addCalendarEvent(roomId, sharedKey, { title, dateTime }) {
 
 export function listenCalendar(roomId, sharedKey, onEvents) {
   const q = query(col(roomId, 'calendar'), orderBy('dateTime', 'asc'));
-  return watch(q, (snap) => {
+  return watch('calendar', q, (snap) => {
     const events = snap.docs.map((d) => {
       const data = d.data();
       let title = '⚠️ Could not decrypt';
@@ -341,7 +344,7 @@ export async function toggleBucketItem(roomId, sharedKey, itemId, currentText, c
 
 export function listenBucketList(roomId, sharedKey, onItems) {
   const q = query(col(roomId, 'bucketlist'), orderBy('createdAt', 'asc'));
-  return watch(q, (snap) => {
+  return watch('your list', q, (snap) => {
     const items = snap.docs.map((d) => {
       const data = d.data();
       let text = '⚠️ Could not decrypt';
@@ -380,7 +383,7 @@ export function listenPhotos(roomId, sharedKey, onPhotos, max = 14) {
   // Cap the query itself so a growing photo history never pulls every base64
   // image down onto a low-RAM device — only the most recent `max` load.
   const q = query(col(roomId, 'photos'), orderBy('createdAt', 'desc'), fbLimit(max));
-  return watch(q, (snap) => {
+  return watch('photos', q, (snap) => {
     const photos = snap.docs.map((d) => {
       const data = d.data();
       let image = null;
@@ -419,7 +422,7 @@ async function getRoomSettingsOnce(roomId, sharedKey) {
 }
 
 export function listenRoomSettings(roomId, sharedKey, onSettings) {
-  return watch(doc(db, 'rooms', roomId, 'meta', 'settings'), (snap) => {
+  return watch('settings', doc(db, 'rooms', roomId, 'meta', 'settings'), (snap) => {
     const data = snap.data();
     if (!data) return onSettings({});
     try {
@@ -464,7 +467,7 @@ export async function deleteExpense(roomId, expenseId) {
 
 export function listenExpenses(roomId, sharedKey, onExpenses) {
   const q = query(col(roomId, 'expenses'), orderBy('createdAt', 'desc'));
-  return watch(q, (snap) => {
+  return watch('expenses', q, (snap) => {
     const expenses = snap.docs.map((d) => {
       const data = d.data();
       let parsed = { description: '⚠️ Could not decrypt', amount: 0, spentBy: null };
@@ -517,7 +520,7 @@ export async function deleteSavingsGoal(roomId, goalId) {
 
 export function listenSavingsGoals(roomId, sharedKey, onGoals) {
   const q = query(col(roomId, 'savingsGoals'), orderBy('createdAt', 'asc'));
-  return watch(q, (snap) => {
+  return watch('savings goals', q, (snap) => {
     onGoals(
       snap.docs.map((d) => {
         const data = d.data();
@@ -552,7 +555,7 @@ export async function deleteSavingsEntry(roomId, entryId) {
 
 export function listenSavings(roomId, sharedKey, onEntries) {
   const q = query(col(roomId, 'savings'), orderBy('createdAt', 'desc'));
-  return watch(q, (snap) => {
+  return watch('savings', q, (snap) => {
     const entries = snap.docs.map((d) => {
       const data = d.data();
       let parsed = { label: '⚠️ Could not decrypt', amount: 0, contributedBy: null };
@@ -594,7 +597,7 @@ export async function deleteJournalEntry(roomId, entryId) {
 
 export function listenJournal(roomId, sharedKey, onEntries) {
   const q = query(col(roomId, 'journal'), orderBy('createdAt', 'desc'));
-  return watch(q, (snap) => {
+  return watch('journal', q, (snap) => {
     const entries = snap.docs.map((d) => {
       const data = d.data();
       let text = '⚠️ Could not decrypt';

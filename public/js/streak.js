@@ -10,15 +10,22 @@ function todayUTC(offsetDays = 0) {
   return d.toISOString().slice(0, 10);
 }
 
+// Deliberately swallows its own errors. This is a side effect of sending, not
+// part of sending: if the streak write fails, the message itself has already
+// been stored, and letting this throw would report a successful send as failed.
 export async function recordActivity(roomId) {
-  const user = await ensureSignedIn();
-  const date = todayUTC();
-  const id = `${date}_${user.uid}`;
-  await setDoc(doc(db, 'rooms', roomId, 'activity', id), {
-    uid: user.uid,
-    date,
-    updatedAt: Date.now(),
-  });
+  try {
+    const user = await ensureSignedIn();
+    const date = todayUTC();
+    const id = `${date}_${user.uid}`;
+    await setDoc(doc(db, 'rooms', roomId, 'activity', id), {
+      uid: user.uid,
+      date,
+      updatedAt: Date.now(),
+    });
+  } catch (e) {
+    console.warn('Streak activity not recorded:', e?.code || e?.message || e);
+  }
 }
 
 // memberUids: the room's two uids (order doesn't matter here).

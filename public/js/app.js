@@ -43,6 +43,7 @@ import {
   listenPartnerPresence,
   startGamePresence,
   stopGamePresence,
+  markSeenNow,
 } from './presence.js';
 import * as Game from './game-tictactoe.js';
 import {
@@ -740,11 +741,46 @@ function registerForPush() {
   initPush(firebaseApp, vapidKey, (token) => RoomData.setPushToken(identity.roomId, token)).catch(() => {});
 }
 
+// Verifies once, on open, that this device is still one of the room's two
+// members. If it isn't, every single write will be refused by the server — and
+// without this check the only symptom is a generic error on each action, which
+// is exactly how "the other person can't send anything" presents. Better to say
+// so plainly, once, than to let them discover it one failure at a time.
+let membershipBroken = false;
+
+async function verifyRoomMembership() {
+  if (!identity?.roomId || !lastKnownUid) return;
+  const warn = () => {
+    membershipBroken = true;
+    toast('This device is signed in to a different account than the one you paired with, so nothing it sends can save.', {
+      duration: 14000,
+      action: { label: 'What to do', onClick: () => renderConnectionCheck() },
+    });
+  };
+  try {
+    const { doc: fbDoc, getDoc: fbGetDoc, db: fbDb } = await import('./firebase.js');
+    const snap = await fbGetDoc(fbDoc(fbDb, 'rooms', identity.roomId));
+    if (!snap.exists()) return; // reported in full by the connection check
+    const members = snap.data().memberUids || [];
+    if (members.includes(lastKnownUid)) {
+      membershipBroken = false;
+      return;
+    }
+    warn();
+  } catch (e) {
+    // A refused READ is itself the answer: the rules only allow members to read
+    // the room, so permission-denied here proves this account isn't one. Being
+    // silent about it was what made the failure look like a mystery.
+    if (e?.code === 'permission-denied') warn();
+  }
+}
+
 function setUpGlobalListeners() {
   if (!identity?.roomId || !sharedKey) return;
 
   if (presenceEnabled()) startHeartbeat(identity.roomId);
   registerForPush();
+  verifyRoomMembership();
 
   // Publish gender into the encrypted room profile once, so the partner's hero
   // scene can draw you. Guarded by a local flag to avoid a write per app open.
@@ -1296,6 +1332,7 @@ function renderHome(slot) {
             )}</div>
             <div class="clock-time" id="partner-time">--:--</div>
             <div class="clock-meta" id="partner-meta"></div>
+            <div class="clock-presence" id="partner-presence"></div>
           </div>
         </div>
 
@@ -1397,6 +1434,30 @@ function renderHome(slot) {
   tick();
   const clockInterval = setInterval(tick, 20000);
   unsubscribers.push(() => clearInterval(clockInterval));
+
+  // Partner presence on Home — a persisted last-seen, not just "we happen to be
+  // online together right now". Re-rendered on a timer so "12m ago" keeps up
+  // without needing a new write from their side.
+  if (identity.partnerUid) {
+    let lastPresence = null;
+    const paintPresence = () => {
+      const el = document.getElementById('partner-presence');
+      if (!el) return;
+      if (!lastPresence) return void (el.textContent = '');
+      if (lastPresence.typing) el.innerHTML = '<span class="status-typing">typing…</span>';
+      else if (lastPresence.online) el.innerHTML = '<span class="status-online">● online now</span>';
+      else if (lastPresence.lastSeen) el.textContent = `last seen ${relativeTime(lastPresence.lastSeen)}`;
+      else el.textContent = 'not seen yet';
+    };
+    unsubscribers.push(
+      listenPartnerPresence(identity.roomId, identity.partnerUid, (p) => {
+        lastPresence = p;
+        paintPresence();
+      })
+    );
+    const presenceTick = setInterval(paintPresence, 30000);
+    unsubscribers.push(() => clearInterval(presenceTick));
+  }
 
   // --- Home note: theirs is shown, yours is editable ---
   if (identity.partnerUid) {
@@ -1696,19 +1757,33 @@ function renderThread(slot) {
 
   // Partner presence → header status + typing bubble.
   if (identity.partnerUid) {
+    let presence = null;
+    const paintStatus = () => {
+      const statusEl = document.getElementById('chat-status');
+      const typingRow = document.getElementById('typing-row');
+      if (!statusEl || !typingRow) return;
+      if (!presence) {
+        statusEl.innerHTML = '&nbsp;';
+        typingRow.hidden = true;
+        return;
+      }
+      typingRow.hidden = !presence.typing;
+      if (presence.typing) statusEl.innerHTML = '<span class="status-typing">typing…</span>';
+      else if (presence.online) statusEl.innerHTML = '<span class="status-online">● online</span>';
+      else if (presence.lastSeen) statusEl.textContent = `last seen ${relativeTime(presence.lastSeen)}`;
+      else statusEl.innerHTML = '&nbsp;';
+    };
     unsubscribers.push(
       listenPartnerPresence(identity.roomId, identity.partnerUid, (p) => {
-        const statusEl = document.getElementById('chat-status');
-        const typingRow = document.getElementById('typing-row');
-        if (!statusEl || !typingRow) return;
-        typingRow.hidden = !p.typing;
-        if (p.typing) statusEl.innerHTML = '<span class="status-typing">typing…</span>';
-        else if (p.online) statusEl.innerHTML = '<span class="status-online">● online</span>';
-        else if (p.lastSeen) statusEl.textContent = `last seen ${relativeTime(p.lastSeen)}`;
-        else statusEl.innerHTML = '&nbsp;';
+        presence = p;
+        paintStatus();
         if (p.typing && atBottom) listEl.scrollTop = listEl.scrollHeight;
       })
     );
+    // "last seen 4m ago" has to keep counting on its own — their side stops
+    // writing the moment they leave, so no new snapshot is ever coming.
+    const statusTick = setInterval(paintStatus, 30000);
+    unsubscribers.push(() => clearInterval(statusTick));
     unsubscribers.push(
       RoomData.listenProfiles(identity.roomId, sharedKey, [identity.partnerUid], (uid, avatar) => {
         const el = document.getElementById('chat-avatar');
@@ -2016,7 +2091,12 @@ function renderThread(slot) {
     try {
       await RoomData.sendThreadMessage(identity.roomId, sharedKey, text, replyPayload);
     } catch (e) {
-      toast("Message didn't send — check your connection");
+      // Say what actually went wrong. "Check your connection" on a
+      // permission-denied sent people chasing their wifi for no reason.
+      toast(sendFailureMessage(e), {
+        duration: 9000,
+        action: { label: 'Diagnose', onClick: () => renderConnectionCheck() },
+      });
       input.value = text;
       autoGrow();
       syncActionButton();
@@ -3546,7 +3626,10 @@ function renderSettings() {
           This clears that cached copy and reloads. It touches nothing else — your messages, keys and
           history are untouched, and you stay signed in.
         </p>
-        <button class="btn-secondary" id="refresh-app-btn" style="margin-top:10px;">Reload a fresh copy</button>
+        <div class="btn-row" style="margin-top:10px;">
+          <button class="btn-secondary" id="refresh-app-btn">Reload a fresh copy</button>
+          <button class="btn-secondary" id="connection-check-btn">Connection check</button>
+        </div>
       </div>
 
       <div class="card">
@@ -3627,6 +3710,8 @@ function renderSettings() {
       renderSettings();
     };
   });
+
+  document.getElementById('connection-check-btn').onclick = () => renderConnectionCheck();
 
   document.getElementById('refresh-app-btn').onclick = async () => {
     const btn = document.getElementById('refresh-app-btn');
@@ -3838,6 +3923,205 @@ function renderDnsHelp() {
   document.getElementById('back-settings-btn').onclick = () => renderSettings();
 }
 
+// ---------------- Connection check ----------------
+// Walks the exact chain a write depends on and reports where it breaks. Built
+// because "it shows an error" is unactionable: the same toast covered offline,
+// a dead listener, and this device not being a member of the room — which are
+// three completely different problems with three different fixes.
+// The single most common real failure, and its actual fix. Recovery sign-in
+// restores the ORIGINAL account id (Firebase links rather than replaces), so it
+// puts this device back inside the room — re-pairing is only the last resort.
+const WRONG_ACCOUNT_VERDICT =
+  'This device is signed in to a different account than the one that was paired. ' +
+  'That happens after logging out, clearing browser data, or using a different browser. ' +
+  'Everything it tries to save is refused by the server. ' +
+  'If recovery was set up, signing back in with that email and password restores the original account and fixes this immediately. ' +
+  'If not, the two of you will need to pair again.';
+
+function renderConnectionCheck() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="diag-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Diagnostics</div>
+          <h2>Connection check</h2>
+        </div>
+      </div>
+      <div class="card">
+        <p class="body-dim">Checking everything a message needs in order to send.</p>
+      </div>
+      <div id="diag-results"></div>
+      <div id="diag-verdict"></div>
+    </div>
+  `;
+  attachNav();
+  document.getElementById('diag-back').onclick = () => renderSettings();
+
+  const resultsEl = document.getElementById('diag-results');
+  const rows = [];
+  const paint = () => {
+    resultsEl.innerHTML = `<div class="card">${rows
+      .map(
+        (r) => `<div class="diag-row ${r.state}">
+          <span class="diag-mark">${r.state === 'pass' ? '✓' : r.state === 'fail' ? '✗' : '…'}</span>
+          <div class="grow">
+            <div class="diag-label">${escapeHTML(r.label)}</div>
+            ${r.detail ? `<div class="row-meta">${escapeHTML(r.detail)}</div>` : ''}
+          </div>
+        </div>`
+      )
+      .join('')}</div>`;
+  };
+  const add = (label) => {
+    const row = { label, state: 'run', detail: '' };
+    rows.push(row);
+    paint();
+    return row;
+  };
+
+  (async () => {
+    let verdict = null;
+
+    // 1. auth
+    const rAuth = add('Signed in');
+    let uid = null;
+    try {
+      const u = await ensureSignedIn();
+      uid = u.uid;
+      rAuth.state = 'pass';
+      rAuth.detail = `Account ${uid.slice(0, 8)}…`;
+    } catch (e) {
+      rAuth.state = 'fail';
+      rAuth.detail = e?.code || e?.message || 'could not sign in';
+      verdict = 'This device could not sign in to Firebase at all. Check the connection and reopen the app.';
+    }
+    paint();
+
+    // 2. local pairing data
+    const rLocal = add('Paired on this device');
+    if (identity?.roomId && identity?.partnerUid && identity?.secretKey) {
+      rLocal.state = 'pass';
+      rLocal.detail = `Room ${identity.roomId.slice(0, 8)}… · partner ${identity.partnerUid.slice(0, 8)}…`;
+    } else {
+      rLocal.state = 'fail';
+      rLocal.detail = !identity?.roomId
+        ? 'no room stored'
+        : !identity?.secretKey
+        ? 'private key locked — unlock with your PIN'
+        : 'no partner stored';
+      verdict = verdict || 'This device is not fully paired. Pair again from a fresh start.';
+    }
+    paint();
+
+    // 3. room document + membership — the usual culprit
+    const rRoom = add('Room recognises this device');
+    if (uid && identity?.roomId) {
+      try {
+        const { doc: fbDoc, getDoc: fbGetDoc, db: fbDb } = await import('./firebase.js');
+        const snap = await fbGetDoc(fbDoc(fbDb, 'rooms', identity.roomId));
+        if (!snap.exists()) {
+          rRoom.state = 'fail';
+          rRoom.detail = 'the room record does not exist';
+          verdict =
+            verdict ||
+            'The shared room record is missing. This happens when only one side finished pairing. You will need to pair again.';
+        } else {
+          const members = snap.data().memberUids || [];
+          const meIn = members.includes(uid);
+          const themIn = members.includes(identity.partnerUid);
+          if (meIn && themIn) {
+            rRoom.state = 'pass';
+            rRoom.detail = 'both accounts listed';
+          } else {
+            rRoom.state = 'fail';
+            rRoom.detail = meIn
+              ? "your partner's account is not listed on the room"
+              : 'this device’s account is not listed on the room';
+            verdict =
+              verdict ||
+              (meIn
+                ? "Your partner's account is missing from the room, so everything they send is refused. On their device: if they set up recovery, signing back in with that email restores their original account. Otherwise you'll both need to pair again."
+                : WRONG_ACCOUNT_VERDICT);
+          }
+        }
+      } catch (e) {
+        rRoom.state = 'fail';
+        if (e?.code === 'permission-denied') {
+          // Only members may read the room, so a refusal here is itself proof.
+          rRoom.detail = 'refused — this account is not a member of the room';
+          verdict = verdict || WRONG_ACCOUNT_VERDICT;
+        } else {
+          rRoom.detail = e?.code || e?.message || 'could not read the room';
+          verdict = verdict || 'The room record could not be read from this device.';
+        }
+      }
+    } else {
+      rRoom.state = 'fail';
+      rRoom.detail = 'skipped — not paired';
+    }
+    paint();
+
+    // 4. read
+    const rRead = add('Can read your messages');
+    if (identity?.roomId && sharedKey) {
+      try {
+        const { collection: fbCol, query: fbQuery, orderBy: fbOrder, limit: fbLim, getDocs: fbGetDocs, db: fbDb } =
+          await import('./firebase.js');
+        await fbGetDocs(fbQuery(fbCol(fbDb, 'rooms', identity.roomId, 'thread'), fbOrder('createdAt', 'desc'), fbLim(1)));
+        rRead.state = 'pass';
+      } catch (e) {
+        rRead.state = 'fail';
+        rRead.detail = e?.code || e?.message || 'read refused';
+      }
+    } else {
+      rRead.state = 'fail';
+      rRead.detail = 'skipped';
+    }
+    paint();
+
+    // 5. write — the actual thing that's failing, tested harmlessly
+    const rWrite = add('Can save to your room');
+    if (identity?.roomId && uid) {
+      try {
+        const { doc: fbDoc, setDoc: fbSetDoc, deleteDoc: fbDeleteDoc, db: fbDb } = await import('./firebase.js');
+        const probe = fbDoc(fbDb, 'rooms', identity.roomId, 'diagnostics', uid);
+        await fbSetDoc(probe, { at: Date.now() });
+        await fbDeleteDoc(probe).catch(() => {});
+        rWrite.state = 'pass';
+      } catch (e) {
+        rWrite.state = 'fail';
+        rWrite.detail = e?.code || e?.message || 'write refused';
+        if (e?.code === 'permission-denied') verdict = verdict || WRONG_ACCOUNT_VERDICT;
+      }
+    } else {
+      rWrite.state = 'fail';
+      rWrite.detail = 'skipped';
+    }
+    paint();
+
+    const allPass = rows.every((r) => r.state === 'pass');
+    const wrongAccount = verdict === WRONG_ACCOUNT_VERDICT;
+    document.getElementById('diag-verdict').innerHTML = `
+      <div class="card ${allPass ? '' : 'diag-verdict-bad'}">
+        <div class="eyebrow">${allPass ? 'All good' : 'What this means'}</div>
+        <p class="body-dim">${
+          allPass
+            ? 'Everything this device needs is working. If a message still fails, it will be a passing network problem and it will send itself once you are back online.'
+            : escapeHTML(verdict || 'Something in the chain above failed. The first ✗ is the one to fix.')
+        }</p>
+        ${
+          wrongAccount
+            ? '<button class="btn-primary" id="diag-recover-btn" style="margin-top:12px;">Sign in with recovery</button>'
+            : ''
+        }
+      </div>`;
+    const recoverBtn = document.getElementById('diag-recover-btn');
+    if (recoverBtn) recoverBtn.onclick = () => renderRecoverStep();
+  })();
+}
+
 async function handleLogout() {
   const confirmed = identity.recoveryEmail
     ? confirm('Log out of Tidelight on this device? You can sign back in with your recovery email and password.')
@@ -3957,6 +4241,23 @@ function safeMediaSrc(value, kind = 'image') {
 function localMidnightISO(yyyyMmDd) {
   const [y, m, d] = String(yyyyMmDd).split('-').map(Number);
   return new Date(y, m - 1, d, 0, 0, 0, 0).toISOString();
+}
+
+// Turns a Firestore error into something that tells the user what to do next.
+// `permission-denied` in this app almost always means this device's account is
+// no longer one of the room's two members — a completely different problem from
+// being offline, and one no amount of retrying will fix.
+function sendFailureMessage(e) {
+  const code = e?.code || '';
+  if (code === 'permission-denied') {
+    return "This device isn't recognised as part of your room, so nothing can be saved. Tap Diagnose.";
+  }
+  if (code === 'unavailable' || !navigator.onLine) {
+    return "You're offline — it'll send by itself once you're back.";
+  }
+  if (code === 'unauthenticated') return 'Signed out unexpectedly. Reopen the app to sign back in.';
+  if (code === 'resource-exhausted') return 'That was too large to send.';
+  return `Didn't send${code ? ` (${escapeHTML(code)})` : ''}. Tap Diagnose.`;
 }
 
 function dayLabel(date) {
@@ -4095,7 +4396,9 @@ document.addEventListener('visibilitychange', () => {
   if (document.hidden) {
     lastHiddenAt = Date.now();
     if (identity?.roomId && presenceEnabled()) {
-      clearTyping(identity.roomId);
+      // Record the moment of leaving — this is what the partner sees as
+      // "last seen", and it's far more accurate than the last heartbeat tick.
+      markSeenNow(identity.roomId);
       // Leaving the app pauses any game immediately, rather than making the
       // partner wait out a timeout to learn you stepped away.
       stopGamePresence(identity.roomId);
@@ -4116,6 +4419,13 @@ document.addEventListener('visibilitychange', () => {
 window.addEventListener('blur', () => document.body.classList.add('privacy-blur'));
 window.addEventListener('focus', () => document.body.classList.remove('privacy-blur'));
 
+// `pagehide` is the most reliable "the app is going away" signal on mobile —
+// far more dependable than `beforeunload`, which phones frequently skip. This is
+// the last chance to record when you were actually here.
+window.addEventListener('pagehide', () => {
+  if (identity?.roomId && presenceEnabled()) markSeenNow(identity.roomId);
+});
+
 // Catch anything that slips through so the app never just goes blank.
 window.addEventListener('error', (e) => {
   if (root.innerHTML.trim() === '') renderFatalError(e.error || new Error(e.message));
@@ -4129,12 +4439,22 @@ window.addEventListener('unhandledrejection', (e) => {
 // A data listener dying used to leave a screen stuck on its skeleton with no
 // explanation. Now it says so and offers the one action that actually helps.
 let dataErrorToastAt = 0;
-RoomData.setDataErrorHandler(({ label }) => {
+RoomData.setDataErrorHandler(({ label, error }) => {
   // Offline is already explained by the banner; don't pile on.
   if (!navigator.onLine) return;
   const now = Date.now();
   if (now - dataErrorToastAt < 6000) return; // one message, not one per listener
   dataErrorToastAt = now;
+
+  // A refused read is not a loading hiccup and "Retry" will never fix it — it
+  // means this account isn't a member of the room. Say that instead.
+  if (error?.code === 'permission-denied' || membershipBroken) {
+    toast('This device is signed in to a different account than the one you paired with.', {
+      duration: 14000,
+      action: { label: 'What to do', onClick: () => renderConnectionCheck() },
+    });
+    return;
+  }
   toast(`Couldn't load ${escapeHTML(label)}.`, {
     duration: 8000,
     action: {
