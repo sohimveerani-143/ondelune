@@ -1,4 +1,4 @@
-const CACHE_NAME = 'tidelight-v12';
+const CACHE_NAME = 'tidelight-v13';
 const SHELL_FILES = [
   './',
   './index.html',
@@ -19,6 +19,8 @@ const SHELL_FILES = [
   './js/presence.js',
   './js/notify.js',
   './js/game-tictactoe.js',
+  './js/ludo.js',
+  './js/ludo-rules.js',
 ];
 
 self.addEventListener('install', (event) => {

@@ -8,7 +8,7 @@ import {
   setSeen,
   clearSeen,
 } from './store.js';
-import { generateKeyPair, deriveSharedKey } from './crypto.js';
+import { generateKeyPair, deriveSharedKey, boxKeyFromB64 } from './crypto.js';
 import {
   pairingLinkFor,
   getPairingIdFromUrl,
@@ -18,10 +18,18 @@ import {
   joinPairing,
 } from './pairing.js';
 import * as RoomData from './room-data.js';
+import * as Ludo from './ludo.js';
+import * as LudoRules from './ludo-rules.js';
 import { fileToCompressedBase64 } from './image-utils.js';
-import { app as firebaseApp, ensureSignedIn, tryEnableOfflinePersistence, signOutOfAccount } from './firebase.js';
+import {
+  app as firebaseApp,
+  ensureSignedIn,
+  currentUserOrNull,
+  tryEnableOfflinePersistence,
+  signOutOfAccount,
+} from './firebase.js';
 import { lockIdentityWithPin, unlockIdentityWithPin, needsUnlock } from './applock.js';
-import { setUpRecovery, recoverFromEmail } from './auth-recovery.js';
+import { setUpRecovery, recoverFromEmail, refreshBackup } from './auth-recovery.js';
 import { listenStreak } from './streak.js';
 import {
   renderLoading,
@@ -187,12 +195,38 @@ function presenceEnabled() {
 // ---------------- Boot ----------------
 async function boot() {
   try {
-    const user = await ensureSignedIn();
-    lastKnownUid = user.uid;
-    tryEnableOfflinePersistence();
-
+    // Identity first, because whether we may create an account at all depends
+    // on whether this device already belongs to a room.
     identity = await loadIdentity();
     seenCounts = await loadSeen();
+
+    // A Ludo link is answered before anything else. Whoever opened it may be a
+    // complete stranger to this app — they must not be walked through pairing,
+    // and a paired user must not be dumped on the home screen instead of the
+    // game they just tapped.
+    const ludoInvite = Ludo.ludoInviteFromUrl();
+
+    // currentUserOrNull waits for Firebase to finish restoring the saved
+    // session, so a null here genuinely means "no session", not "not yet".
+    let user = await currentUserOrNull();
+
+    if (ludoInvite && (!identity || !identity.displayName)) {
+      await ensureSignedIn();
+      lastKnownUid = (await currentUserOrNull()).uid;
+      tryEnableOfflinePersistence();
+      return renderLudoGuest(ludoInvite);
+    }
+
+    if (!user && identity?.roomId) {
+      // Signing in anonymously at this point would mint a NEW account and lock
+      // this device out of its own room — history intact on screen, every write
+      // refused by the server. Whatever went wrong, creating an account is
+      // never the right repair, so stop and explain instead.
+      return renderSessionLostScreen();
+    }
+    if (!user) user = await ensureSignedIn();
+    lastKnownUid = user.uid;
+    tryEnableOfflinePersistence();
 
     if (!identity || !identity.displayName) {
       return renderEntryChoice();
@@ -219,6 +253,11 @@ function continueAfterUnlock() {
 
   if (isPaired(identity)) {
     sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
+    // Someone already set up opening a Ludo link goes straight to the table.
+    const ludoInvite = Ludo.ludoInviteFromUrl();
+    if (ludoInvite) {
+      return renderLudo({ ...ludoInvite, key: boxKeyFromB64(ludoInvite.keyB64) });
+    }
     return renderMain();
   }
   if (urlPairingId) {
@@ -246,6 +285,159 @@ function renderFatalError(err) {
       <code>${escapeHTML(err?.message || String(err))}</code>
     </div>
   `;
+}
+
+// Shown when this device is paired but has no Firebase session at all — the
+// browser cleared its storage, or an old build swapped the account out. The one
+// thing this screen must never do is quietly make a new account, which is what
+// used to happen and what left the app writing into a room it no longer belonged to.
+function renderSessionLostScreen() {
+  clearListeners();
+  const hasRecovery = !!identity?.recoveryEmail;
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>Signed out</h1>
+      <p class="lede">
+        Everything on this device — your keys, your history, your person — is still here and still yours.
+        The sign-in to the server is what went missing, and nothing can save until it's back.
+      </p>
+      <div class="card">
+        <p class="body-dim">
+          ${
+            hasRecovery
+              ? `Sign back in as <strong>${escapeHTML(identity.recoveryEmail)}</strong> and everything reconnects exactly as it was.`
+              : 'Recovery was never set up on this device, so there is no password to sign back in with. Your partner can re-admit this device from theirs — open Settings → Connection check on their phone.'
+          }
+        </p>
+      </div>
+      ${hasRecovery ? '<button class="btn-primary" id="lost-recover-btn">Sign in with recovery</button>' : ''}
+      <button class="btn-secondary" id="lost-readmit-btn">My partner will re-admit me</button>
+      <div id="lost-error" class="error-text"></div>
+    </div>
+  `;
+  const recoverBtn = document.getElementById('lost-recover-btn');
+  if (recoverBtn) recoverBtn.onclick = () => renderRecoverStep();
+  document.getElementById('lost-readmit-btn').onclick = async () => {
+    // Needs *an* account to have a uid to hand over. Safe here only because the
+    // user has explicitly chosen the re-admit path over recovery.
+    try {
+      const u = await ensureSignedIn();
+      lastKnownUid = u.uid;
+      renderReadmitCode();
+    } catch (e) {
+      document.getElementById('lost-error').textContent = e?.message || 'Could not reach the server.';
+    }
+  };
+}
+
+// Side one of the repair: the locked-out device shows the account id it now has.
+// Nothing secret is on this screen — a uid grants nothing on its own, and the
+// partner still has to accept it on their device.
+function renderReadmitCode() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>Read this to them</h1>
+      <p class="lede">
+        On their phone: <strong>Settings → Connection check → Re-admit a device</strong>.
+        They type in this code and you're back — nothing is lost.
+      </p>
+      <div class="card">
+        <div class="eyebrow">This device's code</div>
+        <div class="readmit-code" id="readmit-code">${escapeHTML(lastKnownUid || '')}</div>
+        <button class="btn-secondary compact" id="copy-code-btn" style="margin-top:10px;">Copy</button>
+      </div>
+      <div class="card">
+        <p class="body-dim" id="readmit-status">Waiting for them to accept…</p>
+      </div>
+      <button class="btn-secondary" id="readmit-back">Back</button>
+    </div>
+  `;
+  document.getElementById('readmit-back').onclick = () => renderSessionLostScreen();
+  document.getElementById('copy-code-btn').onclick = async () => {
+    try {
+      await navigator.clipboard.writeText(lastKnownUid || '');
+      toast('Code copied');
+    } catch (e) {
+      toast('Select the code and copy it manually');
+    }
+  };
+
+  // Polled, not listened to: a non-member's listener is refused outright, so
+  // there is no snapshot to wait on until the moment membership actually lands.
+  const poll = setInterval(async () => {
+    if (!identity?.roomId) return;
+    const ok = await RoomData.amIAMember(identity.roomId);
+    if (!ok) return;
+    clearInterval(poll);
+    const statusEl = document.getElementById('readmit-status');
+    if (statusEl) statusEl.textContent = 'Accepted — reconnecting…';
+    await healPartnerUid();
+    identity = await updateIdentity({ myUid: lastKnownUid });
+    continueAfterUnlock();
+  }, 3000);
+  unsubscribers.push(() => clearInterval(poll));
+}
+
+// Side two: the healthy device accepts. Guarded by a typed confirmation because
+// this hands an account full access to everything in the room.
+function renderReadmitEnter() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="readmit-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div>
+          <div class="eyebrow">Repair</div>
+          <h2>Re-admit a device</h2>
+        </div>
+      </div>
+      <div class="card">
+        <p class="body-dim">
+          Only do this if ${escapeHTML(identity?.partnerName || 'your partner')} is asking you to, and you are sure it is them.
+          It gives the account below full access to everything in your room.
+        </p>
+      </div>
+      <div class="card">
+        <input type="text" id="readmit-input" placeholder="Paste their code" autocomplete="off" spellcheck="false" />
+      </div>
+      <button class="btn-primary" id="readmit-submit">Re-admit</button>
+      <div id="readmit-error" class="error-text"></div>
+    </div>
+  `;
+  attachNav();
+  document.getElementById('readmit-back').onclick = () => renderConnectionCheck();
+  const btn = document.getElementById('readmit-submit');
+  btn.onclick = async () => {
+    const freshUid = document.getElementById('readmit-input').value.trim();
+    const errEl = document.getElementById('readmit-error');
+    errEl.textContent = '';
+    if (freshUid.length < 20) {
+      errEl.textContent = 'That does not look like a full code. Ask them to copy it again.';
+      return;
+    }
+    if (freshUid === lastKnownUid) {
+      errEl.textContent = 'That is this device’s own code, not theirs.';
+      return;
+    }
+    if (!confirm(`Give this account access to everything in your room?\n\n${freshUid}\n\nOnly continue if ${identity?.partnerName || 'your partner'} just read it out to you.`)) return;
+    btn.disabled = true;
+    btn.textContent = 'Re-admitting…';
+    try {
+      await RoomData.readmitMember(identity.roomId, identity.partnerUid, freshUid);
+      identity = await updateIdentity({ partnerUid: freshUid });
+      await refreshRecoveryBackup();
+      membershipBroken = false;
+      toast('Done — their device should reconnect in a moment');
+      renderConnectionCheck();
+    } catch (e) {
+      errEl.textContent = e?.message || 'Could not update the room.';
+      btn.disabled = false;
+      btn.textContent = 'Re-admit';
+    }
+  };
 }
 
 // ---------------- Entry: new here, or recovering an existing account ----------------
@@ -302,9 +494,13 @@ function renderRecoverStep() {
       for (const k of Object.keys(recovered)) {
         if (recovered[k] == null && existing[k] != null) merged[k] = existing[k];
       }
-      identity = await saveIdentity(merged);
       lastKnownUid = (await ensureSignedIn()).uid;
+      merged.myUid = lastKnownUid;
+      identity = await saveIdentity(merged);
       await healPartnerUid();
+      // A backup taken before pairing carries no room. If this device already
+      // knew one, that knowledge is now the better copy — write it back.
+      await refreshRecoveryBackup();
       continueAfterUnlock();
     } catch (e) {
       document.getElementById('recover-error').textContent = e.message;
@@ -404,8 +600,10 @@ function renderRecoveryChoice() {
     btn.disabled = true;
     btn.textContent = 'Setting up…';
     try {
-      await setUpRecovery(email, password, identity);
+      const backupKey = await setUpRecovery(email, password, identity);
       identity.recoveryEmail = email;
+      identity.backupKey = backupKey;
+      identity.myUid = lastKnownUid;
       renderPinChoice();
     } catch (e) {
       document.getElementById('recovery-error').textContent = e.message;
@@ -649,11 +847,15 @@ function renderWaitingScreen(pairingId) {
         partnerTimezone: data.joinerTimezone,
         partnerUid: data.joinerUid,
         roomId,
+        myUid: lastKnownUid,
         pending: null,
       });
       done = true;
       clearListeners();
       sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
+      // The room and partner only exist as of this line. Any backup written
+      // before now describes an unpaired device, so it has to be rewritten.
+      await refreshRecoveryBackup();
       renderMain();
     } catch (err) {
       console.error('Pairing finalize failed:', err);
@@ -711,10 +913,13 @@ function renderJoinScreen(pairingId) {
         partnerTimezone: result.partnerTimezone,
         partnerUid: result.creatorUid,
         roomId: result.roomId,
+        myUid: result.myUid,
         pending: null,
       });
       sharedKey = deriveSharedKey(identity.partnerPublicKey, identity.secretKey);
       history.replaceState(null, '', window.location.pathname);
+      // As above: this is the first moment there is a room to back up.
+      await refreshRecoveryBackup();
       renderMain();
     } catch (e) {
       // Show the exact code we looked up, so a mangled link is instantly obvious
@@ -764,6 +969,17 @@ let membershipBroken = false;
 // recovery backups omitted partnerUid entirely, leaving otherwise-healthy
 // devices half-broken: history visible, but presence, badges, streak, avatars
 // and the game all silently dead.
+// Keeps the cloud backup in step with what this device actually knows. Silent
+// and best-effort on purpose — it runs after pairing and after a membership
+// repair, and neither of those should fail because a backup write did.
+async function refreshRecoveryBackup() {
+  try {
+    return await refreshBackup(identity);
+  } catch (e) {
+    return false;
+  }
+}
+
 async function healPartnerUid() {
   if (!identity?.roomId || !lastKnownUid || identity.partnerUid) return false;
   try {
@@ -2648,20 +2864,201 @@ function renderCalendar(slot) {
   );
 }
 
-// ---------------- Bucket list ----------------
+// ---------------- List ----------------
+// One tab, two lists that behave differently: Daily resets every morning and is
+// worth seeing a history of, Someday is finished once and stays finished. The
+// mode is remembered for the session so switching tabs doesn't bounce you back.
+let listMode = 'daily';
+
 function renderBucketList(slot) {
   slot.innerHTML = `
     <div class="screen">
       <div class="eyebrow">Things to do together</div>
       <h2 class="screen-title">List</h2>
-      <div class="card">
-        <div class="inline-add">
-          <input type="text" id="item-input" placeholder="Add something…" />
-          <button class="btn-primary compact" id="add-item">Add</button>
-        </div>
+      <div class="segmented" id="list-mode">
+        <button class="segment ${listMode === 'daily' ? 'active' : ''}" data-mode="daily">Daily</button>
+        <button class="segment ${listMode === 'someday' ? 'active' : ''}" data-mode="someday">Someday</button>
       </div>
-      <div id="item-list"></div>
+      <div id="list-body"></div>
     </div>
+  `;
+  slot.querySelectorAll('.segment').forEach((btn) => {
+    btn.onclick = () => {
+      if (listMode === btn.dataset.mode) return;
+      listMode = btn.dataset.mode;
+      renderTab('list');
+    };
+  });
+  const body = document.getElementById('list-body');
+  if (listMode === 'daily') renderDailyList(body);
+  else renderSomedayList(body);
+}
+
+// Last seven days, today last — far enough back to catch up on a day you
+// missed, short enough to stay on one screen without scrolling.
+function recentDateKeys(count = 7) {
+  const keys = [];
+  for (let i = count - 1; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    keys.push(RoomData.dateKeyOf(d));
+  }
+  return keys;
+}
+
+// Deliberately not the existing dayLabel(): that one returns "Yesterday" and
+// "Mon, Aug 3", which are far too wide for a chip in a seven-across strip.
+function dayChipLabel(key) {
+  if (key === RoomData.dateKeyOf()) return 'Today';
+  const yesterday = new Date();
+  yesterday.setDate(yesterday.getDate() - 1);
+  if (key === RoomData.dateKeyOf(yesterday)) return 'Yest';
+  return new Date(`${key}T12:00:00`).toLocaleDateString(undefined, { weekday: 'short' });
+}
+
+function renderDailyList(host) {
+  const todayKey = RoomData.dateKeyOf();
+  let selectedDate = todayKey;
+  let tasks = [];
+  let doneMap = {};
+  let doneUnsub = null;
+
+  host.innerHTML = `
+    <div class="card">
+      <div class="inline-add">
+        <input type="text" id="daily-input" placeholder="Something every day…" />
+        <button class="btn-primary compact" id="add-daily">Add</button>
+      </div>
+    </div>
+    <div class="chip-row" id="date-strip"></div>
+    <div id="daily-body"></div>
+  `;
+
+  const add = async () => {
+    const el = document.getElementById('daily-input');
+    const text = el.value.trim();
+    if (!text) return;
+    el.value = '';
+    try {
+      await RoomData.addDailyTask(identity.roomId, sharedKey, text);
+    } catch (e) {
+      toast("Couldn't add that");
+    }
+  };
+  document.getElementById('add-daily').onclick = add;
+  document.getElementById('daily-input').onkeydown = (e) => {
+    if (e.key === 'Enter') add();
+  };
+
+  const stripEl = document.getElementById('date-strip');
+  const bodyEl = document.getElementById('daily-body');
+  renderLoading(bodyEl, 'list', 3);
+
+  const paintStrip = () => {
+    stripEl.innerHTML = recentDateKeys()
+      .map(
+        (k) => `<button class="chip ${k === selectedDate ? 'active' : ''}" data-key="${k}">
+          ${dayChipLabel(k)} <span class="chip-count">${k.slice(8)}</span>
+        </button>`
+      )
+      .join('');
+    stripEl.querySelectorAll('.chip').forEach((chip) => {
+      chip.onclick = () => {
+        selectedDate = chip.dataset.key;
+        paintStrip();
+        watchDay();
+      };
+    });
+  };
+
+  const paintBody = () => {
+    if (tasks.length === 0) {
+      bodyEl.innerHTML = `<div class="empty-state"><div class="empty-emoji">🌅</div>No daily tasks yet — add one above</div>`;
+      return;
+    }
+    const doneCount = tasks.filter((t) => doneMap[t.id]).length;
+    const isToday = selectedDate === todayKey;
+    bodyEl.innerHTML = `
+      <div class="card">
+        <div class="list-progress">
+          <div class="progress-track"><div class="progress-fill" style="width:${Math.round(
+            (doneCount / tasks.length) * 100
+          )}%"></div></div>
+          <div class="stat-caption">${doneCount} of ${tasks.length} done${isToday ? ' today' : ` on ${selectedDate}`}</div>
+        </div>
+        ${tasks
+          .map((t, idx) => {
+            const mark = doneMap[t.id];
+            const who = mark ? (mark.by === lastKnownUid ? 'You' : identity.partnerName || 'Them') : '';
+            return `
+            <div class="list-row tappable" data-id="${t.id}" style="animation-delay:${idx * 25}ms">
+              <div class="checkbox ${mark ? 'done' : ''}">${mark ? '✓' : ''}</div>
+              <div class="grow ${mark ? 'done-text' : ''}">${escapeHTML(t.text)}</div>
+              ${mark ? `<span class="row-meta">${escapeHTML(who)}</span>` : ''}
+              <button class="btn-icon subtle daily-remove" data-id="${t.id}" aria-label="Remove">×</button>
+            </div>`;
+          })
+          .join('')}
+      </div>`;
+
+    bodyEl.querySelectorAll('.list-row').forEach((row) => {
+      row.onclick = async (e) => {
+        if (e.target.closest('.daily-remove')) return;
+        try {
+          await RoomData.toggleDailyDone(identity.roomId, sharedKey, selectedDate, row.dataset.id);
+        } catch (err) {
+          toast("Couldn't save that");
+        }
+      };
+    });
+    bodyEl.querySelectorAll('.daily-remove').forEach((btn) => {
+      btn.onclick = async (e) => {
+        e.stopPropagation();
+        const task = tasks.find((t) => t.id === btn.dataset.id);
+        if (!confirm(`Stop tracking “${task?.text || 'this'}” every day?`)) return;
+        try {
+          await RoomData.deleteDailyTask(identity.roomId, btn.dataset.id);
+        } catch (err) {
+          toast("Couldn't remove that");
+        }
+      };
+    });
+  };
+
+  // Only one day is ever listened to at a time — switching days swaps the
+  // listener rather than adding another.
+  const watchDay = () => {
+    if (doneUnsub) doneUnsub();
+    doneMap = {};
+    doneUnsub = RoomData.listenDailyDone(identity.roomId, sharedKey, selectedDate, (done) => {
+      doneMap = done;
+      paintBody();
+    });
+  };
+
+  unsubscribers.push(
+    RoomData.listenDailyTasks(identity.roomId, sharedKey, (list) => {
+      tasks = list;
+      paintBody();
+    })
+  );
+  unsubscribers.push(() => {
+    if (doneUnsub) doneUnsub();
+  });
+
+  paintStrip();
+  watchDay();
+}
+
+function renderSomedayList(host) {
+  host.innerHTML = `
+    <div class="card">
+      <div class="inline-add">
+        <input type="text" id="item-input" placeholder="Add something…" />
+        <button class="btn-primary compact" id="add-item">Add</button>
+      </div>
+    </div>
+    <div id="item-list"></div>
   `;
   const add = async () => {
     const el = document.getElementById('item-input');
@@ -2729,6 +3126,7 @@ function renderMore(slot) {
           ['tile-journal', iconJournal(), 'Journal', 'Longer thoughts, shared'],
           ['tile-letters', iconLetter(), 'Letters', 'Written now, opened later'],
           ['tile-game', iconGame(), 'Tic-Tac-Toe', 'Take a turn each'],
+          ['tile-ludo', iconLudo(), 'Ludo', 'Four seats, bots welcome'],
           ['tile-memories', iconMemory(), 'Memories', 'Pinned from Chat'],
           ['tile-settings', iconSettings(), 'Settings', 'Security &amp; account'],
         ]
@@ -2749,6 +3147,7 @@ function renderMore(slot) {
   document.getElementById('tile-journal').onclick = () => renderJournal();
   document.getElementById('tile-letters').onclick = () => renderLetters();
   document.getElementById('tile-game').onclick = () => renderGame();
+  document.getElementById('tile-ludo').onclick = () => renderLudoEntry();
   document.getElementById('tile-memories').onclick = () => renderMemories();
   document.getElementById('tile-settings').onclick = () => renderSettings();
 }
@@ -2991,6 +3390,482 @@ function renderGame() {
   }
 
   paint();
+}
+
+// ---------------- Ludo ----------------
+// Everything below draws a single screen that never scrolls: a thin line of
+// text on top, a square board that takes whatever space is left, and the dice
+// underneath. On a short phone the board shrinks; it is never cut off, and
+// nothing is ever hidden below a fold.
+const LUDO_YARD_ORIGIN = { red: [0, 0], green: [0, 9], yellow: [9, 9], blue: [9, 0] };
+
+function ludoYardSlots(seat) {
+  const [r, c] = LUDO_YARD_ORIGIN[seat];
+  return [
+    [r + 1.5, c + 1.5],
+    [r + 1.5, c + 3.5],
+    [r + 3.5, c + 1.5],
+    [r + 3.5, c + 3.5],
+  ];
+}
+
+// Where token `index` of `seat` physically sits, in grid coordinates.
+function ludoTokenCell(seat, progress, index) {
+  if (progress === LudoRules.YARD) return ludoYardSlots(seat)[index];
+  if (progress === LudoRules.FINISHED) {
+    // Fan the finished tokens out around the centre so four of them don't
+    // stack into what looks like one.
+    const spread = [[6.6, 7], [7, 6.6], [7.4, 7], [7, 7.4]];
+    return spread[index];
+  }
+  return LudoRules.cellFor(seat, progress);
+}
+
+function ludoBoardHTML() {
+  const cells = [];
+  const kind = {};
+  LudoRules.RING.forEach((c, i) => {
+    kind[`${c[0]},${c[1]}`] = LudoRules.SAFE_INDICES.has(i) ? 'track safe' : 'track';
+  });
+  for (const seat of LudoRules.SEATS) {
+    for (const c of LudoRules.HOME_COLUMNS[seat]) kind[`${c[0]},${c[1]}`] = `home ${seat}`;
+    const startCell = LudoRules.RING[LudoRules.START_INDEX[seat]];
+    kind[`${startCell[0]},${startCell[1]}`] = `track start ${seat}`;
+  }
+  for (let r = 0; r < 15; r++) {
+    for (let c = 0; c < 15; c++) {
+      const k = kind[`${r},${c}`];
+      cells.push(`<div class="lc ${k || 'blank'}"></div>`);
+    }
+  }
+  const yards = LudoRules.SEATS.map((seat) => {
+    const [r, c] = LUDO_YARD_ORIGIN[seat];
+    return `<div class="lyard ${seat}" style="left:${(c / 15) * 100}%;top:${(r / 15) * 100}%"></div>`;
+  }).join('');
+  return `<div class="ludo-grid">${yards}${cells.join('')}<div class="lcentre"></div></div>`;
+}
+
+function ludoStatusLine(state, presence, mySeat) {
+  if (!state) return 'Loading…';
+  if (state.status === 'finished') {
+    const who = Ludo.seatLabel(state, state.winner, presence);
+    return state.winner === mySeat ? 'You won 🎉' : `${who.name} won`;
+  }
+  if (state.status === 'abandoned') {
+    return state.abandonedReason === 'not-enough-players'
+      ? 'Ended — a game needs two real players'
+      : 'Ended';
+  }
+  const seat = state.turn;
+  if (!seat) return 'Waiting…';
+  const who = Ludo.seatLabel(state, seat, presence);
+  const roll = state.roll != null ? ` · rolled ${state.roll}` : '';
+  if (seat === mySeat && !who.bot) return `Your turn${roll}`;
+  return `${who.name}${who.bot ? ' (bot)' : ''}${roll}`;
+}
+
+function renderLudo(invite) {
+  clearListeners();
+  markSectionsSeen(['game']);
+  onSubScreen = true;
+
+  let gameId = invite?.gameId || null;
+  let key = invite?.key || null;
+  let keyB64 = invite?.keyB64 || null;
+  let state = null;
+  let presence = {};
+  let mySeat = null;
+  let botTimer = null;
+  let shortHandedSince = null;
+  let left = false;
+
+  const myName = identity?.displayName || 'You';
+
+  root.innerHTML = `<div class="ludo-screen" id="ludo-root"></div>`;
+  const host = document.getElementById('ludo-root');
+
+  const leave = async () => {
+    left = true;
+    if (gameId) await Ludo.clearPresence(gameId);
+    clearListeners();
+    onSubScreen = false;
+    history.replaceState(null, '', window.location.pathname);
+    // A guest has no room to go back to, and must never be dropped into the
+    // paired app's navigation.
+    if (isPaired(identity)) renderMain();
+    else renderGuestFarewell();
+  };
+
+  // ---- lobby ----
+  const paintLobby = () => {
+    const link = keyB64 ? Ludo.ludoLinkFor(gameId, keyB64) : '';
+    const liveHumans = Ludo.liveHumanSeats(state, presence).length;
+    const ready = Ludo.canStart(state, presence);
+    host.innerHTML = `
+      <div class="ludo-head">
+        <button class="btn-icon" id="ludo-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div class="grow"><div class="eyebrow">Ludo</div><h2>Table</h2></div>
+      </div>
+      <div class="ludo-lobby">
+        ${LudoRules.SEATS.map((seat) => {
+          const info = state.seats[seat];
+          const label = Ludo.seatLabel(state, seat, presence);
+          const isHost = state.hostUid === lastKnownUid;
+          return `
+          <div class="lseat ${seat} ${info.occupied ? '' : 'empty'}">
+            <span class="ldot ${seat}"></span>
+            <span class="grow">${escapeHTML(info.occupied ? label.name : 'Open seat')}${
+              info.uid === lastKnownUid ? ' · you' : ''
+            }</span>
+            ${
+              isHost && info.kind !== 'human'
+                ? `<button class="btn-secondary compact" data-ai="${seat}">${
+                    info.kind === 'ai' ? 'Remove' : 'Add bot'
+                  }</button>`
+                : ''
+            }
+          </div>`;
+        }).join('')}
+      </div>
+      <div class="ludo-foot">
+        <p class="body-dim ludo-note">
+          ${
+            ready
+              ? 'Ready when you are.'
+              : `Two real players are needed to start — ${liveHumans} here so far. Send the link, or fill a seat with a bot.`
+          }
+        </p>
+        <div class="btn-row">
+          <button class="btn-secondary" id="ludo-copy">Copy invite link</button>
+          <button class="btn-primary" id="ludo-start" ${ready ? '' : 'disabled'}>Start</button>
+        </div>
+      </div>`;
+    document.getElementById('ludo-back').onclick = leave;
+    document.getElementById('ludo-copy').onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(link);
+        toast('Link copied — send it to anyone');
+      } catch (e) {
+        toast('Could not copy the link');
+      }
+    };
+    document.getElementById('ludo-start').onclick = async () => {
+      if (!Ludo.canStart(state, presence)) return;
+      await Ludo.startGame(gameId, key);
+    };
+    host.querySelectorAll('[data-ai]').forEach((btn) => {
+      btn.onclick = async () => {
+        const seat = btn.dataset.ai;
+        await Ludo.setSeatToAi(gameId, key, seat, state.seats[seat]?.kind !== 'ai');
+      };
+    });
+  };
+
+  // ---- board ----
+  const paintBoard = () => {
+    const myTurn = state.turn === mySeat && state.status === 'playing' && !Ludo.seatIsBot(state, mySeat, presence);
+    const moves = myTurn && state.roll != null ? LudoRules.legalMoves(state, mySeat, state.roll) : [];
+    const movable = new Set(moves.map((m) => m.token));
+
+    const tokens = [];
+    for (const seat of LudoRules.SEATS) {
+      if (!state.seats[seat]?.occupied) continue;
+      (state.tokens[seat] || []).forEach((progress, i) => {
+        const cell = ludoTokenCell(seat, progress, i);
+        if (!cell) return;
+        const canMove = seat === mySeat && movable.has(i);
+        tokens.push(`<button class="ltoken ${seat} ${canMove ? 'movable' : ''}"
+          data-token="${canMove ? i : ''}" style="left:${((cell[1] + 0.5) / 15) * 100}%;top:${
+          ((cell[0] + 0.5) / 15) * 100
+        }%" ${canMove ? '' : 'disabled'} aria-label="${seat} token ${i + 1}"></button>`);
+      });
+    }
+
+    // Whose seat has quietly become a bot, said out loud rather than swapped in
+    // behind your back.
+    const takenOver = LudoRules.SEATS.filter((s) => Ludo.seatLabel(state, s, presence).takenOver).map(
+      (s) => `${escapeHTML(state.seats[s].name || 'Someone')} dropped out — a bot is playing ${s} now`
+    );
+
+    const finished = state.status === 'finished' || state.status === 'abandoned';
+    host.innerHTML = `
+      <div class="ludo-head">
+        <button class="btn-icon" id="ludo-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div class="grow ludo-status">${escapeHTML(ludoStatusLine(state, presence, mySeat))}</div>
+      </div>
+      <div class="ludo-players">
+        ${LudoRules.SEATS.filter((s) => state.seats[s]?.occupied)
+          .map((s) => {
+            const l = Ludo.seatLabel(state, s, presence);
+            return `<span class="lchip ${s} ${state.turn === s ? 'active' : ''}">
+              <span class="ldot ${s}"></span>${escapeHTML(l.name)}${l.bot ? ' 🤖' : ''}
+              <b>${LudoRules.tokensHome(state, s)}/4</b>
+            </span>`;
+          })
+          .join('')}
+      </div>
+      ${takenOver.length ? `<div class="ludo-alert">${takenOver.map(escapeHTML).join(' · ')}</div>` : ''}
+      <div class="ludo-boardwrap">
+        <div class="ludo-board">
+          ${ludoBoardHTML()}
+          <div class="ludo-tokens">${tokens.join('')}</div>
+        </div>
+      </div>
+      <div class="ludo-foot">
+        ${
+          finished
+            ? `<button class="btn-primary" id="ludo-again">Back to the table</button>`
+            : `<button class="ludo-die ${myTurn && state.roll == null ? 'ready' : ''}" id="ludo-roll" ${
+                myTurn && state.roll == null ? '' : 'disabled'
+              }>${state.roll != null ? state.roll : '🎲'}</button>
+               <p class="body-dim ludo-note">${escapeHTML(
+                 myTurn
+                   ? state.roll == null
+                     ? 'Tap the die'
+                     : moves.length
+                     ? 'Pick a token'
+                     : 'Nothing to move'
+                   : 'Waiting for their move'
+               )}</p>`
+        }
+      </div>`;
+
+    document.getElementById('ludo-back').onclick = leave;
+    const rollBtn = document.getElementById('ludo-roll');
+    if (rollBtn) rollBtn.onclick = () => Ludo.rollFor(gameId, key, state, mySeat);
+    const againBtn = document.getElementById('ludo-again');
+    if (againBtn) againBtn.onclick = leave;
+    host.querySelectorAll('.ltoken.movable').forEach((el) => {
+      el.onclick = () => Ludo.moveToken(gameId, key, state, mySeat, Number(el.dataset.token));
+    });
+  };
+
+  const paint = () => {
+    if (!state) {
+      host.innerHTML = `<div class="ludo-head"><button class="btn-icon" id="ludo-back">${iconChevronLeft()}</button><div class="grow ludo-status">Loading…</div></div>`;
+      document.getElementById('ludo-back').onclick = leave;
+      return;
+    }
+    if (state.status === 'lobby') paintLobby();
+    else paintBoard();
+  };
+
+  // A turn belonging to a bot — or to someone who has gone quiet — is played by
+  // whichever human client gets there first. No host to depend on, and the
+  // moveCount guard makes a tie harmless.
+  const driveBots = () => {
+    // Always cancel and re-decide. An earlier version bailed out whenever a
+    // timer was already pending, which meant a timer armed for a turn that had
+    // since moved on would fire, find the game changed, and quietly do nothing —
+    // leaving the bot's actual turn with nobody scheduled to play it, and the
+    // board frozen until a human happened to reload.
+    if (botTimer) {
+      clearTimeout(botTimer);
+      botTimer = null;
+    }
+    if (left || !state || state.status !== 'playing' || !state.turn || !mySeat) return;
+    if (!Ludo.seatIsBot(state, state.turn, presence)) return;
+    const seat = state.turn;
+    const at = state.moveCount || 0;
+    botTimer = setTimeout(async () => {
+      botTimer = null;
+      if (left || !state || state.turn !== seat || (state.moveCount || 0) !== at) return;
+      // Re-checked at firing time, not just when scheduled: someone whose phone
+      // woke up in the last second is back, and their turn is theirs again.
+      if (!Ludo.seatIsBot(state, seat, presence)) return;
+      await Ludo.playBotTurn(gameId, key, state, seat);
+    }, Ludo.AI_THINK_MS);
+  };
+
+  // My own turn with a roll and nothing legal to do with it passes itself on,
+  // so nobody sits looking at a board wondering what they are meant to tap.
+  const autoPass = () => {
+    if (!state || state.status !== 'playing' || state.turn !== mySeat || state.roll == null) return;
+    if (Ludo.seatIsBot(state, mySeat, presence)) return;
+    if (LudoRules.legalMoves(state, mySeat, state.roll).length > 0) return;
+    const at = state.moveCount || 0;
+    setTimeout(() => {
+      if (left || !state || state.turn !== mySeat || state.roll == null) return;
+      if ((state.moveCount || 0) !== at) return;
+      Ludo.passTurn(gameId, key, state, mySeat);
+    }, 900);
+  };
+
+  // The floor the user asked for: below two real players the game stops rather
+  // than quietly turning into one person against three bots.
+  const enforceTwoHumans = () => {
+    if (!state || state.status !== 'playing') {
+      shortHandedSince = null;
+      return;
+    }
+    if (Ludo.liveHumanSeats(state, presence).length >= 2) {
+      shortHandedSince = null;
+      return;
+    }
+    if (!shortHandedSince) shortHandedSince = Date.now();
+    else if (Date.now() - shortHandedSince > 45000) {
+      shortHandedSince = null;
+      Ludo.abandonGame(gameId, key, 'not-enough-players');
+    }
+  };
+
+  const attach = () => {
+    unsubscribers.push(
+      Ludo.listenGame(
+        gameId,
+        key,
+        (next) => {
+          if (!next) {
+            host.innerHTML = `<div class="ludo-head"><button class="btn-icon" id="ludo-back">${iconChevronLeft()}</button><div class="grow ludo-status">That game could not be opened.</div></div>`;
+            document.getElementById('ludo-back').onclick = leave;
+            return;
+          }
+          state = next;
+          mySeat = LudoRules.SEATS.find((s) => state.seats[s]?.uid === lastKnownUid) || null;
+          paint();
+          driveBots();
+          autoPass();
+        },
+        () => toast("Lost the game connection")
+      )
+    );
+    unsubscribers.push(Ludo.listenPresence(gameId, (map) => {
+      presence = map;
+      if (state) paint();
+      driveBots();
+      enforceTwoHumans();
+    }));
+
+    Ludo.heartbeat(gameId);
+    const beat = setInterval(() => {
+      Ludo.heartbeat(gameId);
+      // Presence is time-based, so the screen has to re-evaluate on a clock as
+      // well as on a snapshot — nothing arrives to tell you someone went quiet.
+      if (state) paint();
+      driveBots();
+      enforceTwoHumans();
+    }, Ludo.HEARTBEAT_MS);
+    unsubscribers.push(() => clearInterval(beat));
+    unsubscribers.push(() => {
+      if (botTimer) clearTimeout(botTimer);
+      botTimer = null;
+    });
+  };
+
+  (async () => {
+    try {
+      if (!gameId) {
+        const created = await Ludo.createGame({ hostName: myName });
+        gameId = created.gameId;
+        key = created.key;
+        keyB64 = created.keyB64;
+        // Drop the invite into the room too, so your person just sees a Join
+        // button instead of having to be sent a link like a stranger.
+        if (identity?.roomId && sharedKey) {
+          await RoomData.setLudoInvite(identity.roomId, sharedKey, { gameId, keyB64, by: myName });
+        }
+      } else {
+        const joined = await Ludo.claimSeat(gameId, key, myName);
+        state = joined.state;
+        mySeat = joined.seat;
+      }
+      attach();
+    } catch (e) {
+      host.innerHTML = `
+        <div class="ludo-head"><button class="btn-icon" id="ludo-back">${iconChevronLeft()}</button>
+        <div class="grow ludo-status">${escapeHTML(e?.message || 'Could not open that game.')}</div></div>`;
+      document.getElementById('ludo-back').onclick = leave;
+    }
+  })();
+}
+
+// The Ludo tile lands here: either pick up the game already going, or start one.
+function renderLudoEntry() {
+  clearListeners();
+  onSubScreen = true;
+  root.innerHTML = `
+    <div class="screen">
+      <div class="page-head">
+        <button class="btn-icon" id="ludo-entry-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div><div class="eyebrow">Four seats</div><h2>Ludo</h2></div>
+      </div>
+      <div class="card">
+        <p class="body-dim">
+          You and ${escapeHTML(identity?.partnerName || 'your person')}, plus two more —
+          send a link to anyone, or fill the seats with bots. It takes two real players to start.
+        </p>
+      </div>
+      <div id="ludo-open"></div>
+      <button class="btn-primary" id="ludo-new">Start a new game</button>
+    </div>`;
+  attachNav();
+  document.getElementById('ludo-entry-back').onclick = () => renderMain();
+  document.getElementById('ludo-new').onclick = () => renderLudo(null);
+
+  const openEl = document.getElementById('ludo-open');
+  if (!identity?.roomId || !sharedKey) return;
+  unsubscribers.push(
+    RoomData.listenLudoInvite(identity.roomId, sharedKey, (invite) => {
+      if (!invite?.gameId) {
+        openEl.innerHTML = '';
+        return;
+      }
+      openEl.innerHTML = `
+        <div class="card">
+          <div class="eyebrow">A game is open</div>
+          <p class="body-dim">Started by ${escapeHTML(invite.by || 'them')}.</p>
+          <button class="btn-secondary compact" id="ludo-join" style="margin-top:10px;">Join</button>
+        </div>`;
+      document.getElementById('ludo-join').onclick = () =>
+        renderLudo({ gameId: invite.gameId, keyB64: invite.keyB64, key: boxKeyFromB64(invite.keyB64) });
+    })
+  );
+}
+
+// Where a guest lands when they leave. They have no room, no tabs and nothing
+// else in this app — so the screen says so, warmly, and stops.
+function renderGuestFarewell() {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>Thanks for playing</h1>
+      <p class="lede">That's the end of the game. Ask for a new link whenever you fancy another.</p>
+    </div>`;
+}
+
+// A guest arriving on a Ludo link is not part of the room and must never be
+// walked through pairing. Name, seat, play — that is the whole of it.
+function renderLudoGuest(invite) {
+  clearListeners();
+  root.innerHTML = `
+    <div class="screen center-col">
+      <div class="mark"></div>
+      <h1>You've been invited</h1>
+      <p class="lede">A game of Ludo. Pick a name and take a seat.</p>
+      <div class="card">
+        <input type="text" id="guest-name" placeholder="Your name" maxlength="20" />
+      </div>
+      <button class="btn-primary" id="guest-join">Take a seat</button>
+      <div id="guest-error" class="error-text"></div>
+    </div>`;
+  const btn = document.getElementById('guest-join');
+  btn.onclick = async () => {
+    const name = document.getElementById('guest-name').value.trim();
+    if (!name) return;
+    btn.disabled = true;
+    btn.textContent = 'Joining…';
+    try {
+      const user = await ensureSignedIn();
+      lastKnownUid = user.uid;
+      identity = { ...(identity || {}), displayName: name };
+      renderLudo({ ...invite, key: boxKeyFromB64(invite.keyB64) });
+    } catch (e) {
+      document.getElementById('guest-error').textContent = e?.message || 'Could not join.';
+      btn.disabled = false;
+      btn.textContent = 'Take a seat';
+    }
+  };
 }
 
 // ---------------- Expenses (with categories) ----------------
@@ -4224,9 +5099,13 @@ function renderConnectionCheck() {
             rRoom.detail = 'both accounts listed';
           } else {
             rRoom.state = 'fail';
+            // Show the actual ids side by side. "Wrong account" is impossible to
+            // act on until you can see that the room expects one id and this
+            // device is presenting another.
+            const expected = members.map((m) => `${String(m).slice(0, 8)}…`).join(', ') || 'nobody';
             rRoom.detail = meIn
-              ? "your partner's account is not listed on the room"
-              : 'this device’s account is not listed on the room';
+              ? `room lists ${expected} — your partner's account is not among them`
+              : `room lists ${expected}, this device is ${uid.slice(0, 8)}…`;
             verdict =
               verdict ||
               (meIn
@@ -4300,13 +5179,28 @@ function renderConnectionCheck() {
             : escapeHTML(verdict || 'Something in the chain above failed. The first ✗ is the one to fix.')
         }</p>
         ${
-          wrongAccount
+          wrongAccount && identity?.recoveryEmail
             ? '<button class="btn-primary" id="diag-recover-btn" style="margin-top:12px;">Sign in with recovery</button>'
             : ''
         }
+        ${
+          wrongAccount && !identity?.recoveryEmail
+            ? '<button class="btn-primary" id="diag-code-btn" style="margin-top:12px;">Get my code for them</button>'
+            : ''
+        }
+      </div>
+      <div class="card">
+        <div class="eyebrow">On the healthy device</div>
+        <p class="body-dim">
+          If it is your partner who is locked out, they will read you a code. This is where you enter it.
+        </p>
+        <button class="btn-secondary compact" id="diag-readmit-btn" style="margin-top:10px;">Re-admit a device</button>
       </div>`;
     const recoverBtn = document.getElementById('diag-recover-btn');
     if (recoverBtn) recoverBtn.onclick = () => renderRecoverStep();
+    const codeBtn = document.getElementById('diag-code-btn');
+    if (codeBtn) codeBtn.onclick = () => renderReadmitCode();
+    document.getElementById('diag-readmit-btn').onclick = () => renderReadmitEnter();
   })();
 }
 
@@ -4392,8 +5286,8 @@ function renderRecoverySetupFromSettings() {
     btn.disabled = true;
     btn.textContent = 'Saving…';
     try {
-      await setUpRecovery(email, password, identity);
-      identity = await updateIdentity({ recoveryEmail: email });
+      const backupKey = await setUpRecovery(email, password, identity);
+      identity = await updateIdentity({ recoveryEmail: email, backupKey, myUid: lastKnownUid });
       toast('Recovery is set up');
       renderSettings();
     } catch (e) {
@@ -4546,6 +5440,11 @@ function iconNudge() {
 }
 function iconGame() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18M15 3v18M3 9h18M3 15h18"/></svg>';
+}
+// A die rather than a grid, so the two games are told apart at a glance in the
+// More tab instead of sharing one icon.
+function iconLudo() {
+  return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><rect x="3" y="3" width="18" height="18" rx="4"/><circle cx="8.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="8.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none"/><circle cx="8.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/><circle cx="15.5" cy="15.5" r="1.3" fill="currentColor" stroke="none"/></svg>';
 }
 function iconSearch() {
   return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" width="19" height="19"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>';

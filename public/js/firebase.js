@@ -3,6 +3,7 @@ import { initializeApp } from 'https://www.gstatic.com/firebasejs/10.12.2/fireba
 import {
   getAuth,
   signInAnonymously,
+  onAuthStateChanged,
   signOut as firebaseSignOut,
 } from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js';
 import {
@@ -44,7 +45,46 @@ export async function tryEnableOfflinePersistence() {
   }
 }
 
+// Firebase restores a persisted session ASYNCHRONOUSLY. In the moment right
+// after getAuth(), auth.currentUser is always null — even when a real, valid
+// session is sitting in IndexedDB waiting to be read back. Trusting that null
+// caused the worst bug this app has had: boot() saw "nobody is signed in",
+// called signInAnonymously(), and silently replaced the paired account with a
+// brand-new one. The device kept its keys and room id but was no longer a
+// member of its own room, so every read and write was refused by the server.
+// Nothing below may look at auth.currentUser until this settles.
+let readyPromise = null;
+export function authReady() {
+  if (readyPromise) return readyPromise;
+  readyPromise =
+    typeof auth.authStateReady === 'function'
+      ? auth.authStateReady()
+      : new Promise((resolve) => {
+          const unsub = onAuthStateChanged(
+            auth,
+            () => {
+              unsub();
+              resolve();
+            },
+            () => {
+              unsub();
+              resolve();
+            }
+          );
+        });
+  return readyPromise;
+}
+
+// The signed-in account, or null — never creates one. Use this when "nobody is
+// signed in" is a state to handle rather than a state to fix, which is the case
+// anywhere a paired identity already exists on the device.
+export async function currentUserOrNull() {
+  await authReady();
+  return auth.currentUser;
+}
+
 export async function ensureSignedIn() {
+  await authReady();
   if (!auth.currentUser) {
     await signInAnonymously(auth);
   }

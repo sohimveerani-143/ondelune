@@ -22,13 +22,45 @@ service cloud.firestore {
       allow read, write: if request.auth != null && request.auth.uid == uid;
     }
 
+    // Ludo games. The one thing here that is deliberately open beyond the two
+    // paired accounts, because a seat can be filled by anyone sent a link.
+    //
+    // Access is by knowledge of the game id, which is a random 128-bit token —
+    // and the contents are encrypted with a key that only ever travels in the
+    // link's #fragment, so what is stored is ciphertext Firebase cannot read.
+    // A guest reaching a game therefore reaches exactly one game and nothing
+    // else: rooms/ above is untouched by these rules.
+    //
+    // Deletion is not allowed. Games are ended by writing a status, so the
+    // other players' screens can say what happened rather than going blank.
+    match /games/{gameId} {
+      allow read: if request.auth != null;
+      allow create, update: if request.auth != null
+                            && request.resource.data.ciphertext is string
+                            && request.resource.data.ciphertext.size() < 100000;
+
+      match /presence/{uid} {
+        allow read: if request.auth != null;
+        allow write: if request.auth != null && request.auth.uid == uid;
+      }
+    }
+
     // Rooms: only the two paired members may read or write anything inside.
     match /rooms/{roomId} {
       allow create: if request.auth != null
                     && request.auth.uid in request.resource.data.memberUids;
 
-      allow read, update: if request.auth != null
-                          && request.auth.uid in resource.data.memberUids;
+      // A member may rewrite memberUids — that is how a device that lost its
+      // session gets re-admitted under its new account id. It may not use that
+      // to remove itself, and it may not grow the room past the two people it
+      // was created for.
+      allow read: if request.auth != null
+                  && request.auth.uid in resource.data.memberUids;
+
+      allow update: if request.auth != null
+                    && request.auth.uid in resource.data.memberUids
+                    && request.auth.uid in request.resource.data.memberUids
+                    && request.resource.data.memberUids.size() == 2;
 
       match /{subcollection}/{docId} {
         allow read, write: if request.auth != null

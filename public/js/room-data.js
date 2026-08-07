@@ -10,6 +10,7 @@ import {
   updateDoc,
   deleteDoc,
   onSnapshot,
+  runTransaction,
   collection,
   addDoc,
   query,
@@ -71,6 +72,44 @@ async function bumpMarker(roomId, section) {
     );
   } catch (e) {
     // A missed badge must never break the thing the user actually did.
+  }
+}
+
+// ---------- Membership repair ----------
+// A device that loses its Firebase session keeps everything that matters — its
+// keypair, the room id, the partner's public key — but comes back under a new
+// account id that the room has never heard of, so the server refuses it. The
+// remaining healthy member is the only one who can fix that, because only a
+// current member is allowed to write memberUids. Deliberately a two-device,
+// read-it-out-loud action rather than anything automatic: it is the one call in
+// the app that grants an account access to everything.
+export async function readmitMember(roomId, staleUid, freshUid) {
+  const user = await ensureSignedIn();
+  const snap = await getDoc(doc(db, 'rooms', roomId));
+  if (!snap.exists()) throw new Error('The shared room record could not be found.');
+  const members = snap.data().memberUids || [];
+  if (!members.includes(user.uid)) {
+    throw new Error('This device is not a member of the room either, so it cannot re-admit anyone.');
+  }
+  if (members.includes(freshUid)) return freshUid;
+  // Rebuild as exactly the two accounts: whoever is doing this, plus the one
+  // being let back in. Anything else would either drop the healthy member or
+  // grow the room past two people.
+  const next = [user.uid, freshUid].sort();
+  await updateDoc(doc(db, 'rooms', roomId), { memberUids: next });
+  return freshUid;
+}
+
+// Cheap membership probe the re-admitted device can poll. It cannot listen for
+// this — a non-member's listener is refused outright — so it asks periodically
+// until the answer changes.
+export async function amIAMember(roomId) {
+  try {
+    const user = await ensureSignedIn();
+    const snap = await getDoc(doc(db, 'rooms', roomId));
+    return !!snap.exists() && (snap.data().memberUids || []).includes(user.uid);
+  } catch (e) {
+    return false;
   }
 }
 
@@ -359,6 +398,140 @@ export function listenBucketList(roomId, sharedKey, onItems) {
       return { id: d.id, text, done };
     });
     onItems(items);
+  });
+}
+
+// ---------- Daily tasks ----------
+// Two different shapes of "to do" live side by side, because they behave
+// nothing alike: a someday item is finished once and stays finished, while a
+// daily one resets every morning and is only interesting as a history.
+//
+// So the task list and the ticking are stored separately. Tasks are one doc
+// each; a whole day's ticks are ONE doc keyed by date, which means opening a
+// day costs a single read, and no composite index is ever needed to ask "what
+// was done on the 3rd". The date is the document id and therefore plaintext —
+// the same trade already made by the photo-of-the-day, and it reveals only that
+// a day exists, never what is in it.
+export function dateKeyOf(d = new Date()) {
+  const local = new Date(d.getTime() - d.getTimezoneOffset() * 60000);
+  return local.toISOString().slice(0, 10);
+}
+
+export async function addDailyTask(roomId, sharedKey, text) {
+  const { ciphertext, nonce } = encryptJSON({ text }, sharedKey);
+  await addDoc(col(roomId, 'daily'), { ciphertext, nonce, createdAt: serverTimestamp() });
+  await recordActivity(roomId);
+  await bumpMarker(roomId, 'list');
+}
+
+export async function deleteDailyTask(roomId, taskId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'daily', taskId));
+}
+
+export function listenDailyTasks(roomId, sharedKey, onTasks) {
+  const q = query(col(roomId, 'daily'), orderBy('createdAt', 'asc'));
+  return watch('your daily tasks', q, (snap) => {
+    onTasks(
+      snap.docs.map((d) => {
+        const data = d.data();
+        try {
+          return { id: d.id, text: decryptJSON(data.ciphertext, data.nonce, sharedKey).text };
+        } catch (e) {
+          return { id: d.id, text: '⚠️ Could not decrypt' };
+        }
+      })
+    );
+  });
+}
+
+// A transaction, not a plain write: both people ticking different tasks on the
+// same day are editing the same document, and a read-modify-write would
+// silently drop one of the two ticks.
+export async function toggleDailyDone(roomId, sharedKey, dateKey, taskId) {
+  const user = await ensureSignedIn();
+  const ref = doc(db, 'rooms', roomId, 'dailylog', dateKey);
+  await runTransaction(db, async (tx) => {
+    const snap = await tx.get(ref);
+    let done = {};
+    if (snap.exists()) {
+      const data = snap.data();
+      try {
+        done = decryptJSON(data.ciphertext, data.nonce, sharedKey).done || {};
+      } catch (e) {
+        done = {};
+      }
+    }
+    if (done[taskId]) delete done[taskId];
+    else done[taskId] = { by: user.uid, at: Date.now() };
+    const { ciphertext, nonce } = encryptJSON({ done }, sharedKey);
+    tx.set(ref, { ciphertext, nonce, updatedAt: Date.now() });
+  });
+  await recordActivity(roomId);
+}
+
+export function listenDailyDone(roomId, sharedKey, dateKey, onDone) {
+  return watch('that day', doc(db, 'rooms', roomId, 'dailylog', dateKey), (snap) => {
+    const data = snap.data();
+    if (!data) return onDone({});
+    try {
+      onDone(decryptJSON(data.ciphertext, data.nonce, sharedKey).done || {});
+    } catch (e) {
+      onDone({});
+    }
+  });
+}
+
+// Powers the little run of dots under the date strip. One read per day shown,
+// which at a week's worth is cheaper than a single thread page.
+export async function fetchDailyHistory(roomId, sharedKey, dateKeys) {
+  const results = {};
+  await Promise.all(
+    dateKeys.map(async (k) => {
+      try {
+        const snap = await getDoc(doc(db, 'rooms', roomId, 'dailylog', k));
+        const data = snap.data();
+        results[k] = data ? Object.keys(decryptJSON(data.ciphertext, data.nonce, sharedKey).done || {}).length : 0;
+      } catch (e) {
+        results[k] = 0;
+      }
+    })
+  );
+  return results;
+}
+
+// ---------- Ludo invite ----------
+// The game itself lives outside the room, because guests are not room members.
+// What lives in here is only the pointer to it — game id and its key — so your
+// person gets a Join button instead of being sent a link like a stranger. It is
+// encrypted with the couple's key like everything else in the room, which means
+// the game key never reaches Firebase in the clear from this direction either.
+export async function setLudoInvite(roomId, sharedKey, invite) {
+  const { ciphertext, nonce } = encryptJSON(invite, sharedKey);
+  await setDoc(doc(db, 'rooms', roomId, 'game', 'ludo-invite'), {
+    ciphertext,
+    nonce,
+    updatedAt: Date.now(),
+  });
+  await bumpMarker(roomId, 'game');
+}
+
+export async function clearLudoInvite(roomId) {
+  try {
+    await deleteDoc(doc(db, 'rooms', roomId, 'game', 'ludo-invite'));
+  } catch (e) {
+    /* nothing to clear */
+  }
+}
+
+export function listenLudoInvite(roomId, sharedKey, onInvite) {
+  return watch('the open game', doc(db, 'rooms', roomId, 'game', 'ludo-invite'), (snap) => {
+    const data = snap.data();
+    if (!data) return onInvite(null);
+    try {
+      onInvite(decryptJSON(data.ciphertext, data.nonce, sharedKey));
+    } catch (e) {
+      onInvite(null);
+    }
   });
 }
 

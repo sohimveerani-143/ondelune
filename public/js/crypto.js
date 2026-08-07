@@ -59,6 +59,18 @@ export function decryptBytes(ciphertextB64, nonceB64, sharedKey) {
   return opened;
 }
 
+// A standalone secretbox key, for data that is shared with someone who is not
+// the paired partner — a Ludo guest, say. It travels in a link's #fragment,
+// which browsers never send to the server, so the game stays unreadable to
+// Firebase exactly like everything else here.
+export function randomBoxKeyB64() {
+  return encodeBase64(nacl.randomBytes(nacl.secretbox.keyLength));
+}
+
+export function boxKeyFromB64(b64) {
+  return decodeBase64(b64);
+}
+
 export function randomToken(numBytes = 8) {
   return Array.from(nacl.randomBytes(numBytes))
     .map((b) => b.toString(16).padStart(2, '0'))
@@ -108,6 +120,46 @@ export async function encryptWithPassphrase(plainObj, passphrase) {
     salt: encodeBase64(salt),
     iv: encodeBase64(iv),
   };
+}
+
+// ---------------- Wrapped-key backup envelope ----------------
+// The cloud backup has to be rewritten every time something in it changes —
+// most importantly the moment pairing completes, since a backup taken during
+// onboarding knows no roomId and no partner at all. Rewriting it must NOT
+// require the recovery password, because holding that password on the device
+// (or asking for it on every pairing change) is worse than the problem.
+//
+// So the payload is encrypted with a random key, and only that random key is
+// wrapped by the password. The device keeps the random key locally and can
+// refresh the payload whenever it likes; recovery unwraps the key with the
+// password first, exactly once, and reads the payload with it.
+export function randomKeyB64() {
+  return encodeBase64(crypto.getRandomValues(new Uint8Array(32)));
+}
+
+async function importRawAesKey(keyB64) {
+  return crypto.subtle.importKey('raw', decodeBase64(keyB64), { name: 'AES-GCM' }, false, [
+    'encrypt',
+    'decrypt',
+  ]);
+}
+
+export async function encryptWithRawKey(plainObj, keyB64) {
+  const iv = crypto.getRandomValues(new Uint8Array(12));
+  const key = await importRawAesKey(keyB64);
+  const data = new TextEncoder().encode(JSON.stringify(plainObj));
+  const cipherBuf = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, data);
+  return { ciphertext: encodeBase64(new Uint8Array(cipherBuf)), iv: encodeBase64(iv) };
+}
+
+export async function decryptWithRawKey({ ciphertext, iv }, keyB64) {
+  const key = await importRawAesKey(keyB64);
+  const plainBuf = await crypto.subtle.decrypt(
+    { name: 'AES-GCM', iv: decodeBase64(iv) },
+    key,
+    decodeBase64(ciphertext)
+  );
+  return JSON.parse(new TextDecoder().decode(plainBuf));
 }
 
 export async function decryptWithPassphrase({ ciphertext, salt, iv }, passphrase) {
