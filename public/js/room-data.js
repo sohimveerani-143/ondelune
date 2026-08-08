@@ -381,6 +381,10 @@ export async function toggleBucketItem(roomId, sharedKey, itemId, currentText, c
   await updateDoc(doc(db, 'rooms', roomId, 'bucketlist', itemId), { ciphertext, nonce });
 }
 
+export async function deleteBucketItem(roomId, itemId) {
+  await deleteDoc(doc(db, 'rooms', roomId, 'bucketlist', itemId));
+}
+
 export function listenBucketList(roomId, sharedKey, onItems) {
   const q = query(col(roomId, 'bucketlist'), orderBy('createdAt', 'asc'));
   return watch('your list', q, (snap) => {

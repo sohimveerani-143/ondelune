@@ -3099,14 +3099,28 @@ function renderSomedayList(host) {
             <div class="list-row tappable" data-idx="${idx}" style="animation-delay:${idx * 25}ms">
               <div class="checkbox ${i.done ? 'done' : ''}">${i.done ? '✓' : ''}</div>
               <div class="grow ${i.done ? 'done-text' : ''}">${escapeHTML(i.text)}</div>
+              <button class="btn-icon subtle item-remove" data-idx="${idx}" aria-label="Delete">×</button>
             </div>`
             )
             .join('')}
         </div>`;
       listEl.querySelectorAll('.list-row').forEach((row) => {
         const item = items[Number(row.dataset.idx)];
-        row.onclick = () => {
+        row.onclick = (e) => {
+          if (e.target.closest('.item-remove')) return;
           RoomData.toggleBucketItem(identity.roomId, sharedKey, item.id, item.text, item.done);
+        };
+      });
+      listEl.querySelectorAll('.item-remove').forEach((btn) => {
+        btn.onclick = async (e) => {
+          e.stopPropagation();
+          const item = items[Number(btn.dataset.idx)];
+          if (!confirm(`Delete “${item.text}” from your list?`)) return;
+          try {
+            await RoomData.deleteBucketItem(identity.roomId, item.id);
+          } catch (err) {
+            toast("Couldn't delete that");
+          }
         };
       });
     })
@@ -3341,11 +3355,22 @@ function renderGame() {
         if (!myTurn) return;
         const i = Number(cell.dataset.i);
         if (state.board[i]) return;
-        cell.classList.add('placing');
+        // Draw the mark now rather than waiting for the write to come back.
+        // The move is decided the instant it is tapped, and the round trip is
+        // the entire reason the board felt slow — a border colour changing is
+        // not the feedback a tap needs. If the write fails, paint() puts the
+        // board back exactly as the server sees it.
+        cell.classList.add('placing', 'filled', 'locked');
+        cell.innerHTML = `<span>${markFor(lastKnownUid)}</span>`;
+        boardEl.querySelectorAll('.game-cell').forEach((c) => {
+          c.disabled = true;
+          c.classList.add('locked');
+        });
         try {
           await Game.makeMove(identity.roomId, sharedKey, state, i);
         } catch (e) {
           toast("Couldn't make that move");
+          paint();
         }
       };
     });
@@ -3459,10 +3484,100 @@ function ludoStatusLine(state, presence, mySeat) {
   const seat = state.turn;
   if (!seat) return 'Waiting…';
   const who = Ludo.seatLabel(state, seat, presence);
-  const roll = state.roll != null ? ` · rolled ${state.roll}` : '';
-  if (seat === mySeat && !who.bot) return `Your turn${roll}`;
-  return `${who.name}${who.bot ? ' (bot)' : ''}${roll}`;
+  if (seat === mySeat && !who.bot) return 'Your Turn';
+  return `${who.name}'s Turn`;
 }
+
+// The drifting sky that sits behind every Ludo screen: a moon, a scatter of
+// stars, and a few hearts rising. Pure CSS with no JS loop, so it costs nothing
+// on a phone and stops entirely under prefers-reduced-motion.
+function ludoSkyHTML() {
+  const stars = Array.from({ length: 18 }, (_, i) => {
+    const left = (i * 37) % 100;
+    const top = (i * 53) % 62;
+    return `<i class="lstar" style="left:${left}%;top:${top}%;animation-delay:${(i % 7) * 0.6}s"></i>`;
+  }).join('');
+  const hearts = Array.from({ length: 6 }, (_, i) => {
+    const left = 8 + ((i * 31) % 84);
+    return `<i class="lheart" style="left:${left}%;animation-delay:${i * 2.6}s">♥</i>`;
+  }).join('');
+  return `<div class="ludo-sky" aria-hidden="true"><span class="lmoon"></span>${stars}${hearts}</div>`;
+}
+
+// A real pipped die rather than a printed number. Smaller than the mockup's,
+// as asked — the board is the thing worth looking at.
+const DIE_PIPS = {
+  1: [4],
+  2: [0, 8],
+  3: [0, 4, 8],
+  4: [0, 2, 6, 8],
+  5: [0, 2, 4, 6, 8],
+  6: [0, 2, 3, 5, 6, 8],
+};
+
+function ludoDieHTML(value) {
+  const on = new Set(DIE_PIPS[value] || []);
+  const pips = Array.from({ length: 9 }, (_, i) => `<i class="${on.has(i) ? 'on' : ''}"></i>`).join('');
+  return `<span class="ldie-face">${pips}</span>`;
+}
+
+function ludoInitial(name) {
+  return (String(name || '?').trim()[0] || '?').toUpperCase();
+}
+
+// How far this seat has actually got, as one number. Finished tokens count the
+// full distance so the score only ever climbs.
+function ludoProgress(state, seat) {
+  return (state.tokens[seat] || []).reduce((sum, p) => sum + (p > 0 ? p : 0), 0);
+}
+
+// The header. Two players get the mockup's "You vs Them"; three or four get the
+// same cards laid out in a row, because a vs in the middle stops meaning
+// anything once there are more than two of you.
+function ludoPlayersHTML(state, presence, mySeat) {
+  const seated = LudoRules.SEATS.filter((s) => state.seats[s]?.occupied);
+  const card = (seat) => {
+    const label = Ludo.seatLabel(state, seat, presence);
+    const isTurn = state.turn === seat && state.status === 'playing';
+    const home = LudoRules.tokensHome(state, seat);
+    const pips = Array.from(
+      { length: 4 },
+      (_, i) => `<i class="${i < home ? 'home' : ''}"></i>`
+    ).join('');
+    return `
+      <div class="lplayer ${seat} ${isTurn ? 'turn' : ''} ${seat === mySeat ? 'me' : ''}">
+        <span class="lavatar ${seat}">${escapeHTML(ludoInitial(label.name))}${
+      label.bot ? '<b class="lbot">🤖</b>' : ''
+    }</span>
+        <span class="lplayer-text">
+          <span class="lname">${escapeHTML(seat === mySeat && !label.bot ? 'You' : label.name)}</span>
+          <span class="lpips">${pips}</span>
+        </span>
+        <span class="lscore">★ ${ludoProgress(state, seat)}</span>
+      </div>`;
+  };
+  if (seated.length === 2) {
+    // Keep whoever is reading the screen on the left, as the mockup does.
+    const ordered = mySeat && seated.includes(mySeat) ? [mySeat, seated.find((s) => s !== mySeat)] : seated;
+    return `<div class="ludo-players duo">${card(ordered[0])}<span class="lvs">vs</span>${card(
+      ordered[1]
+    )}</div>`;
+  }
+  return `<div class="ludo-players">${seated.map(card).join('')}</div>`;
+}
+
+function ludoReactionsHTML() {
+  return `<div class="ludo-reacts">${Ludo.REACTIONS.map(
+    (e) => `<button class="lreact" data-react="${e}" aria-label="React ${e}">${e}</button>`
+  ).join('')}</div>`;
+}
+
+const LUDO_HOWTO = [
+  ['🎲', 'Roll the die', 'Tap the die on your turn and move one piece by that many squares.'],
+  ['♟️', 'Get your pieces out', 'Roll a 6 to move a piece from your yard onto its starting square.'],
+  ['🔄', 'Move around the board', 'Travel clockwise all the way round, then up your own colour’s column.'],
+  ['❤️', 'Reach home', 'Land on someone to send them back. First to bring all four pieces home wins.'],
+];
 
 function renderLudo(invite) {
   clearListeners();
@@ -3478,6 +3593,20 @@ function renderLudo(invite) {
   let botTimer = null;
   let shortHandedSince = null;
   let left = false;
+  let overlay = null; // 'pause' | 'howto' — the win screen comes from state
+  let seenReactionAt = 0;
+  let celebrated = false;
+  // The board is built once and then updated in place. Rebuilding it wholesale
+  // threw away and recreated 225 cells and every piece on each repaint, which
+  // (a) cost real time on every presence heartbeat and (b) meant the CSS
+  // transition on .ltoken could never run — a brand-new element has nothing to
+  // animate from, so pieces jumped instead of sliding.
+  let boardShell = false;
+  let tokenEls = {};
+  let rollAnim = null;
+  // The last state the server actually confirmed, kept apart from `state` so an
+  // optimistic move that gets refused has something truthful to fall back to.
+  let serverState = null;
 
   const myName = identity?.displayName || 'You';
 
@@ -3486,6 +3615,8 @@ function renderLudo(invite) {
 
   const leave = async () => {
     left = true;
+    if (rollAnim) clearInterval(rollAnim);
+    rollAnim = null;
     if (gameId) await Ludo.clearPresence(gameId);
     clearListeners();
     onSubScreen = false;
@@ -3502,9 +3633,15 @@ function renderLudo(invite) {
     const liveHumans = Ludo.liveHumanSeats(state, presence).length;
     const ready = Ludo.canStart(state, presence);
     host.innerHTML = `
+      ${ludoSkyHTML()}
       <div class="ludo-head">
         <button class="btn-icon" id="ludo-back" aria-label="Back">${iconChevronLeft()}</button>
-        <div class="grow"><div class="eyebrow">Ludo</div><h2>Table</h2></div>
+        <div class="grow"></div>
+        <button class="btn-icon" id="ludo-howto" aria-label="How to play">?</button>
+      </div>
+      <div class="ludo-hero">
+        <h1 class="ludo-wordmark">Ludo</h1>
+        <p class="ludo-tagline">A little fun, just for us.</p>
       </div>
       <div class="ludo-lobby">
         ${LudoRules.SEATS.map((seat) => {
@@ -3513,10 +3650,12 @@ function renderLudo(invite) {
           const isHost = state.hostUid === lastKnownUid;
           return `
           <div class="lseat ${seat} ${info.occupied ? '' : 'empty'}">
-            <span class="ldot ${seat}"></span>
+            <span class="lavatar ${seat} small">${
+              info.occupied ? escapeHTML(ludoInitial(label.name)) : '+'
+            }</span>
             <span class="grow">${escapeHTML(info.occupied ? label.name : 'Open seat')}${
               info.uid === lastKnownUid ? ' · you' : ''
-            }</span>
+            }${info.kind === 'ai' ? ' · bot' : ''}</span>
             ${
               isHost && info.kind !== 'human'
                 ? `<button class="btn-secondary compact" data-ai="${seat}">${
@@ -3535,12 +3674,14 @@ function renderLudo(invite) {
               : `Two real players are needed to start — ${liveHumans} here so far. Send the link, or fill a seat with a bot.`
           }
         </p>
-        <div class="btn-row">
-          <button class="btn-secondary" id="ludo-copy">Copy invite link</button>
-          <button class="btn-primary" id="ludo-start" ${ready ? '' : 'disabled'}>Start</button>
-        </div>
+        <button class="btn-primary ludo-cta" id="ludo-start" ${ready ? '' : 'disabled'}>Start Game</button>
+        <button class="btn-secondary" id="ludo-copy">Invite someone</button>
       </div>`;
     document.getElementById('ludo-back').onclick = leave;
+    document.getElementById('ludo-howto').onclick = () => {
+      overlay = 'howto';
+      paintOverlay();
+    };
     document.getElementById('ludo-copy').onclick = async () => {
       try {
         await navigator.clipboard.writeText(link);
@@ -3562,82 +3703,280 @@ function renderLudo(invite) {
   };
 
   // ---- board ----
-  const paintBoard = () => {
-    const myTurn = state.turn === mySeat && state.status === 'playing' && !Ludo.seatIsBot(state, mySeat, presence);
-    const moves = myTurn && state.roll != null ? LudoRules.legalMoves(state, mySeat, state.roll) : [];
-    const movable = new Set(moves.map((m) => m.token));
+  // Built once. Everything after that is an in-place update of the few things
+  // that actually change, which is what lets pieces slide rather than jump.
+  const buildBoardShell = () => {
+    host.innerHTML = `
+      ${ludoSkyHTML()}
+      <div class="ludo-head">
+        <button class="btn-icon" id="ludo-back" aria-label="Back">${iconChevronLeft()}</button>
+        <div class="grow"></div>
+        <button class="btn-icon" id="ludo-pause" aria-label="Pause">⋯</button>
+      </div>
+      <div id="lud-players"></div>
+      <div id="lud-alert"></div>
+      <div class="ludo-boardwrap">
+        <div class="ludo-board">
+          ${ludoBoardHTML()}
+          <div class="ludo-tokens" id="lud-tokens"></div>
+        </div>
+      </div>
+      <div class="ludo-turnline" id="lud-turnline"></div>
+      <div class="ludo-foot" id="lud-foot"></div>`;
+    document.getElementById('ludo-back').onclick = leave;
+    document.getElementById('ludo-pause').onclick = () => {
+      overlay = 'pause';
+      paintOverlay();
+    };
+    tokenEls = {};
+    boardShell = true;
+  };
 
-    const tokens = [];
+  // Tapping the die can't know its own result — the value is drawn inside the
+  // transaction — so tumble the face until the real one lands. This is covering
+  // a real round trip, not decoration: without it the die sits dead for as long
+  // as the network takes.
+  const startRollAnim = () => {
+    const btn = document.getElementById('lud-die');
+    if (!btn) return;
+    btn.classList.add('rolling');
+    let face = 0;
+    clearInterval(rollAnim);
+    rollAnim = setInterval(() => {
+      face = (face % 6) + 1;
+      btn.innerHTML = ludoDieHTML(face);
+    }, 90);
+  };
+  const stopRollAnim = () => {
+    if (rollAnim) clearInterval(rollAnim);
+    rollAnim = null;
+  };
+
+  const onTokenTap = (tokenIndex) => {
+    if (state.roll == null) return;
+    // Apply the move locally and show it immediately. applyMove is pure, so the
+    // result is exactly what the server will compute from the same inputs.
+    // Note the send goes out BEFORE `state` is reassigned: the transaction is
+    // guarded on the move count it was issued against, and handing it the
+    // optimistic count would make it reject itself every time.
+    const optimistic = LudoRules.applyMove(state, mySeat, tokenIndex, state.roll);
+    const sent = Ludo.moveToken(gameId, key, state, mySeat, tokenIndex);
+    if (optimistic) {
+      state = optimistic;
+      paintBoard();
+    }
+    sent
+      .then((result) => {
+        // A null result means the guard refused it — usually because someone
+        // else got there first. Their snapshot normally corrects us, but if
+        // nothing else changed there is none coming, and the optimistic move
+        // would sit on screen as a move that never happened.
+        if (result || !serverState) return;
+        state = serverState;
+        paintBoard();
+      })
+      .catch(() => {
+        toast("Couldn't make that move");
+        if (serverState) {
+          state = serverState;
+          paintBoard();
+        }
+      });
+  };
+
+  const updateTokens = (movable) => {
+    const wrap = document.getElementById('lud-tokens');
+    if (!wrap) return;
+    const seen = new Set();
     for (const seat of LudoRules.SEATS) {
       if (!state.seats[seat]?.occupied) continue;
       (state.tokens[seat] || []).forEach((progress, i) => {
         const cell = ludoTokenCell(seat, progress, i);
         if (!cell) return;
+        const id = `${seat}-${i}`;
+        seen.add(id);
+        let el = tokenEls[id];
+        if (!el) {
+          el = document.createElement('button');
+          el.className = `ltoken ${seat}`;
+          el.setAttribute('aria-label', `${seat} piece ${i + 1}`);
+          wrap.appendChild(el);
+          tokenEls[id] = el;
+        }
+        el.style.left = `${((cell[1] + 0.5) / 15) * 100}%`;
+        el.style.top = `${((cell[0] + 0.5) / 15) * 100}%`;
         const canMove = seat === mySeat && movable.has(i);
-        tokens.push(`<button class="ltoken ${seat} ${canMove ? 'movable' : ''}"
-          data-token="${canMove ? i : ''}" style="left:${((cell[1] + 0.5) / 15) * 100}%;top:${
-          ((cell[0] + 0.5) / 15) * 100
-        }%" ${canMove ? '' : 'disabled'} aria-label="${seat} token ${i + 1}"></button>`);
+        el.classList.toggle('movable', canMove);
+        el.disabled = !canMove;
+        el.onclick = canMove ? () => onTokenTap(i) : null;
       });
     }
+    for (const id of Object.keys(tokenEls)) {
+      if (seen.has(id)) continue;
+      tokenEls[id].remove();
+      delete tokenEls[id];
+    }
+  };
+
+  const paintBoard = () => {
+    if (!boardShell) buildBoardShell();
+
+    const myTurn = state.turn === mySeat && state.status === 'playing' && !Ludo.seatIsBot(state, mySeat, presence);
+    const moves = myTurn && state.roll != null ? LudoRules.legalMoves(state, mySeat, state.roll) : [];
+    const movable = new Set(moves.map((m) => m.token));
+    const finished = state.status === 'finished' || state.status === 'abandoned';
+
+    document.getElementById('lud-players').innerHTML = ludoPlayersHTML(state, presence, mySeat);
 
     // Whose seat has quietly become a bot, said out loud rather than swapped in
     // behind your back.
     const takenOver = LudoRules.SEATS.filter((s) => Ludo.seatLabel(state, s, presence).takenOver).map(
-      (s) => `${escapeHTML(state.seats[s].name || 'Someone')} dropped out — a bot is playing ${s} now`
+      (s) => `${state.seats[s].name || 'Someone'} dropped out — a bot is playing ${s} now`
     );
+    document.getElementById('lud-alert').innerHTML = takenOver.length
+      ? `<div class="ludo-alert">${takenOver.map(escapeHTML).join(' · ')}</div>`
+      : '';
 
-    const finished = state.status === 'finished' || state.status === 'abandoned';
-    host.innerHTML = `
-      <div class="ludo-head">
-        <button class="btn-icon" id="ludo-back" aria-label="Back">${iconChevronLeft()}</button>
-        <div class="grow ludo-status">${escapeHTML(ludoStatusLine(state, presence, mySeat))}</div>
-      </div>
-      <div class="ludo-players">
-        ${LudoRules.SEATS.filter((s) => state.seats[s]?.occupied)
-          .map((s) => {
-            const l = Ludo.seatLabel(state, s, presence);
-            return `<span class="lchip ${s} ${state.turn === s ? 'active' : ''}">
-              <span class="ldot ${s}"></span>${escapeHTML(l.name)}${l.bot ? ' 🤖' : ''}
-              <b>${LudoRules.tokensHome(state, s)}/4</b>
-            </span>`;
-          })
-          .join('')}
-      </div>
-      ${takenOver.length ? `<div class="ludo-alert">${takenOver.map(escapeHTML).join(' · ')}</div>` : ''}
-      <div class="ludo-boardwrap">
-        <div class="ludo-board">
-          ${ludoBoardHTML()}
-          <div class="ludo-tokens">${tokens.join('')}</div>
-        </div>
-      </div>
-      <div class="ludo-foot">
-        ${
-          finished
-            ? `<button class="btn-primary" id="ludo-again">Back to the table</button>`
-            : `<button class="ludo-die ${myTurn && state.roll == null ? 'ready' : ''}" id="ludo-roll" ${
-                myTurn && state.roll == null ? '' : 'disabled'
-              }>${state.roll != null ? state.roll : '🎲'}</button>
-               <p class="body-dim ludo-note">${escapeHTML(
-                 myTurn
-                   ? state.roll == null
-                     ? 'Tap the die'
-                     : moves.length
-                     ? 'Pick a token'
-                     : 'Nothing to move'
-                   : 'Waiting for their move'
-               )}</p>`
-        }
-      </div>`;
+    updateTokens(movable);
 
-    document.getElementById('ludo-back').onclick = leave;
-    const rollBtn = document.getElementById('ludo-roll');
-    if (rollBtn) rollBtn.onclick = () => Ludo.rollFor(gameId, key, state, mySeat);
+    const turnEl = document.getElementById('lud-turnline');
+    turnEl.classList.toggle('mine', myTurn);
+    turnEl.innerHTML = `<span class="lsparkle">✦</span><span>${escapeHTML(
+      ludoStatusLine(state, presence, mySeat)
+    )}</span><span class="lsparkle">✦</span>`;
+
+    if (state.roll != null) stopRollAnim();
+    const foot = document.getElementById('lud-foot');
+    foot.innerHTML = finished
+      ? `<button class="btn-primary ludo-cta" id="ludo-again">Back to the table</button>`
+      : `<button class="ludo-die ${myTurn && state.roll == null ? 'ready' : ''}" id="lud-die" ${
+          myTurn && state.roll == null ? '' : 'disabled'
+        } aria-label="Roll the die">${state.roll != null ? ludoDieHTML(state.roll) : ludoDieHTML(6)}</button>
+         <p class="body-dim ludo-note">${escapeHTML(
+           myTurn
+             ? state.roll == null
+               ? 'Tap the die'
+               : moves.length
+               ? 'Pick a piece'
+               : 'Nothing to move'
+             : 'Waiting for their move'
+         )}</p>
+         ${ludoReactionsHTML()}`;
+
+    const rollBtn = document.getElementById('lud-die');
+    if (rollBtn) {
+      rollBtn.onclick = () => {
+        rollBtn.disabled = true;
+        startRollAnim();
+        Ludo.rollFor(gameId, key, state, mySeat).catch(() => {
+          stopRollAnim();
+          paintBoard();
+        });
+      };
+    }
     const againBtn = document.getElementById('ludo-again');
     if (againBtn) againBtn.onclick = leave;
-    host.querySelectorAll('.ltoken.movable').forEach((el) => {
-      el.onclick = () => Ludo.moveToken(gameId, key, state, mySeat, Number(el.dataset.token));
+    foot.querySelectorAll('.lreact').forEach((el) => {
+      el.onclick = () => {
+        if (!mySeat) return;
+        Ludo.sendReaction(gameId, key, mySeat, el.dataset.react);
+      };
     });
+  };
+
+  // ---- overlays ----
+  // Drawn on top of whatever screen is underneath rather than replacing it, so
+  // dismissing a menu never costs a repaint of the board or loses its position.
+  // Scoped to `.menu` on purpose: the win screen is also a .ludo-overlay, and a
+  // bare selector here would quietly delete it on the next repaint.
+  const paintOverlay = () => {
+    const existing = host.querySelector('.ludo-overlay.menu');
+    if (existing) existing.remove();
+    if (!overlay) return;
+
+    const sheet =
+      overlay === 'howto'
+        ? `<div class="ludo-sheet howto">
+             <h2 class="ludo-sheet-title">♡ How to Play Ludo ♡</h2>
+             ${LUDO_HOWTO.map(
+               ([icon, title, body]) => `
+               <div class="lhow">
+                 <span class="lhow-icon">${icon}</span>
+                 <span>
+                   <b>${escapeHTML(title)}</b>
+                   <span class="body-dim">${escapeHTML(body)}</span>
+                 </span>
+               </div>`
+             ).join('')}
+             <p class="ludo-signoff">Have fun together! 💜</p>
+             <button class="btn-secondary" data-close="1">Close</button>
+           </div>`
+        : `<div class="ludo-sheet">
+             <h2 class="ludo-sheet-title">♡ Game Paused ♡</h2>
+             <button class="lmenu" data-act="resume">▶ Resume Game</button>
+             <button class="lmenu" data-act="howto">? How to Play</button>
+             <button class="lmenu danger" data-act="leave">⤶ Leave Game</button>
+             <button class="btn-secondary" data-close="1">Cancel</button>
+           </div>`;
+
+    const el = document.createElement('div');
+    el.className = 'ludo-overlay menu';
+    el.innerHTML = sheet;
+    host.appendChild(el);
+
+    el.querySelectorAll('[data-close]').forEach((b) => {
+      b.onclick = () => {
+        overlay = null;
+        paintOverlay();
+      };
+    });
+    el.querySelectorAll('[data-act]').forEach((b) => {
+      b.onclick = () => {
+        const act = b.dataset.act;
+        if (act === 'resume') {
+          overlay = null;
+          paintOverlay();
+        } else if (act === 'howto') {
+          overlay = 'howto';
+          paintOverlay();
+        } else if (act === 'leave') {
+          leave();
+        }
+      };
+    });
+  };
+
+  // The win screen. Shown once, over the final board, so the last move stays
+  // visible behind it.
+  const paintWin = () => {
+    const who = Ludo.seatLabel(state, state.winner, presence);
+    const mine = state.winner === mySeat;
+    const scores = LudoRules.SEATS.filter((s) => state.seats[s]?.occupied)
+      .map((s) => {
+        const l = Ludo.seatLabel(state, s, presence);
+        return `<div class="lwin-score ${s === state.winner ? 'won' : ''}">
+            <span class="lavatar ${s} small">${escapeHTML(ludoInitial(l.name))}</span>
+            <span class="lwin-name">${escapeHTML(s === mySeat && !l.bot ? 'You' : l.name)}</span>
+            <b>${ludoProgress(state, s)}</b>
+          </div>`;
+      })
+      .join('<span class="lvs">vs</span>');
+
+    const el = document.createElement('div');
+    el.className = 'ludo-overlay win';
+    el.innerHTML = `
+      <div class="lfireworks" aria-hidden="true">${Array.from(
+        { length: 14 },
+        (_, i) => `<i style="left:${(i * 29) % 96}%;animation-delay:${(i % 6) * 0.35}s"></i>`
+      ).join('')}</div>
+      <div class="ludo-sheet win">
+        <h2 class="lwin-title">${escapeHTML(mine ? 'You win!' : `${who.name} wins!`)} 🎉</h2>
+        <p class="ludo-tagline">What a game.</p>
+        <div class="lwin-scores">${scores}</div>
+        <button class="btn-primary ludo-cta" data-act="again">Back to the table</button>
+      </div>`;
+    host.appendChild(el);
+    el.querySelector('[data-act="again"]').onclick = leave;
   };
 
   const paint = () => {
@@ -3646,8 +3985,44 @@ function renderLudo(invite) {
       document.getElementById('ludo-back').onclick = leave;
       return;
     }
-    if (state.status === 'lobby') paintLobby();
-    else paintBoard();
+    if (state.status === 'lobby') {
+      // The lobby replaces the whole screen, so the board shell it wiped has to
+      // be rebuilt next time rather than updated into a DOM that no longer exists.
+      celebrated = false;
+      boardShell = false;
+      tokenEls = {};
+      paintLobby();
+    } else if (state.status === 'finished' && celebrated) {
+      // The board and the celebration are already on screen and a finished game
+      // cannot change again. Repainting would restart the fireworks every time
+      // a presence heartbeat lands, five seconds apart, forever.
+      return;
+    } else {
+      paintBoard();
+    }
+    paintOverlay();
+    if (state.status === 'finished' && state.winner && !celebrated) {
+      paintWin();
+      celebrated = true;
+    }
+    flushReaction();
+  };
+
+  // A reaction someone else sent floats up once and is gone. Keyed on its
+  // timestamp so a repaint for any other reason never replays it.
+  const flushReaction = () => {
+    const r = state?.lastReaction;
+    if (!r || !r.at || r.at <= seenReactionAt) return;
+    const first = seenReactionAt === 0;
+    seenReactionAt = r.at;
+    // Don't replay a backlog of reactions on the first paint after opening.
+    if (first || Date.now() - r.at > 12000) return;
+    const el = document.createElement('div');
+    el.className = 'lfloat';
+    el.textContent = r.emoji;
+    el.style.left = `${18 + Math.random() * 64}%`;
+    host.appendChild(el);
+    setTimeout(() => el.remove(), 2600);
   };
 
   // A turn belonging to a bot — or to someone who has gone quiet — is played by
@@ -3721,6 +4096,7 @@ function renderLudo(invite) {
             return;
           }
           state = next;
+          serverState = next;
           mySeat = LudoRules.SEATS.find((s) => state.seats[s]?.uid === lastKnownUid) || null;
           paint();
           driveBots();

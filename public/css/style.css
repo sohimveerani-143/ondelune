@@ -1722,6 +1722,38 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
    and it stays square by taking the smaller of the width available and the
    height available — so a short phone gets a smaller board rather than a
    cropped one, and nothing is ever hidden below a fold. */
+/* ============================================================
+   Ludo
+   A warm, moonlit table: a cream board floating on the night sky
+   the rest of the app already lives in. The four seats keep their
+   engine names (red/green/yellow/blue) because saved games and the
+   rules refer to them — only the paint changed.
+       red    → violet   (top-left)
+       green  → coral    (top-right)
+       yellow → amber    (bottom-right)
+       blue   → sky      (bottom-left)
+   The whole screen is one viewport, never scrolls, and the board
+   takes whatever space the fixed furniture leaves it.
+   ============================================================ */
+:root {
+  --l-red: #9b7fc4;
+  --l-red-soft: #c3addf;
+  --l-red-pale: #e6dcf3;
+  --l-green: #e8798a;
+  --l-green-soft: #f2a3ae;
+  --l-green-pale: #fad5da;
+  --l-yellow: #e0a85c;
+  --l-yellow-soft: #eec78f;
+  --l-yellow-pale: #f9e6c8;
+  --l-blue: #6d9fd0;
+  --l-blue-soft: #9dc2e4;
+  --l-blue-pale: #d3e5f5;
+
+  --l-board: #f7efe3;
+  --l-track: #fdf8f0;
+  --l-line: rgba(90, 68, 120, 0.14);
+}
+
 .ludo-screen {
   position: fixed;
   inset: 0;
@@ -1729,52 +1761,219 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   flex-direction: column;
   gap: 8px;
   padding: max(10px, env(safe-area-inset-top)) 14px max(12px, env(safe-area-inset-bottom));
-  background: var(--night);
+  background:
+    radial-gradient(120% 70% at 50% 0%, #2c2350 0%, transparent 60%),
+    linear-gradient(180deg, #1b1636 0%, var(--night) 55%);
   overflow: hidden;
 }
+
+/* ---- the drifting sky ---- */
+.ludo-sky {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  overflow: hidden;
+  z-index: 0;
+}
+.lmoon {
+  position: absolute;
+  top: 7%;
+  left: 50%;
+  width: 54px;
+  height: 54px;
+  margin-left: -27px;
+  border-radius: 50%;
+  background: radial-gradient(circle at 36% 32%, #fdf3dc, var(--moonlight) 62%, #d8bd8e 100%);
+  box-shadow: 0 0 42px rgba(236, 214, 173, 0.28), 0 0 90px rgba(236, 214, 173, 0.12);
+  animation: l-moon 7s ease-in-out infinite;
+}
+@keyframes l-moon {
+  0%, 100% { transform: translateY(0); box-shadow: 0 0 42px rgba(236, 214, 173, 0.26), 0 0 90px rgba(236, 214, 173, 0.1); }
+  50%      { transform: translateY(-5px); box-shadow: 0 0 54px rgba(236, 214, 173, 0.36), 0 0 110px rgba(236, 214, 173, 0.16); }
+}
+.lstar {
+  position: absolute;
+  width: 3px;
+  height: 3px;
+  border-radius: 50%;
+  background: var(--moonlight);
+  opacity: 0.2;
+  animation: l-twinkle 4.5s ease-in-out infinite;
+}
+@keyframes l-twinkle {
+  0%, 100% { opacity: 0.12; transform: scale(0.8); }
+  50%      { opacity: 0.7;  transform: scale(1.35); }
+}
+.lheart {
+  position: absolute;
+  bottom: -24px;
+  font-size: 13px;
+  font-style: normal;
+  color: var(--l-green-soft);
+  opacity: 0;
+  animation: l-rise 16s linear infinite;
+}
+@keyframes l-rise {
+  0%   { opacity: 0;    transform: translateY(0) scale(0.7) rotate(-8deg); }
+  12%  { opacity: 0.45; }
+  80%  { opacity: 0.25; }
+  100% { opacity: 0;    transform: translateY(-88vh) scale(1.05) rotate(10deg); }
+}
+
+/* Everything above the sky. */
+.ludo-head, .ludo-hero, .ludo-players, .ludo-alert,
+.ludo-boardwrap, .ludo-turnline, .ludo-foot, .ludo-lobby {
+  position: relative;
+  z-index: 1;
+}
+
 .ludo-head {
   display: flex;
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
 }
-.ludo-status {
-  font-size: 15px;
-  font-weight: 600;
-  color: var(--text);
+.ludo-status { font-size: 15px; font-weight: 600; color: var(--text); }
+
+/* ---- lobby ---- */
+.ludo-hero {
+  flex-shrink: 0;
+  text-align: center;
+  padding: 6px 0 2px;
 }
+.ludo-wordmark {
+  font-family: 'Parisienne', cursive;
+  font-size: 46px;
+  font-weight: 400;
+  line-height: 1.1;
+  margin: 0;
+  color: var(--text);
+  text-shadow: 0 0 26px rgba(236, 214, 173, 0.35);
+}
+.ludo-tagline {
+  margin: 2px 0 0;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+.ludo-lobby {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding-top: 4px;
+}
+.lseat {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 14px;
+  color: var(--text);
+  background: rgba(40, 32, 64, 0.72);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+  padding: 10px 12px;
+}
+.lseat.empty { color: var(--text-faint); }
+.lseat.empty .lavatar { background: transparent; border: 1px dashed var(--border-strong); color: var(--text-faint); }
+
+/* ---- player header ---- */
 .ludo-players {
   display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
+  gap: 8px;
   flex-shrink: 0;
+  align-items: stretch;
 }
-.lchip {
-  display: inline-flex;
+.ludo-players.duo { align-items: center; }
+.lplayer {
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
   align-items: center;
-  gap: 5px;
-  font-size: 11.5px;
-  color: var(--text-dim);
-  background: var(--surface-2);
-  border: 1px solid var(--border);
+  gap: 8px;
+  padding: 7px 10px;
   border-radius: 16px;
-  padding: 4px 9px;
+  background: rgba(40, 32, 64, 0.72);
+  border: 1px solid var(--border);
+  transition: border-color var(--dur) var(--ease), box-shadow var(--dur) var(--ease),
+              background var(--dur) var(--ease), transform var(--dur) var(--ease);
 }
-.lchip.active {
-  border-color: var(--horizon);
-  color: var(--text);
+/* Whose turn it is, said three ways at once: a lit ring, a lift, and a pulse.
+   One of them alone is easy to miss on a small screen mid-conversation. */
+.lplayer.turn {
+  background: rgba(56, 45, 86, 0.95);
+  border-color: var(--seat-c, var(--horizon));
+  box-shadow: 0 0 0 1px var(--seat-c, var(--horizon)), 0 0 22px -4px var(--seat-c, var(--horizon));
+  transform: translateY(-1px);
 }
-.lchip b { font-weight: 600; opacity: 0.6; }
-.ldot {
-  width: 8px; height: 8px; border-radius: 50%;
-  flex-shrink: 0;
+.lplayer.turn .lavatar { animation: l-pulse 1.9s ease-in-out infinite; }
+@keyframes l-pulse {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(255, 255, 255, 0.35); }
+  50%      { box-shadow: 0 0 0 5px rgba(255, 255, 255, 0); }
 }
-.ldot.red, .lseat.red .ldot { background: #e5645f; }
-.ldot.green, .lseat.green .ldot { background: #6fbf73; }
-.ldot.yellow, .lseat.yellow .ldot { background: #e3c04c; }
-.ldot.blue, .lseat.blue .ldot { background: #5b9bd5; }
+.lplayer.red    { --seat-c: var(--l-red); }
+.lplayer.green  { --seat-c: var(--l-green); }
+.lplayer.yellow { --seat-c: var(--l-yellow); }
+.lplayer.blue   { --seat-c: var(--l-blue); }
 
-/* Said plainly, never quietly: a person's seat has become a bot. */
+.lavatar {
+  position: relative;
+  flex-shrink: 0;
+  width: 34px;
+  height: 34px;
+  border-radius: 50%;
+  display: grid;
+  place-items: center;
+  font-size: 14px;
+  font-weight: 700;
+  color: #241c3c;
+  background: var(--seat-c, var(--horizon));
+}
+.lavatar.small { width: 26px; height: 26px; font-size: 11.5px; }
+.lavatar.red    { --seat-c: var(--l-red); }
+.lavatar.green  { --seat-c: var(--l-green); }
+.lavatar.yellow { --seat-c: var(--l-yellow); }
+.lavatar.blue   { --seat-c: var(--l-blue); }
+.lbot {
+  position: absolute;
+  right: -3px;
+  bottom: -3px;
+  font-size: 10px;
+  line-height: 1;
+}
+
+.lplayer-text { min-width: 0; display: flex; flex-direction: column; gap: 3px; flex: 1 1 auto; }
+.lname {
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--text);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.lpips { display: flex; gap: 3px; }
+.lpips i {
+  width: 6px; height: 6px; border-radius: 50%;
+  background: rgba(242, 233, 222, 0.2);
+}
+.lpips i.home { background: var(--seat-c, var(--horizon)); }
+.lscore {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 600;
+  color: var(--moonlight);
+  opacity: 0.85;
+}
+.lvs {
+  flex-shrink: 0;
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--text-faint);
+  letter-spacing: 0.06em;
+}
+
 .ludo-alert {
   flex-shrink: 0;
   font-size: 11.5px;
@@ -1786,6 +1985,7 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   padding: 6px 9px;
 }
 
+/* ---- board ---- */
 .ludo-boardwrap {
   flex: 1 1 auto;
   min-height: 0;           /* without this the board refuses to shrink */
@@ -1803,9 +2003,10 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   aspect-ratio: 1;
   width: 100%;
   max-width: 100%;
-  border-radius: var(--r-md);
-  background: var(--surface);
-  border: 1px solid var(--border-strong);
+  border-radius: 18px;
+  background: var(--l-board);
+  border: 1px solid rgba(242, 233, 222, 0.16);
+  box-shadow: 0 14px 40px rgba(0, 0, 0, 0.42), 0 0 0 1px rgba(0, 0, 0, 0.2);
   overflow: hidden;
 }
 /* Container query units are what actually express "the smaller of the two axes
@@ -1827,67 +2028,150 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   display: grid;
   grid-template-columns: repeat(15, 1fr);
   grid-template-rows: repeat(15, 1fr);
+  z-index: 1;
 }
-.lc { border: 0.5px solid rgba(242, 233, 222, 0.05); }
-.lc.blank { border-color: transparent; }
-.lc.track { background: rgba(242, 233, 222, 0.05); }
-.lc.safe { background: rgba(242, 233, 222, 0.13); }
-.lc.start.red { background: #e5645f; }
-.lc.start.green { background: #6fbf73; }
-.lc.start.yellow { background: #e3c04c; }
-.lc.start.blue { background: #5b9bd5; }
-.lc.home.red { background: rgba(229, 100, 95, 0.5); }
-.lc.home.green { background: rgba(111, 191, 115, 0.5); }
-.lc.home.yellow { background: rgba(227, 192, 76, 0.5); }
-.lc.home.blue { background: rgba(91, 155, 213, 0.5); }
+.lc { border: 0.5px solid var(--l-line); }
+.lc.blank { border-color: transparent; background: transparent; }
+.lc.track { background: var(--l-track); }
+.lc.safe {
+  background: var(--l-track);
+  position: relative;
+}
+/* The classic star on a resting square, drawn rather than imaged. */
+.lc.safe::after {
+  content: '✦';
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 8px;
+  color: rgba(90, 68, 120, 0.4);
+}
+.lc.start.red    { background: var(--l-red); }
+.lc.start.green  { background: var(--l-green); }
+.lc.start.yellow { background: var(--l-yellow); }
+.lc.start.blue   { background: var(--l-blue); }
+/* A start square is a resting square too, but it is coloured rather than
+   starred by the markup, so it needs the star drawn back on in white. */
+.lc.start {
+  position: relative;
+}
+.lc.start::after {
+  content: '✦';
+  position: absolute;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  font-size: 8px;
+  color: rgba(255, 255, 255, 0.8);
+}
+.lc.home.red    { background: var(--l-red-soft); }
+.lc.home.green  { background: var(--l-green-soft); }
+.lc.home.yellow { background: var(--l-yellow-soft); }
+.lc.home.blue   { background: var(--l-blue-soft); }
 
 .lyard {
   position: absolute;
   width: 40%;
   height: 40%;
-  border-radius: var(--r-sm);
-  opacity: 0.22;
+  border-radius: 14px;
+  z-index: 2;
+  opacity: 1;
+  border: 1px solid rgba(255, 255, 255, 0.5);
 }
-.lyard.red { background: #e5645f; }
-.lyard.green { background: #6fbf73; }
-.lyard.yellow { background: #e3c04c; }
-.lyard.blue { background: #5b9bd5; }
+/* The pale inner pad the four pieces rest on, as on a real board. */
+.lyard::after {
+  content: '';
+  position: absolute;
+  inset: 17%;
+  border-radius: 12px;
+  background: rgba(255, 255, 255, 0.62);
+}
+.lyard.red    { background: var(--l-red); }
+.lyard.green  { background: var(--l-green); }
+.lyard.yellow { background: var(--l-yellow); }
+.lyard.blue   { background: var(--l-blue); }
 
 .lcentre {
   position: absolute;
   left: 40%; top: 40%;
   width: 20%; height: 20%;
-  background: radial-gradient(circle at 40% 35%, var(--moonlight), var(--horizon) 80%);
-  opacity: 0.85;
+  z-index: 2;
+  display: grid;
+  place-items: center;
+  background:
+    conic-gradient(from 45deg,
+      var(--l-green) 0deg 90deg,
+      var(--l-yellow) 90deg 180deg,
+      var(--l-blue) 180deg 270deg,
+      var(--l-red) 270deg 360deg);
+}
+.lcentre::after {
+  content: '♥';
+  width: 58%;
+  height: 58%;
+  border-radius: 50%;
+  background: rgba(255, 255, 255, 0.92);
+  display: grid;
+  place-items: center;
+  color: var(--l-green);
+  font-size: 13px;
+  box-shadow: 0 0 14px rgba(232, 121, 138, 0.45);
+  animation: l-beat 2.4s ease-in-out infinite;
+}
+@keyframes l-beat {
+  0%, 100% { transform: scale(1); }
+  45%      { transform: scale(1.12); }
 }
 
-.ludo-tokens { position: absolute; inset: 0; }
+.ludo-tokens { position: absolute; inset: 0; z-index: 3; }
 .ltoken {
   position: absolute;
-  width: 5.4%;
-  height: 5.4%;
+  width: 5.6%;
+  height: 5.6%;
   padding: 0;
   border-radius: 50%;
-  border: 1.5px solid rgba(22, 18, 43, 0.65);
+  border: 1.5px solid rgba(255, 255, 255, 0.9);
   transform: translate(-50%, -50%);
-  transition: left 0.28s var(--ease), top 0.28s var(--ease);
-  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+  transition: left 0.34s var(--ease), top 0.34s var(--ease);
+  box-shadow: 0 2px 5px rgba(60, 40, 90, 0.45);
 }
-.ltoken.red { background: #e5645f; }
-.ltoken.green { background: #6fbf73; }
-.ltoken.yellow { background: #e3c04c; }
-.ltoken.blue { background: #5b9bd5; }
+.ltoken.red    { background: var(--l-red); }
+.ltoken.green  { background: var(--l-green); }
+.ltoken.yellow { background: var(--l-yellow); }
+.ltoken.blue   { background: var(--l-blue); }
 .ltoken:disabled { cursor: default; }
 .ltoken.movable {
-  border-color: var(--moonlight);
-  box-shadow: 0 0 0 2px rgba(236, 214, 173, 0.55), 0 1px 6px rgba(0, 0, 0, 0.45);
+  border-color: #fff;
+  box-shadow: 0 0 0 2.5px rgba(255, 255, 255, 0.9), 0 0 14px 2px rgba(236, 214, 173, 0.8);
   animation: ludo-nudge 1.5s ease-in-out infinite;
+  cursor: pointer;
 }
 @keyframes ludo-nudge {
   0%, 100% { transform: translate(-50%, -50%) scale(1); }
   50%      { transform: translate(-50%, -50%) scale(1.18); }
 }
 
+/* ---- turn line ---- */
+.ludo-turnline {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  font-size: 14.5px;
+  font-weight: 600;
+  color: var(--text-dim);
+}
+.ludo-turnline.mine { color: var(--horizon-soft); }
+.lsparkle {
+  font-size: 10px;
+  color: var(--moonlight);
+  opacity: 0.5;
+  animation: l-twinkle 3s ease-in-out infinite;
+}
+
+/* ---- foot: dice + reactions ---- */
 .ludo-foot {
   flex-shrink: 0;
   display: flex;
@@ -1896,45 +2180,209 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   gap: 6px;
 }
 .ludo-note { text-align: center; font-size: 12px; margin: 0; }
-.ludo-die {
-  width: 58px;
-  height: 58px;
-  border-radius: 16px;
-  font-size: 24px;
-  font-weight: 700;
-  color: var(--text);
-  background: var(--surface-2);
-  border: 1px solid var(--border-strong);
-  transition: transform 0.18s var(--ease), background 0.18s var(--ease);
-}
-.ludo-die.ready {
-  background: linear-gradient(135deg, var(--horizon), var(--horizon-soft));
-  color: #1a1430;
-  animation: ludo-nudge 1.7s ease-in-out infinite;
-}
-.ludo-die:disabled { opacity: 0.75; }
+.ludo-cta { width: 100%; }
 
-.ludo-lobby {
-  flex: 1 1 auto;
-  min-height: 0;
+/* Smaller than the reference, on purpose — one standard die, because a six is
+   what releases a piece and two dice would break that rule. */
+.ludo-die {
+  width: 46px;
+  height: 46px;
+  padding: 6px;
+  border-radius: 12px;
+  background: #fdf8f0;
+  border: 1px solid rgba(0, 0, 0, 0.14);
+  box-shadow: 0 3px 10px rgba(0, 0, 0, 0.35);
+  transition: transform 0.18s var(--ease), box-shadow 0.18s var(--ease);
+}
+.ldie-face {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  grid-template-rows: repeat(3, 1fr);
+  gap: 2px;
+  width: 100%;
+  height: 100%;
+}
+.ldie-face i { border-radius: 50%; background: transparent; }
+.ldie-face i.on { background: #3a2f55; }
+.ludo-die.ready {
+  box-shadow: 0 0 0 2px var(--horizon), 0 4px 16px rgba(224, 144, 111, 0.5);
+  animation: ludo-nudge-flat 1.7s ease-in-out infinite;
+}
+/* Covers the server round trip a transaction cannot shortcut. */
+.ludo-die.rolling {
+  animation: l-tumble 0.42s linear infinite;
+  box-shadow: 0 0 0 2px var(--moonlight), 0 4px 18px rgba(236, 214, 173, 0.45);
+}
+@keyframes l-tumble {
+  0%   { transform: rotate(0deg)   scale(1); }
+  25%  { transform: rotate(-9deg)  scale(1.07); }
+  50%  { transform: rotate(0deg)   scale(1.11); }
+  75%  { transform: rotate(9deg)   scale(1.07); }
+  100% { transform: rotate(0deg)   scale(1); }
+}
+@keyframes ludo-nudge-flat {
+  0%, 100% { transform: scale(1); }
+  50%      { transform: scale(1.09); }
+}
+.ludo-die:disabled { opacity: 0.6; }
+
+.ludo-reacts {
+  display: flex;
+  gap: 6px;
+  justify-content: center;
+}
+.lreact {
+  width: 38px;
+  height: 32px;
+  font-size: 17px;
+  line-height: 1;
+  border-radius: 12px;
+  background: rgba(40, 32, 64, 0.7);
+  border: 1px solid var(--border);
+  transition: transform 0.15s var(--ease), background 0.15s var(--ease);
+}
+.lreact:active { transform: scale(0.88); background: var(--surface-3); }
+
+/* A reaction someone sent, floating up the screen once. */
+.lfloat {
+  position: absolute;
+  bottom: 20%;
+  font-size: 30px;
+  pointer-events: none;
+  z-index: 6;
+  animation: l-float 2.6s ease-out forwards;
+}
+@keyframes l-float {
+  0%   { opacity: 0; transform: translateY(10px) scale(0.6); }
+  18%  { opacity: 1; transform: translateY(0) scale(1.15); }
+  100% { opacity: 0; transform: translateY(-160px) scale(0.9); }
+}
+
+/* ---- overlays: pause, how to play, win ---- */
+.ludo-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 20px;
+  background: rgba(16, 12, 32, 0.76);
+  backdrop-filter: blur(7px);
+  -webkit-backdrop-filter: blur(7px);
+  animation: l-fade 0.22s var(--ease);
+}
+@keyframes l-fade { from { opacity: 0; } to { opacity: 1; } }
+.ludo-sheet {
+  width: 100%;
+  max-width: 340px;
+  max-height: 100%;
   overflow-y: auto;
   display: flex;
   flex-direction: column;
-  gap: 8px;
-  padding-top: 4px;
+  gap: 9px;
+  padding: 20px 18px;
+  border-radius: var(--r-xl);
+  background: linear-gradient(180deg, #2a2249, #211a3c);
+  border: 1px solid var(--border-strong);
+  box-shadow: var(--sh-lg);
+  animation: l-pop 0.26s var(--ease);
 }
-.lseat {
+@keyframes l-pop {
+  from { opacity: 0; transform: translateY(14px) scale(0.97); }
+  to   { opacity: 1; transform: none; }
+}
+.ludo-sheet-title {
+  margin: 0 0 4px;
+  text-align: center;
+  font-family: 'Playfair Display', Georgia, serif;
+  font-size: 19px;
+  font-weight: 600;
+  color: var(--text);
+}
+.lmenu {
   display: flex;
   align-items: center;
   gap: 10px;
+  width: 100%;
+  padding: 13px 15px;
   font-size: 14px;
+  font-weight: 500;
+  text-align: left;
   color: var(--text);
-  background: var(--surface-2);
+  background: rgba(50, 40, 71, 0.8);
   border: 1px solid var(--border);
   border-radius: var(--r-md);
-  padding: 12px 14px;
 }
-.lseat.empty { color: var(--text-faint); }
+.lmenu.danger { color: var(--danger); }
+
+.lhow {
+  display: flex;
+  gap: 11px;
+  align-items: flex-start;
+  padding: 11px 12px;
+  background: rgba(50, 40, 71, 0.6);
+  border: 1px solid var(--border);
+  border-radius: var(--r-md);
+}
+.lhow-icon { font-size: 19px; line-height: 1.2; flex-shrink: 0; }
+.lhow b { display: block; font-size: 13.5px; margin-bottom: 2px; color: var(--text); }
+.lhow .body-dim { display: block; font-size: 12px; line-height: 1.45; }
+.ludo-signoff {
+  margin: 4px 0 2px;
+  text-align: center;
+  font-family: 'Parisienne', cursive;
+  font-size: 20px;
+  color: var(--moonlight);
+}
+
+.lwin-title {
+  margin: 0;
+  text-align: center;
+  font-family: 'Parisienne', cursive;
+  font-size: 34px;
+  font-weight: 400;
+  color: var(--text);
+  text-shadow: 0 0 26px rgba(236, 214, 173, 0.4);
+}
+.ludo-sheet.win .ludo-tagline { text-align: center; margin-bottom: 4px; }
+.lwin-scores {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 10px;
+  padding: 12px 4px;
+}
+.lwin-score {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  opacity: 0.6;
+}
+.lwin-score.won { opacity: 1; }
+.lwin-score b { font-size: 21px; font-weight: 700; color: var(--text); }
+.lwin-score.won b { color: var(--horizon-soft); }
+.lwin-name { font-size: 11.5px; color: var(--text-dim); }
+
+.lfireworks { position: absolute; inset: 0; pointer-events: none; overflow: hidden; }
+.lfireworks i {
+  position: absolute;
+  top: 22%;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--moonlight);
+  opacity: 0;
+  animation: l-spark 2.4s ease-out infinite;
+}
+.lfireworks i:nth-child(3n)   { background: var(--l-green-soft); }
+.lfireworks i:nth-child(3n+1) { background: var(--l-yellow-soft); }
+@keyframes l-spark {
+  0%   { opacity: 0; transform: translateY(0) scale(0.4); }
+  22%  { opacity: 1; transform: translateY(-26px) scale(1.25); }
+  100% { opacity: 0; transform: translateY(58px) scale(0.5); }
+}
 
 /* Landscape on a phone is the one case where a square board plus a column
    layout runs out of height, so the board takes its size from the height and
@@ -1943,4 +2391,27 @@ body.privacy-blur .lightbox-img { filter: blur(22px); transition: filter 0.12s e
   .ludo-screen { flex-direction: row; align-items: center; gap: 14px; }
   .ludo-head, .ludo-players, .ludo-foot { flex-direction: column; }
   .ludo-boardwrap { height: 100%; }
+  .ludo-hero, .ludo-turnline { display: none; }
+  .ludo-players.duo .lvs { display: none; }
+}
+
+/* Short phones: reclaim height from the parts that are decoration, not play. */
+@media (max-height: 700px) {
+  .ludo-wordmark { font-size: 38px; }
+  .lavatar { width: 30px; height: 30px; font-size: 13px; }
+  .ludo-die { width: 42px; height: 42px; }
+  .lreact { height: 29px; }
+}
+
+/* Motion is decoration here — every one of these animations can go without
+   changing what the screen says or how it is played. */
+@media (prefers-reduced-motion: reduce) {
+  .lmoon, .lstar, .lheart, .lsparkle, .lcentre::after,
+  .ltoken.movable, .ludo-die.ready, .ludo-die.rolling, .lplayer.turn .lavatar,
+  .lfireworks i, .ludo-overlay, .ludo-sheet {
+    animation: none !important;
+  }
+  .lheart { display: none; }
+  .ltoken { transition: none; }
+  .lfloat { animation-duration: 0.01s; }
 }

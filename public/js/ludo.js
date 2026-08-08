@@ -183,7 +183,30 @@ export async function setSeatToAi(gameId, key, seat, on) {
 }
 
 function aiNameFor(seat) {
-  return { red: 'Coral', green: 'Fern', yellow: 'Amber', blue: 'Tide' }[seat] || 'Bot';
+  return { red: 'Violet', green: 'Coral', yellow: 'Amber', blue: 'Tide' }[seat] || 'Bot';
+}
+
+// ---- Reactions ----
+// The little row of emoji under the board. Deliberately part of the game state
+// rather than a collection of its own: it is one field, it is already encrypted
+// with everything else, and it disappears with the game instead of leaving a
+// chat log behind for a guest to scroll.
+export const REACTIONS = ['👏', '❤️', '🥰', '🎉'];
+
+export async function sendReaction(gameId, key, seat, emoji) {
+  if (!REACTIONS.includes(emoji)) return null;
+  // No moveCount guard — a reaction is not a turn and must never be refused
+  // because someone moved a token at the same instant. Firestore retries the
+  // transaction on conflict, so it simply lands a moment later.
+  return runTransaction(db, async (tx) => {
+    const snap = await tx.get(gameRef(gameId));
+    const state = readState(snap, key);
+    if (!state) return null;
+    const next = { ...state, lastReaction: { seat, emoji, at: Date.now() } };
+    const { ciphertext, nonce } = encryptJSON(next, key);
+    tx.set(gameRef(gameId), { ciphertext, nonce, updatedAt: Date.now() });
+    return next;
+  });
 }
 
 // Two real people is the floor, exactly as asked. A board full of bots with one
